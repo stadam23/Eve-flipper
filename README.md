@@ -60,12 +60,9 @@ Ships as a **single executable** &mdash; frontend is embedded into the Go binary
 
 ## Screenshots
 
-> Add screenshots to `assets/` and uncomment below:
->
-> ```
-> ![Radius Scan](assets/screenshot-radius.png)
-> ![Route Builder](assets/screenshot-routes.png)
-> ```
+![Radius Scan](assets/screenshot-radius.png)
+
+![Route Builder](assets/screenshot-routes.png)
 
 ## Download
 
