@@ -45,14 +45,20 @@ Ships as a **single executable** &mdash; frontend embedded into the Go binary. N
 
 ## Screenshots
 
-### Station Trading Pro
-![Station Trading](assets/screenshot-station.png)
+<table>
+  <tr>
+    <td align="center"><b>Station Trading Pro</b></td>
+    <td align="center"><b>Radius Scan</b></td>
+    <td align="center"><b>Route Builder</b></td>
+  </tr>
+  <tr>
+    <td><a href="assets/screenshot-station.png"><img src="assets/screenshot-station.png" width="280"/></a></td>
+    <td><a href="assets/screenshot-radius.png"><img src="assets/screenshot-radius.png" width="280"/></a></td>
+    <td><a href="assets/screenshot-routes.png"><img src="assets/screenshot-routes.png" width="280"/></a></td>
+  </tr>
+</table>
 
-### Radius Scan
-![Radius Scan](assets/screenshot-radius.png)
-
-### Route Builder
-![Route Builder](assets/screenshot-routes.png)
+<sub>Click to enlarge</sub>
 
 ## Quick Start
 
