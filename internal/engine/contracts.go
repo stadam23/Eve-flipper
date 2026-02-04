@@ -59,7 +59,12 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	minContractPrice, maxContractMargin, minPricedRatio := getContractFilters(params)
 
 	progress("Finding systems within radius...")
-	buySystems := s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+	var buySystems map[int32]int
+	if params.MinRouteSecurity > 0 {
+		buySystems = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, params.MinRouteSecurity)
+	} else {
+		buySystems = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+	}
 	buyRegions := s.SDE.Universe.RegionsInSet(buySystems)
 
 	log.Printf("[DEBUG] ScanContracts: buySystems=%d, buyRegions=%d, minPrice=%.0f, maxMargin=%.1f",
@@ -339,7 +344,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			if d, ok := buySystems[sysID]; ok {
 				jumps = d
 			} else {
-				jumps = s.jumpsBetween(params.CurrentSystemID, sysID)
+				jumps = s.jumpsBetweenWithSecurity(params.CurrentSystemID, sysID, params.MinRouteSecurity)
 			}
 		}
 

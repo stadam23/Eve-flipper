@@ -33,6 +33,7 @@ type SolarSystem struct {
 	ID       int32
 	Name     string
 	RegionID int32
+	Security float64 // 0.0 (null) to 1.0 (highsec); highsec >= 0.45
 }
 
 // ItemType represents a market-tradeable item type from the SDE.
@@ -118,9 +119,11 @@ func Load(dataDir string) (*Data, error) {
 func (d *Data) loadSystems(dir string) error {
 	return readJSONL(dir, "mapSolarSystems", func(raw json.RawMessage) error {
 		var s struct {
-			Key      int32             `json:"_key"`
-			Name     map[string]string `json:"name"`
-			RegionID int32             `json:"regionID"`
+			Key             int32             `json:"_key"`
+			Name            map[string]string `json:"name"`
+			RegionID        int32             `json:"regionID"`
+			Security        float64           `json:"security"`
+			SecurityStatus  float64           `json:"securityStatus"` // alternate SDE field name
 		}
 		if err := json.Unmarshal(raw, &s); err != nil {
 			return err
@@ -129,12 +132,17 @@ func (d *Data) loadSystems(dir string) error {
 		if name == "" {
 			return nil
 		}
+		sec := s.Security
+		if sec == 0 && s.SecurityStatus != 0 {
+			sec = s.SecurityStatus
+		}
 		d.Systems[s.Key] = &SolarSystem{
-			ID: s.Key, Name: name, RegionID: s.RegionID,
+			ID: s.Key, Name: name, RegionID: s.RegionID, Security: sec,
 		}
 		d.SystemByName[strings.ToLower(name)] = s.Key
 		d.SystemNames = append(d.SystemNames, name)
 		d.Universe.SetRegion(s.Key, s.RegionID)
+		d.Universe.SetSecurity(s.Key, sec)
 		return nil
 	})
 }

@@ -56,13 +56,22 @@ func (s *Scanner) Scan(params ScanParams, progress func(string)) ([]FlipResult, 
 	var buySystems, sellSystems map[int32]int
 	var wg sync.WaitGroup
 	wg.Add(2)
+	minSec := params.MinRouteSecurity
 	go func() {
 		defer wg.Done()
-		buySystems = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+		if minSec > 0 {
+			buySystems = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, minSec)
+		} else {
+			buySystems = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+		}
 	}()
 	go func() {
 		defer wg.Done()
-		sellSystems = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.SellRadius)
+		if minSec > 0 {
+			sellSystems = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.SellRadius, minSec)
+		} else {
+			sellSystems = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.SellRadius)
+		}
 	}()
 	wg.Wait()
 
@@ -95,13 +104,22 @@ func (s *Scanner) ScanMultiRegion(params ScanParams, progress func(string)) ([]F
 	var buySystemsRadius, sellSystemsRadius map[int32]int
 	var wg sync.WaitGroup
 	wg.Add(2)
+	minSec := params.MinRouteSecurity
 	go func() {
 		defer wg.Done()
-		buySystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+		if minSec > 0 {
+			buySystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, minSec)
+		} else {
+			buySystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+		}
 	}()
 	go func() {
 		defer wg.Done()
-		sellSystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.SellRadius)
+		if minSec > 0 {
+			sellSystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.SellRadius, minSec)
+		} else {
+			sellSystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.SellRadius)
+		}
 	}()
 	wg.Wait()
 
@@ -246,9 +264,10 @@ func (s *Scanner) calculateResults(
 
 		totalProfit := profitPerUnit * float64(units)
 
-		// OPT: use BFS distances when available, fallback to Dijkstra
-		buyJumps := s.jumpsBetweenWithBFS(params.CurrentSystemID, sell.SystemID, bfsDistances)
-		sellJumps := s.jumpsBetween(sell.SystemID, buy.SystemID)
+		// OPT: use BFS distances when available, fallback to Dijkstra (with optional route security filter)
+		minSec := params.MinRouteSecurity
+		buyJumps := s.jumpsBetweenWithBFS(params.CurrentSystemID, sell.SystemID, bfsDistances, minSec)
+		sellJumps := s.jumpsBetweenWithSecurity(sell.SystemID, buy.SystemID, minSec)
 		totalJumps := buyJumps + sellJumps
 
 		var profitPerJump float64
@@ -361,7 +380,17 @@ func (s *Scanner) fetchOrders(regions map[int32]bool, orderType string, validSys
 }
 
 func (s *Scanner) jumpsBetween(from, to int32) int {
-	d := s.SDE.Universe.ShortestPath(from, to)
+	return s.jumpsBetweenWithSecurity(from, to, 0)
+}
+
+// jumpsBetweenWithSecurity returns jump count using only systems with security >= minSecurity (0 = no filter).
+func (s *Scanner) jumpsBetweenWithSecurity(from, to int32, minSecurity float64) int {
+	var d int
+	if minSecurity > 0 {
+		d = s.SDE.Universe.ShortestPathMinSecurity(from, to, minSecurity)
+	} else {
+		d = s.SDE.Universe.ShortestPath(from, to)
+	}
 	if d < 0 {
 		return UnreachableJumps
 	}
@@ -369,11 +398,11 @@ func (s *Scanner) jumpsBetween(from, to int32) int {
 }
 
 // jumpsBetweenWithBFS uses pre-computed BFS distances when 'from' is the origin.
-func (s *Scanner) jumpsBetweenWithBFS(from, to int32, bfsDistances map[int32]int) int {
+func (s *Scanner) jumpsBetweenWithBFS(from, to int32, bfsDistances map[int32]int, minRouteSecurity float64) int {
 	if d, ok := bfsDistances[to]; ok {
 		return d
 	}
-	return s.jumpsBetween(from, to)
+	return s.jumpsBetweenWithSecurity(from, to, minRouteSecurity)
 }
 
 // sanitizeFloat replaces NaN/Inf with 0 to prevent JSON marshal errors.

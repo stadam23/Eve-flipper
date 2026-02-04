@@ -151,6 +151,7 @@ export async function findRoutes(
       min_hops: minHops,
       max_hops: maxHops,
       max_results: params.max_results,
+      min_route_security: params.min_route_security,
     },
     onProgress,
     signal,

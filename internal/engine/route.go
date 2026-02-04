@@ -128,7 +128,7 @@ func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params Rou
 			}
 
 			profit := profitPerUnit * float64(actualUnits)
-			jumps := s.jumpsBetween(fromSystemID, buySystemID)
+			jumps := s.jumpsBetweenWithSecurity(fromSystemID, buySystemID, params.MinRouteSecurity)
 			if jumps <= 0 || jumps > MaxTradeJumps {
 				continue
 			}

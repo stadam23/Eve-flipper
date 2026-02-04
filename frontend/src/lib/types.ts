@@ -152,6 +152,8 @@ export interface ScanParams {
   min_daily_volume?: number;
   max_investment?: number;
   max_results?: number;
+  /** Route security: 0 = all space, 0.45 = highsec only, 0.7 = min 0.7 */
+  min_route_security?: number;
   // Contract-specific filters
   min_contract_price?: number;
   max_contract_margin?: number;

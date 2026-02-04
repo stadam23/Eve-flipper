@@ -628,12 +628,12 @@ export function ScanResultsTable({ results, scanning, progress, scanCompletedWit
             />
             <div className="h-px bg-eve-border my-1" />
             <ContextItem
-              label={t("openInEvemarketer")}
-              onClick={() => { window.open(`https://evemarketer.com/types/${contextMenu.row.TypeID}`, "_blank"); setContextMenu(null); }}
+              label={t("openInEveref")}
+              onClick={() => { window.open(`https://everef.net/type/${contextMenu.row.TypeID}`, "_blank"); setContextMenu(null); }}
             />
             <ContextItem
-              label={t("openInFuzzwork")}
-              onClick={() => { window.open(`https://market.fuzzwork.co.uk/type/${contextMenu.row.TypeID}`, "_blank"); setContextMenu(null); }}
+              label={t("openInJitaSpace")}
+              onClick={() => { window.open(`https://www.jita.space/market/${contextMenu.row.TypeID}`, "_blank"); setContextMenu(null); }}
             />
             <div className="h-px bg-eve-border my-1" />
             <ContextItem

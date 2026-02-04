@@ -227,9 +227,10 @@ type scanRequest struct {
 	MinMargin       float64 `json:"min_margin"`
 	SalesTaxPercent float64 `json:"sales_tax_percent"`
 	// Advanced filters
-	MinDailyVolume int64   `json:"min_daily_volume"`
-	MaxInvestment  float64 `json:"max_investment"`
-	MaxResults     int     `json:"max_results"`
+	MinDailyVolume   int64   `json:"min_daily_volume"`
+	MaxInvestment    float64 `json:"max_investment"`
+	MaxResults       int     `json:"max_results"`
+	MinRouteSecurity float64 `json:"min_route_security"` // 0 = all; 0.45 = highsec only; 0.7 = min 0.7
 	// Contract-specific filters
 	MinContractPrice  float64 `json:"min_contract_price"`
 	MaxContractMargin float64 `json:"max_contract_margin"`
@@ -258,6 +259,7 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 		SalesTaxPercent:   req.SalesTaxPercent,
 		MinDailyVolume:    req.MinDailyVolume,
 		MaxInvestment:     req.MaxInvestment,
+		MinRouteSecurity:  req.MinRouteSecurity,
 		MaxResults:        req.MaxResults,
 		MinContractPrice:  req.MinContractPrice,
 		MaxContractMargin: req.MaxContractMargin,
@@ -475,13 +477,14 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SystemName      string  `json:"system_name"`
-		CargoCapacity   float64 `json:"cargo_capacity"`
-		MinMargin       float64 `json:"min_margin"`
-		SalesTaxPercent float64 `json:"sales_tax_percent"`
-		MinHops         int     `json:"min_hops"`
-		MaxHops         int     `json:"max_hops"`
-		MaxResults      int     `json:"max_results"`
+		SystemName       string  `json:"system_name"`
+		CargoCapacity    float64 `json:"cargo_capacity"`
+		MinMargin        float64 `json:"min_margin"`
+		SalesTaxPercent  float64 `json:"sales_tax_percent"`
+		MinHops          int     `json:"min_hops"`
+		MaxHops          int     `json:"max_hops"`
+		MaxResults       int     `json:"max_results"`
+		MinRouteSecurity float64 `json:"min_route_security"` // 0 = all; 0.45 = highsec only; 0.7 = min 0.7
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid json")
@@ -514,13 +517,14 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	params := engine.RouteParams{
-		SystemName:      req.SystemName,
-		CargoCapacity:   req.CargoCapacity,
-		MinMargin:       req.MinMargin,
-		SalesTaxPercent: req.SalesTaxPercent,
-		MinHops:         req.MinHops,
-		MaxHops:         req.MaxHops,
-		MaxResults:      req.MaxResults,
+		SystemName:       req.SystemName,
+		CargoCapacity:    req.CargoCapacity,
+		MinMargin:        req.MinMargin,
+		SalesTaxPercent:  req.SalesTaxPercent,
+		MinHops:          req.MinHops,
+		MaxHops:          req.MaxHops,
+		MaxResults:       req.MaxResults,
+		MinRouteSecurity: req.MinRouteSecurity,
 	}
 
 	log.Printf("[API] RouteFind: system=%s, cargo=%.0f, margin=%.1f, hops=%d-%d",

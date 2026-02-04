@@ -75,13 +75,14 @@ type RouteResult struct {
 
 // RouteParams holds the input parameters for multi-hop route search.
 type RouteParams struct {
-	SystemName      string
-	CargoCapacity   float64
-	MinMargin       float64
-	SalesTaxPercent float64
-	MinHops         int
-	MaxHops         int
-	MaxResults      int // 0 = use default (50)
+	SystemName       string
+	CargoCapacity    float64
+	MinMargin        float64
+	SalesTaxPercent  float64
+	MinHops          int
+	MaxHops          int
+	MaxResults       int     // 0 = use default (50)
+	MinRouteSecurity float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7
 }
 
 // ScanParams holds the input parameters for radius and region scans.
@@ -93,10 +94,11 @@ type ScanParams struct {
 	MinMargin       float64
 	SalesTaxPercent float64
 	// Advanced filters
-	MinDailyVolume int64   // 0 = no filter
-	MaxInvestment  float64 // 0 = no filter (max ISK per position)
-	SecurityFilter string  // "" = all, "highsec", "lowsec", "nullsec"
-	MaxResults     int     // 0 = use default (100)
+	MinDailyVolume    int64   // 0 = no filter
+	MaxInvestment     float64 // 0 = no filter (max ISK per position)
+	SecurityFilter    string  // "" = all, "highsec", "lowsec", "nullsec"
+	MinRouteSecurity  float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7 (route must stay in this security)
+	MaxResults        int     // 0 = use default (100)
 
 	// --- Contract-specific filters ---
 	MinContractPrice  float64 // Minimum contract price in ISK (0 = use default 10M)

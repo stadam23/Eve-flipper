@@ -5,6 +5,12 @@ import "container/heap"
 // SystemsWithinRadius returns all systems reachable from origin within maxJumps,
 // mapped to their distance in jumps.
 func (u *Universe) SystemsWithinRadius(origin int32, maxJumps int) map[int32]int {
+	return u.SystemsWithinRadiusMinSecurity(origin, maxJumps, 0)
+}
+
+// SystemsWithinRadiusMinSecurity returns systems reachable within maxJumps where
+// every system on the path has security >= minSecurity. Use minSecurity <= 0 for no filter.
+func (u *Universe) SystemsWithinRadiusMinSecurity(origin int32, maxJumps int, minSecurity float64) map[int32]int {
 	result := make(map[int32]int)
 	result[origin] = 0
 
@@ -17,6 +23,11 @@ func (u *Universe) SystemsWithinRadius(origin int32, maxJumps int) map[int32]int
 			continue
 		}
 		for _, neighbor := range u.Adj[current] {
+			if minSecurity > 0 {
+				if sec, ok := u.SystemSecurity[neighbor]; !ok || sec < minSecurity {
+					continue
+				}
+			}
 			if _, visited := result[neighbor]; !visited {
 				result[neighbor] = dist + 1
 				queue = append(queue, neighbor)
@@ -29,8 +40,22 @@ func (u *Universe) SystemsWithinRadius(origin int32, maxJumps int) map[int32]int
 // ShortestPath returns the shortest jump count between origin and dest using Dijkstra.
 // Returns -1 if no path exists.
 func (u *Universe) ShortestPath(origin, dest int32) int {
+	return u.ShortestPathMinSecurity(origin, dest, 0)
+}
+
+// ShortestPathMinSecurity returns the shortest jump count using only systems with
+// security >= minSecurity. Use minSecurity <= 0 for no filter. Returns -1 if no path exists.
+func (u *Universe) ShortestPathMinSecurity(origin, dest int32, minSecurity float64) int {
 	if origin == dest {
 		return 0
+	}
+	if minSecurity > 0 {
+		if sec, ok := u.SystemSecurity[origin]; ok && sec < minSecurity {
+			return -1
+		}
+		if sec, ok := u.SystemSecurity[dest]; ok && sec < minSecurity {
+			return -1
+		}
 	}
 
 	dist := make(map[int32]int)
@@ -48,6 +73,11 @@ func (u *Universe) ShortestPath(origin, dest int32) int {
 			continue
 		}
 		for _, neighbor := range u.Adj[item.systemID] {
+			if minSecurity > 0 {
+				if sec, ok := u.SystemSecurity[neighbor]; !ok || sec < minSecurity {
+					continue
+				}
+			}
 			nd := item.dist + 1
 			if d, ok := dist[neighbor]; !ok || nd < d {
 				dist[neighbor] = nd
