@@ -28,10 +28,11 @@ type Client struct {
 }
 
 // NewClient creates an ESI client with rate limiting and the given station cache store.
+// Uses 50 concurrent connections (ESI allows up to 150 error-free requests/sec).
 func NewClient(store StationStore) *Client {
 	return &Client{
 		http:         &http.Client{Timeout: 30 * time.Second},
-		sem:          make(chan struct{}, 20),
+		sem:          make(chan struct{}, 50), // Increased from 20 to 50
 		stationStore: store,
 	}
 }

@@ -39,15 +39,24 @@ type IndustryCache struct {
 	costIndicesTime time.Time
 	prices          map[int32]*IndustryPrice // typeID -> prices
 	pricesTime      time.Time
+	
+	// Market prices cache (sell order minimums)
+	marketPricesMu   sync.RWMutex
+	marketPrices     map[int32]float64 // typeID -> min sell price
+	marketPricesTime time.Time
 }
 
 // NewIndustryCache creates a new industry cache.
 func NewIndustryCache() *IndustryCache {
 	return &IndustryCache{
-		costIndices: make(map[int32]*SystemCostIndices),
-		prices:      make(map[int32]*IndustryPrice),
+		costIndices:  make(map[int32]*SystemCostIndices),
+		prices:       make(map[int32]*IndustryPrice),
+		marketPrices: make(map[int32]float64),
 	}
 }
+
+// MarketPricesCacheTTL is how long market prices are cached.
+const MarketPricesCacheTTL = 10 * time.Minute
 
 // FetchIndustrySystems fetches cost indices for all systems.
 func (c *Client) FetchIndustrySystems() ([]IndustryCostIndex, error) {
@@ -200,4 +209,53 @@ func (c *Client) GetAllAdjustedPrices(cache *IndustryCache) (map[int32]float64, 
 	cache.pricesTime = time.Now()
 
 	return result, nil
+}
+
+// GetCachedMarketPrices returns cached market prices or fetches fresh ones.
+// Uses 10-minute cache for sell order minimums.
+func (c *Client) GetCachedMarketPrices(cache *IndustryCache, regionID int32) (map[int32]float64, error) {
+	cache.marketPricesMu.RLock()
+	if time.Since(cache.marketPricesTime) < MarketPricesCacheTTL && len(cache.marketPrices) > 0 {
+		// Return cached prices
+		result := make(map[int32]float64, len(cache.marketPrices))
+		for k, v := range cache.marketPrices {
+			result[k] = v
+		}
+		cache.marketPricesMu.RUnlock()
+		return result, nil
+	}
+	cache.marketPricesMu.RUnlock()
+
+	// Fetch fresh data
+	cache.marketPricesMu.Lock()
+	defer cache.marketPricesMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if time.Since(cache.marketPricesTime) < MarketPricesCacheTTL && len(cache.marketPrices) > 0 {
+		result := make(map[int32]float64, len(cache.marketPrices))
+		for k, v := range cache.marketPrices {
+			result[k] = v
+		}
+		return result, nil
+	}
+
+	// Fetch all sell orders for region
+	orders, err := c.FetchRegionOrders(regionID, "sell")
+	if err != nil {
+		return nil, err
+	}
+
+	// Build min prices map
+	prices := make(map[int32]float64)
+	for _, o := range orders {
+		if existing, ok := prices[o.TypeID]; !ok || o.Price < existing {
+			prices[o.TypeID] = o.Price
+		}
+	}
+
+	// Update cache
+	cache.marketPrices = prices
+	cache.marketPricesTime = time.Now()
+
+	return prices, nil
 }

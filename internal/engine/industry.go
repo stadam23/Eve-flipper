@@ -361,23 +361,13 @@ func (a *IndustryAnalyzer) sumJobCosts(node *MaterialNode) float64 {
 
 // fetchMarketPrices fetches best sell order prices for materials.
 // Uses Jita (The Forge region) as default market.
+// Results are cached for 10 minutes.
 func (a *IndustryAnalyzer) fetchMarketPrices(params IndustryParams) (map[int32]float64, error) {
 	// The Forge region ID (Jita)
 	regionID := int32(10000002)
 	
-	orders, err := a.ESI.FetchRegionOrders(regionID, "sell")
-	if err != nil {
-		return nil, err
-	}
-
-	prices := make(map[int32]float64)
-	for _, o := range orders {
-		if existing, ok := prices[o.TypeID]; !ok || o.Price < existing {
-			prices[o.TypeID] = o.Price
-		}
-	}
-
-	return prices, nil
+	// Use cached prices if available
+	return a.ESI.GetCachedMarketPrices(a.IndustryCache, regionID)
 }
 
 // GetBlueprintInfo returns blueprint information for a type.
