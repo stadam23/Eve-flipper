@@ -34,14 +34,19 @@ type HistoryProvider interface {
 
 // Scanner orchestrates market scans using SDE data and the ESI client.
 type Scanner struct {
-	SDE     *sde.Data
-	ESI     *esi.Client
-	History HistoryProvider
+	SDE            *sde.Data
+	ESI            *esi.Client
+	History        HistoryProvider
+	ContractsCache *esi.ContractsCache // Cache for contracts (5 min TTL)
 }
 
 // NewScanner creates a Scanner with the given static data and ESI client.
 func NewScanner(data *sde.Data, client *esi.Client) *Scanner {
-	return &Scanner{SDE: data, ESI: client}
+	return &Scanner{
+		SDE:            data,
+		ESI:            client,
+		ContractsCache: esi.NewContractsCache(),
+	}
 }
 
 // Scan finds profitable flip opportunities based on the given parameters.

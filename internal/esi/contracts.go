@@ -10,6 +10,24 @@ import (
 	"time"
 )
 
+// ContractsCache caches public contracts by region.
+type ContractsCache struct {
+	mu        sync.RWMutex
+	contracts map[int32][]PublicContract // regionID -> contracts
+	times     map[int32]time.Time        // regionID -> fetch time
+}
+
+// ContractsCacheTTL is how long contracts are cached (5 minutes).
+const ContractsCacheTTL = 5 * time.Minute
+
+// NewContractsCache creates a new contracts cache.
+func NewContractsCache() *ContractsCache {
+	return &ContractsCache{
+		contracts: make(map[int32][]PublicContract),
+		times:     make(map[int32]time.Time),
+	}
+}
+
 // PublicContract represents a public contract from ESI.
 type PublicContract struct {
 	ContractID          int32   `json:"contract_id"`
@@ -186,4 +204,31 @@ func (c PublicContract) IsExpired() bool {
 		return true
 	}
 	return time.Now().After(t)
+}
+
+// FetchRegionContractsCached fetches contracts with caching.
+func (c *Client) FetchRegionContractsCached(cache *ContractsCache, regionID int32) ([]PublicContract, error) {
+	// Check cache
+	cache.mu.RLock()
+	if contracts, ok := cache.contracts[regionID]; ok {
+		if time.Since(cache.times[regionID]) < ContractsCacheTTL {
+			cache.mu.RUnlock()
+			return contracts, nil
+		}
+	}
+	cache.mu.RUnlock()
+
+	// Fetch fresh
+	contracts, err := c.FetchRegionContracts(regionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update cache
+	cache.mu.Lock()
+	cache.contracts[regionID] = contracts
+	cache.times[regionID] = time.Now()
+	cache.mu.Unlock()
+
+	return contracts, nil
 }

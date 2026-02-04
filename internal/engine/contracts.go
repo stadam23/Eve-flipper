@@ -68,6 +68,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	// Fetch market orders and contracts in parallel
 	var sellOrders []esi.MarketOrder
 	var allContracts []esi.PublicContract
+	var contractsMu sync.Mutex
 	var wg sync.WaitGroup
 
 	progress(fmt.Sprintf("Fetching market orders + contracts from %d regions...", len(buyRegions)))
@@ -79,14 +80,23 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	}()
 	go func() {
 		defer wg.Done()
+		// Fetch contracts from ALL regions in PARALLEL (with caching)
+		var contractsWg sync.WaitGroup
 		for rid := range buyRegions {
-			contracts, err := s.ESI.FetchRegionContracts(rid)
-			if err != nil {
-				log.Printf("[DEBUG] failed to fetch contracts for region %d: %v", rid, err)
-				continue
-			}
-			allContracts = append(allContracts, contracts...)
+			contractsWg.Add(1)
+			go func(regionID int32) {
+				defer contractsWg.Done()
+				contracts, err := s.ESI.FetchRegionContractsCached(s.ContractsCache, regionID)
+				if err != nil {
+					log.Printf("[DEBUG] failed to fetch contracts for region %d: %v", regionID, err)
+					return
+				}
+				contractsMu.Lock()
+				allContracts = append(allContracts, contracts...)
+				contractsMu.Unlock()
+			}(rid)
 		}
+		contractsWg.Wait()
 	}()
 	wg.Wait()
 
@@ -382,8 +392,8 @@ func (s *Scanner) fetchContractItemsHistory(typeIDs map[int32]bool, priceData ma
 		return
 	}
 
-	// Use semaphore to limit concurrent requests
-	sem := make(chan struct{}, 10)
+	// Use semaphore to limit concurrent requests (increased from 10 to 30)
+	sem := make(chan struct{}, 30)
 	var wg sync.WaitGroup
 
 	for typeID := range typeIDs {
