@@ -5,9 +5,10 @@ import type { ScanParams } from "@/lib/types";
 interface Props {
   params: ScanParams;
   onChange: (params: ScanParams) => void;
+  isLoggedIn?: boolean;
 }
 
-export function ParametersPanel({ params, onChange }: Props) {
+export function ParametersPanel({ params, onChange, isLoggedIn = false }: Props) {
   const { t } = useI18n();
   const set = <K extends keyof ScanParams>(key: K, value: ScanParams[K]) => {
     onChange({ ...params, [key]: value });
@@ -20,6 +21,7 @@ export function ParametersPanel({ params, onChange }: Props) {
           <SystemAutocomplete
             value={params.system_name}
             onChange={(v) => set("system_name", v)}
+            isLoggedIn={isLoggedIn}
           />
         </Field>
 

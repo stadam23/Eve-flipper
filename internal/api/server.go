@@ -90,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("GET /api/auth/character", s.handleAuthCharacter)
+	mux.HandleFunc("GET /api/auth/location", s.handleAuthLocation)
 	// Industry
 	mux.HandleFunc("POST /api/industry/analyze", s.handleIndustryAnalyze)
 	mux.HandleFunc("GET /api/industry/search", s.handleIndustrySearch)
@@ -1101,6 +1102,56 @@ func (s *Server) handleAuthCharacter(w http.ResponseWriter, r *http.Request) {
 			}
 			result.Transactions[i].LocationName = s.esi.StationName(result.Transactions[i].LocationID)
 		}
+	}
+
+	writeJSON(w, result)
+}
+
+func (s *Server) handleAuthLocation(w http.ResponseWriter, r *http.Request) {
+	token, err := s.sessions.EnsureValidToken(s.sso)
+	if err != nil {
+		writeError(w, 401, err.Error())
+		return
+	}
+	sess := s.sessions.Get()
+	if sess == nil {
+		writeError(w, 401, "not logged in")
+		return
+	}
+
+	loc, err := esi.GetCharacterLocation(sess.CharacterID, token)
+	if err != nil {
+		writeError(w, 500, "failed to get location: "+err.Error())
+		return
+	}
+
+	// Resolve system name from SDE
+	s.mu.RLock()
+	sdeData := s.sdeData
+	s.mu.RUnlock()
+
+	result := struct {
+		SolarSystemID   int32  `json:"solar_system_id"`
+		SolarSystemName string `json:"solar_system_name"`
+		StationID       int64  `json:"station_id,omitempty"`
+		StationName     string `json:"station_name,omitempty"`
+	}{
+		SolarSystemID: loc.SolarSystemID,
+	}
+
+	if sdeData != nil {
+		if sys, ok := sdeData.Systems[loc.SolarSystemID]; ok {
+			result.SolarSystemName = sys.Name
+		}
+	}
+
+	// Get station name if docked
+	if loc.StationID != 0 {
+		result.StationID = loc.StationID
+		result.StationName = s.esi.StationName(loc.StationID)
+	} else if loc.StructureID != 0 {
+		result.StationID = loc.StructureID
+		result.StationName = s.esi.StationName(loc.StructureID)
 	}
 
 	writeJSON(w, result)

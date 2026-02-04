@@ -257,7 +257,7 @@ function App() {
 
       {/* Parameters - shown for tabs that use global scan params */}
       {(tab === "radius" || tab === "region" || tab === "contracts") && (
-        <ParametersPanel params={params} onChange={setParams} />
+        <ParametersPanel params={params} onChange={setParams} isLoggedIn={authStatus.logged_in} />
       )}
 
       {/* Industry doesn't use global params - has its own settings panel */}
@@ -335,7 +335,7 @@ function App() {
             <RouteBuilder params={params} />
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "industry" ? "" : "hidden"}`}>
-            <IndustryTab />
+            <IndustryTab isLoggedIn={authStatus.logged_in} />
           </div>
         </div>
       </div>

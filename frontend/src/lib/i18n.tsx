@@ -18,6 +18,7 @@ const translations = {
     // Parameters
     system: "Система",
     systemPlaceholder: "Система...",
+    useCurrentLocation: "Моя локация",
     cargoCapacity: "Грузоподъёмность (m³)",
     buyRadius: "Радиус покупки (прыжки)",
     sellRadius: "Радиус продажи (прыжки)",
@@ -353,6 +354,7 @@ const translations = {
     // Parameters
     system: "System",
     systemPlaceholder: "System...",
+    useCurrentLocation: "My location",
     cargoCapacity: "Cargo Capacity (m³)",
     buyRadius: "Buy Radius (jumps)",
     sellRadius: "Sell Radius (jumps)",

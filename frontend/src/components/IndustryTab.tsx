@@ -32,9 +32,10 @@ function HighlightMatch({ text, query }: { text: string; query: string }) {
 
 interface Props {
   onError?: (msg: string) => void;
+  isLoggedIn?: boolean;
 }
 
-export function IndustryTab({ onError }: Props) {
+export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const { t } = useI18n();
 
   // Search state
@@ -266,7 +267,7 @@ export function IndustryTab({ onError }: Props) {
               <SettingsNumberInput value={te} onChange={setTE} min={0} max={20} />
             </SettingsField>
             <SettingsField label={t("system")}>
-              <SystemAutocomplete value={systemName} onChange={setSystemName} />
+              <SystemAutocomplete value={systemName} onChange={setSystemName} isLoggedIn={isLoggedIn} />
             </SettingsField>
             <SettingsField label={t("industryFacilityTax")}>
               <SettingsNumberInput value={facilityTax} onChange={setFacilityTax} min={0} max={50} step={0.1} />

@@ -281,6 +281,18 @@ export async function getCharacterInfo(): Promise<CharacterInfo> {
   return handleResponse<CharacterInfo>(res);
 }
 
+export interface CharacterLocation {
+  solar_system_id: number;
+  solar_system_name: string;
+  station_id?: number;
+  station_name?: string;
+}
+
+export async function getCharacterLocation(): Promise<CharacterLocation> {
+  const res = await fetch(`${BASE}/api/auth/location`);
+  return handleResponse<CharacterLocation>(res);
+}
+
 // --- Industry ---
 
 import type { IndustryParams, IndustryAnalysis, BuildableItem, IndustrySystem, NdjsonIndustryMessage } from "./types";

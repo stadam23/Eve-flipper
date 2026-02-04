@@ -121,6 +121,23 @@ func GetWalletTransactions(characterID int64, accessToken string) ([]WalletTrans
 	return txns, nil
 }
 
+// CharacterLocation represents the character's current location.
+type CharacterLocation struct {
+	SolarSystemID int32 `json:"solar_system_id"`
+	StationID     int64 `json:"station_id,omitempty"`
+	StructureID   int64 `json:"structure_id,omitempty"`
+}
+
+// GetCharacterLocation fetches a character's current location (system/station).
+func GetCharacterLocation(characterID int64, accessToken string) (*CharacterLocation, error) {
+	url := fmt.Sprintf("%s/characters/%d/location/?datasource=tranquility", baseURL, characterID)
+	var loc CharacterLocation
+	if err := authGet(url, accessToken, &loc); err != nil {
+		return nil, fmt.Errorf("location: %w", err)
+	}
+	return &loc, nil
+}
+
 // authGet performs an authenticated GET request to an ESI endpoint.
 func authGet(url, accessToken string, dst interface{}) error {
 	req, err := http.NewRequest("GET", url, nil)
