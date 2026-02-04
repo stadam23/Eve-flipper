@@ -14,7 +14,7 @@ import { LanguageSwitcher } from "./components/LanguageSwitcher";
 import { useGlobalToast } from "./components/Toast";
 import { Modal } from "./components/Modal";
 import { CharacterPopup } from "./components/CharacterPopup";
-import { getConfig, updateConfig, scan, scanMultiRegion, scanContracts, getWatchlist, getAuthStatus, logout as apiLogout, getLoginUrl } from "./lib/api";
+import { getConfig, updateConfig, scan, scanMultiRegion, scanContracts, getWatchlist, getAuthStatus, logout as apiLogout, getLoginUrl, getStatus } from "./lib/api";
 import { useI18n } from "./lib/i18n";
 import type { AuthStatus, ContractResult, FlipResult, ScanParams } from "./lib/types";
 
@@ -46,6 +46,7 @@ function App() {
   const [showWatchlist, setShowWatchlist] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showCharacter, setShowCharacter] = useState(false);
+  const [esiAvailable, setEsiAvailable] = useState<boolean | null>(null); // null = loading
 
   const abortRef = useRef<AbortController | null>(null);
   const scanTabRef = useRef<Tab>(tab);
@@ -125,6 +126,25 @@ function App() {
       })
       .catch(() => {});
     getAuthStatus().then(setAuthStatus).catch(() => {});
+  }, []);
+
+  // Poll ESI status
+  useEffect(() => {
+    let mounted = true;
+    const checkEsi = async () => {
+      try {
+        const status = await getStatus();
+        if (mounted) setEsiAvailable(status.esi_ok);
+      } catch {
+        if (mounted) setEsiAvailable(false);
+      }
+    };
+    checkEsi();
+    const interval = setInterval(checkEsi, 5000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
   const handleLogout = useCallback(async () => {
@@ -393,6 +413,25 @@ function App() {
           characterId={authStatus.character_id!}
           characterName={authStatus.character_name!}
         />
+      )}
+
+      {/* ESI Unavailable Overlay */}
+      {esiAvailable === false && (
+        <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center">
+          <div className="bg-eve-panel border border-eve-error/50 rounded-lg p-8 max-w-md mx-4 text-center shadow-2xl">
+            <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-eve-error/20 flex items-center justify-center">
+              <svg className="w-8 h-8 text-eve-error animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+            <h2 className="text-xl font-bold text-eve-error mb-2">{t("esiUnavailable")}</h2>
+            <p className="text-eve-dim mb-4">{t("esiUnavailableDesc")}</p>
+            <div className="flex items-center justify-center gap-2 text-sm text-eve-dim">
+              <div className="w-2 h-2 bg-eve-accent rounded-full animate-pulse" />
+              <span>{t("esiWaiting")}</span>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

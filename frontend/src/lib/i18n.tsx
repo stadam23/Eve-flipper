@@ -14,6 +14,8 @@ const translations = {
     sdeTypes: "типов",
     esiApi: "ESI API",
     esiUnavailable: "ESI API: недоступен",
+    esiUnavailableDesc: "Серверы EVE Online недоступны. Сканирование и анализ временно невозможны.",
+    esiWaiting: "Ожидание подключения...",
 
     // Parameters
     system: "Система",
@@ -350,6 +352,8 @@ const translations = {
     sdeTypes: "types",
     esiApi: "ESI API",
     esiUnavailable: "ESI API: unavailable",
+    esiUnavailableDesc: "EVE Online servers are unavailable. Scanning and analysis temporarily disabled.",
+    esiWaiting: "Waiting for connection...",
 
     // Parameters
     system: "System",
