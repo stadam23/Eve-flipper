@@ -1,9 +1,15 @@
-import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef, useLayoutEffect } from "react";
+import { List } from "react-window";
 import type { FlipResult, WatchlistItem } from "@/lib/types";
 import { formatISK, formatMargin } from "@/lib/format";
 import { useI18n, type TranslationKey } from "@/lib/i18n";
 import { getWatchlist, addToWatchlist, removeFromWatchlist } from "@/lib/api";
 import { useGlobalToast } from "./Toast";
+import { EmptyState, type EmptyReason } from "./EmptyState";
+
+const VIRTUALIZE_THRESHOLD = 500;
+const ROW_HEIGHT = 36;
+const ROW_HEIGHT_COMPACT = 28;
 
 type SortKey = keyof FlipResult;
 type SortDir = "asc" | "desc";
@@ -12,6 +18,8 @@ interface Props {
   results: FlipResult[];
   scanning: boolean;
   progress: string;
+  /** When true, show "no results" empty state instead of "run scan" */
+  scanCompletedWithZero?: boolean;
 }
 
 const columnDefs: { key: SortKey; labelKey: TranslationKey; width: string; numeric: boolean }[] = [
@@ -37,8 +45,82 @@ function rowKey(row: FlipResult) {
   return `${row.TypeID}-${row.BuySystemID}-${row.SellSystemID}`;
 }
 
-export function ScanResultsTable({ results, scanning, progress }: Props) {
+// Virtualized row props (passed via List rowProps)
+interface VirtualRowProps {
+  sorted: FlipResult[];
+  formatCell: (col: (typeof columnDefs)[number], row: FlipResult) => string;
+  columnDefs: typeof columnDefs;
+  pinnedKeys: Set<string>;
+  selectedKeys: Set<string>;
+  toggleSelect: (key: string) => void;
+  togglePin: (key: string) => void;
+  handleContextMenu: (e: React.MouseEvent, row: FlipResult) => void;
+  rowKey: (row: FlipResult) => string;
+  t: (key: TranslationKey, params?: Record<string, string | number>) => string;
+  compactMode: boolean;
+}
+
+function VirtualRow({
+  index,
+  style,
+  sorted,
+  formatCell,
+  columnDefs,
+  pinnedKeys,
+  selectedKeys,
+  toggleSelect,
+  togglePin,
+  handleContextMenu,
+  rowKey: getRowKey,
+  t,
+  compactMode,
+}: VirtualRowProps & { index: number; style: React.CSSProperties }) {
+  const row = sorted[index];
+  const key = getRowKey(row);
+  const isPinned = pinnedKeys.has(key);
+  const isSelected = selectedKeys.has(key);
+  return (
+    <div
+      style={style}
+      onContextMenu={(e) => handleContextMenu(e, row)}
+      className={`grid grid-cols-[32px_32px_180px_110px_150px_110px_150px_80px_80px_80px_120px_110px_60px_80px_70px_70px_70px] gap-0 border-b border-eve-border/50 hover:bg-eve-accent/5 transition-colors ${compactMode ? "text-xs" : "text-sm"} ${
+        isPinned ? "bg-eve-accent/10 border-l-2 border-l-eve-accent" : isSelected ? "bg-eve-accent/5" : index % 2 === 0 ? "bg-eve-panel" : "bg-[#161616]"
+      }`}
+    >
+      <div className="px-1 py-1 flex items-center justify-center">
+        <input
+          type="checkbox"
+          checked={isSelected}
+          onChange={() => toggleSelect(key)}
+          className="accent-eve-accent cursor-pointer"
+          onClick={(e) => e.stopPropagation()}
+        />
+      </div>
+      <div className="px-1 py-1 flex items-center justify-center">
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); togglePin(key); }}
+          className={isPinned ? "opacity-100" : "opacity-30 hover:opacity-70"}
+          title={isPinned ? t("unpinRow") : t("pinRow")}
+        >
+          📌
+        </button>
+      </div>
+      {columnDefs.map((col) => (
+        <div
+          key={col.key}
+          className={`px-3 py-1 truncate ${col.numeric ? "text-eve-accent font-mono" : "text-eve-text"}`}
+        >
+          {formatCell(col, row)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function ScanResultsTable({ results, scanning, progress, scanCompletedWithZero }: Props) {
   const { t } = useI18n();
+  const emptyReason: EmptyReason = scanCompletedWithZero ? "no_results" : "no_scan_yet";
   const { addToast } = useGlobalToast();
 
   // Sort
@@ -61,6 +143,20 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
   // Context menu
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; row: FlipResult } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // Virtual list (when 500+ rows) and compact mode
+  const [compactMode, setCompactMode] = useState(false);
+  const listContainerRef = useRef<HTMLDivElement>(null);
+  const [listHeight, setListHeight] = useState(400);
+  useLayoutEffect(() => {
+    const el = listContainerRef.current;
+    if (!el) return;
+    const update = () => setListHeight(el.clientHeight);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Adjust context menu position to stay within viewport
   useEffect(() => {
@@ -159,6 +255,9 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
     });
     return copy;
   }, [filtered, sortKey, sortDir, pinnedKeys]);
+
+  const useVirtual = sorted.length >= VIRTUALIZE_THRESHOLD;
+  const rowHeight = compactMode ? ROW_HEIGHT_COMPACT : ROW_HEIGHT;
 
   // Summary stats
   const summary = useMemo(() => {
@@ -322,6 +421,12 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
         )}
         {results.length > 0 && (
           <>
+            <ToolbarBtn
+              label={compactMode ? "⊞" : "⊟"}
+              title={compactMode ? t("comfyRows") : t("compactRows")}
+              active={compactMode}
+              onClick={() => setCompactMode((v) => !v)}
+            />
             <ToolbarBtn label="CSV" title={t("exportCSV")} onClick={exportCSV} />
             <ToolbarBtn label="⎘" title={t("copyTable")} onClick={copyTable} />
           </>
@@ -329,7 +434,41 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
       </div>
 
       {/* Table */}
-      <div className="flex-1 min-h-0 overflow-auto border border-eve-border rounded-sm">
+      <div className={`flex-1 min-h-0 flex flex-col border border-eve-border rounded-sm ${useVirtual ? "overflow-hidden" : "overflow-auto"}`}>
+        {useVirtual ? (
+          <>
+            {/* Virtualized: sticky header */}
+            <div className="shrink-0 grid grid-cols-[32px_32px_180px_110px_150px_110px_150px_80px_80px_80px_120px_110px_60px_80px_70px_70px_70px] gap-0 bg-eve-dark border-b border-eve-border text-[11px] uppercase tracking-wider text-eve-dim font-medium">
+              <div className="px-1 py-2" />
+              <div className="px-1 py-2" />
+              {columnDefs.map((col) => (
+                <div key={col.key} className="px-3 py-2 truncate">{t(col.labelKey)}</div>
+              ))}
+            </div>
+            <div ref={listContainerRef} className="flex-1 min-h-0">
+              <List<VirtualRowProps>
+                rowCount={sorted.length}
+                rowHeight={rowHeight}
+                rowComponent={VirtualRow}
+                rowProps={{
+                  sorted,
+                  formatCell,
+                  columnDefs,
+                  pinnedKeys,
+                  selectedKeys,
+                  toggleSelect,
+                  togglePin,
+                  handleContextMenu,
+                  rowKey,
+                  t,
+                  compactMode,
+                }}
+                overscanCount={10}
+                style={{ height: listHeight }}
+              />
+            </div>
+          </>
+        ) : (
         <table className="w-full text-sm">
           <thead className="sticky top-0 z-10">
             {/* Column headers */}
@@ -392,7 +531,7 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
                 <tr
                   key={key}
                   onContextMenu={(e) => handleContextMenu(e, row)}
-                  className={`border-b border-eve-border/50 hover:bg-eve-accent/5 transition-colors ${
+                  className={`border-b border-eve-border/50 hover:bg-eve-accent/5 transition-colors ${compactMode ? "text-xs" : ""} ${
                     isPinned
                       ? "bg-eve-accent/10 border-l-2 border-l-eve-accent"
                       : isSelected
@@ -403,7 +542,7 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
                   }`}
                 >
                   {/* Checkbox */}
-                  <td className="w-8 px-1 py-1.5 text-center">
+                  <td className={`w-8 px-1 text-center ${compactMode ? "py-1" : "py-1.5"}`}>
                     <input
                       type="checkbox"
                       checked={isSelected}
@@ -412,7 +551,7 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
                     />
                   </td>
                   {/* Pin button */}
-                  <td className="w-8 px-1 py-1.5 text-center">
+                  <td className={`w-8 px-1 text-center ${compactMode ? "py-1" : "py-1.5"}`}>
                     <button
                       onClick={() => togglePin(key)}
                       className={`text-xs cursor-pointer transition-opacity ${
@@ -426,7 +565,7 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
                   {columnDefs.map((col) => (
                     <td
                       key={col.key}
-                      className={`px-3 py-1.5 ${col.width} truncate ${
+                      className={`px-3 ${compactMode ? "py-1" : "py-1.5"} ${col.width} truncate ${
                         col.numeric ? "text-eve-accent font-mono" : "text-eve-text"
                       }`}
                     >
@@ -438,13 +577,14 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
             })}
             {results.length === 0 && !scanning && (
               <tr>
-                <td colSpan={columnDefs.length + 2} className="px-3 py-8 text-center text-eve-dim">
-                  {t("scanPrompt")}
+                <td colSpan={columnDefs.length + 2} className="p-0">
+                  <EmptyState reason={emptyReason} wikiSlug="Getting-Started" />
                 </td>
               </tr>
             )}
           </tbody>
         </table>
+        )}
       </div>
 
       {/* Summary footer */}
@@ -485,6 +625,15 @@ export function ScanResultsTable({ results, scanning, progress }: Props) {
             <ContextItem
               label={t("copySystemAutopilot")}
               onClick={() => copyText(contextMenu.row.BuySystemName)}
+            />
+            <div className="h-px bg-eve-border my-1" />
+            <ContextItem
+              label={t("openInEvemarketer")}
+              onClick={() => { window.open(`https://evemarketer.com/types/${contextMenu.row.TypeID}`, "_blank"); setContextMenu(null); }}
+            />
+            <ContextItem
+              label={t("openInFuzzwork")}
+              onClick={() => { window.open(`https://market.fuzzwork.co.uk/type/${contextMenu.row.TypeID}`, "_blank"); setContextMenu(null); }}
             />
             <div className="h-px bg-eve-border my-1" />
             <ContextItem

@@ -87,6 +87,9 @@ export function RouteBuilder({ params }: Props) {
 
   const routeSummary = (route: RouteResult) =>
     route.Hops.map((h) => h.SystemName).concat([route.Hops[route.Hops.length - 1]?.DestSystemName ?? ""]).filter(Boolean).join(" → ");
+  const copyRouteSystems = (route: RouteResult) => {
+    navigator.clipboard.writeText(routeSummary(route));
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -97,6 +100,7 @@ export function RouteBuilder({ params }: Props) {
           hint={t("routeSettingsHint")}
           icon="🗺"
           defaultExpanded={true}
+          help={{ stepKeys: ["helpRouteStep1", "helpRouteStep2", "helpRouteStep3"], wikiSlug: "Route-Builder" }}
         >
           <div className="flex items-center gap-4 flex-wrap">
             <SettingsGrid cols={2}>
@@ -184,9 +188,10 @@ export function RouteBuilder({ params }: Props) {
 
       {/* Detail popup */}
       {selectedRoute && (
-        <RouteDetailPopup
+          <RouteDetailPopup
           route={selectedRoute}
           onClose={() => setSelectedRoute(null)}
+          onCopySystems={copyRouteSystems}
         />
       )}
     </div>
@@ -227,9 +232,11 @@ function SortTh({
 function RouteDetailPopup({
   route,
   onClose,
+  onCopySystems,
 }: {
   route: RouteResult;
   onClose: () => void;
+  onCopySystems: (route: RouteResult) => void;
 }) {
   const { t } = useI18n();
 
@@ -326,7 +333,13 @@ function RouteDetailPopup({
             <span className="text-eve-dim">{t("routeHopsCol")}: </span>
             <span className="font-mono text-eve-text">{route.HopCount}</span>
           </div>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={() => onCopySystems(route)}
+              className="px-3 py-1 rounded-sm text-xs font-medium text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors cursor-pointer"
+            >
+              {t("copyRouteSystems")}
+            </button>
             <button
               onClick={() => {
                 const lines = ["=== EVE Flipper Route ==="];

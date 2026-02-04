@@ -10,6 +10,8 @@ import {
   SettingsGrid,
 } from "./TabSettingsPanel";
 import { SystemAutocomplete } from "./SystemAutocomplete";
+import { EmptyState } from "./EmptyState";
+import { useGlobalToast } from "./Toast";
 
 // Highlight matching text in search results
 function HighlightMatch({ text, query }: { text: string; query: string }) {
@@ -37,6 +39,7 @@ interface Props {
 
 export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const { t } = useI18n();
+  const { addToast } = useGlobalToast();
 
   // Search state
   const [searchQuery, setSearchQuery] = useState("");
@@ -201,6 +204,7 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
           hint={t("industrySettingsHint")}
           icon="🏭"
           defaultExpanded={true}
+          help={{ stepKeys: ["helpIndustryStep1", "helpIndustryStep2", "helpIndustryStep3"], wikiSlug: "Industry-Chain-Optimizer" }}
         >
           {/* Item Search */}
           <div className="mb-4">
@@ -341,8 +345,8 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
             />
           </div>
 
-          {/* View Toggle */}
-          <div className="shrink-0 flex items-center gap-2 mb-2">
+          {/* View Toggle + Export */}
+          <div className="shrink-0 flex items-center gap-2 mb-2 flex-wrap">
             <button
               onClick={() => setViewMode("tree")}
               className={`px-3 py-1 text-xs rounded-sm transition-colors ${
@@ -363,6 +367,43 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
             >
               {t("industryShoppingList")}
             </button>
+            {viewMode === "shopping" && result.flat_materials.length > 0 && (
+              <>
+                <button
+                  onClick={() => {
+                    const header = "Item\tQuantity\tUnit Price\tTotal\tVolume (m³)";
+                    const rows = result.flat_materials.map(
+                      (m) => `${m.type_name}\t${m.quantity}\t${m.unit_price}\t${m.total_price}\t${m.volume}`
+                    );
+                    navigator.clipboard.writeText([header, ...rows].join("\n"));
+                    addToast(t("copied"), "success", 2000);
+                  }}
+                  className="px-3 py-1 text-xs rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
+                >
+                  {t("industryExportClipboard")}
+                </button>
+                <button
+                  onClick={() => {
+                    const header = "Item,Quantity,Unit Price,Total,Volume (m³)";
+                    const rows = result.flat_materials.map(
+                      (m) => `"${(m.type_name || "").replace(/"/g, '""')}",${m.quantity},${m.unit_price},${m.total_price},${m.volume}`
+                    );
+                    const csv = "\uFEFF" + [header, ...rows].join("\n");
+                    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `industry-shopping-list-${new Date().toISOString().slice(0, 10)}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    addToast(t("industryExportCSV"), "success", 2000);
+                  }}
+                  className="px-3 py-1 text-xs rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
+                >
+                  {t("industryExportCSV")}
+                </button>
+              </>
+            )}
           </div>
 
           {/* Content */}
@@ -378,8 +419,8 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
 
       {/* Empty State */}
       {!result && !analyzing && (
-        <div className="flex-1 flex items-center justify-center text-eve-dim text-sm">
-          {t("industryPrompt")}
+        <div className="flex-1 flex items-center justify-center min-h-[200px]">
+          <EmptyState reason="no_item_selected" wikiSlug="Industry-Chain-Optimizer" />
         </div>
       )}
     </div>
