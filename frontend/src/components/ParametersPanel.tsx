@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { SystemAutocomplete } from "./SystemAutocomplete";
-import { useI18n } from "@/lib/i18n";
+import { useI18n, type TranslationKey } from "@/lib/i18n";
 import { useGlobalToast } from "./Toast";
 import { TabHelp } from "./TabHelp";
 import type { ScanParams } from "@/lib/types";
@@ -250,7 +250,7 @@ function RouteSecurityField({
   value: number;
   onChange: (v: number) => void;
   inputClass: string;
-  t: (key: string) => string;
+  t: (key: TranslationKey) => string;
 }) {
   const isPreset = ROUTE_SECURITY_PRESETS.some((p) => Math.abs(p - value) < 1e-6);
   const selectValue = isPreset ? String(value) : "custom";
