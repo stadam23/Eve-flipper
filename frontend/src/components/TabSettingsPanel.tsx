@@ -1,10 +1,13 @@
 import { useState, type ReactNode } from "react";
+import { TabHelp } from "./TabHelp";
 
 interface TabSettingsPanelProps {
   title: string;
   hint?: string;
   icon?: string;
   defaultExpanded?: boolean;
+  /** Optional help: step keys and wiki slug for ? button */
+  help?: { stepKeys: string[]; wikiSlug: string };
   children: ReactNode;
 }
 
@@ -17,6 +20,7 @@ export function TabSettingsPanel({
   hint,
   icon = "⚙",
   defaultExpanded = false,
+  help,
   children,
 }: TabSettingsPanelProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
@@ -32,7 +36,10 @@ export function TabSettingsPanel({
           <span className="text-sm font-medium text-eve-text">{title}</span>
           {hint && <span className="text-xs text-eve-dim">— {hint}</span>}
         </div>
-        <span className="text-eve-dim text-xs">{expanded ? "▲" : "▼"}</span>
+        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+          {help && <TabHelp stepKeys={help.stepKeys} wikiSlug={help.wikiSlug} />}
+          <span className="text-eve-dim text-xs">{expanded ? "▲" : "▼"}</span>
+        </div>
       </button>
 
       {expanded && (

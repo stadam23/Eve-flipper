@@ -2,6 +2,7 @@ import { useState, useMemo } from "react";
 import type { ContractResult } from "@/lib/types";
 import { formatISK, formatMargin } from "@/lib/format";
 import { useI18n, type TranslationKey } from "@/lib/i18n";
+import { EmptyState, type EmptyReason } from "./EmptyState";
 
 type SortKey = keyof ContractResult;
 type SortDir = "asc" | "desc";
@@ -10,6 +11,8 @@ interface Props {
   results: ContractResult[];
   scanning: boolean;
   progress: string;
+  /** When 0 results, show these filter hints (e.g. "Min price: 10M", "Max margin: 100%") */
+  filterHints?: string[];
 }
 
 const columnDefs: { key: SortKey; labelKey: TranslationKey; width: string; numeric: boolean }[] = [
@@ -29,8 +32,11 @@ function rowKey(row: ContractResult) {
   return `contract-${row.ContractID}`;
 }
 
-export function ContractResultsTable({ results, scanning, progress }: Props) {
+export function ContractResultsTable({ results, scanning, progress, filterHints }: Props) {
   const { t } = useI18n();
+  const emptyReason: EmptyReason = (results.length === 0 && filterHints && filterHints.length > 0)
+    ? "filters_too_strict"
+    : "no_scan_yet";
 
   const [sortKey, setSortKey] = useState<SortKey>("Profit");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -249,8 +255,12 @@ export function ContractResultsTable({ results, scanning, progress }: Props) {
             ))}
             {results.length === 0 && !scanning && (
               <tr>
-                <td colSpan={columnDefs.length} className="px-3 py-8 text-center text-eve-dim">
-                  {t("scanContractsPrompt")}
+                <td colSpan={columnDefs.length} className="p-0">
+                  <EmptyState
+                    reason={emptyReason}
+                    hints={filterHints}
+                    wikiSlug="Contract-Arbitrage"
+                  />
                 </td>
               </tr>
             )}

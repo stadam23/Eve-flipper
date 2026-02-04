@@ -38,6 +38,7 @@ export function ContractParametersPanel({ params, onChange }: Props) {
       title={t("contractFilters")}
       hint={t("contractFiltersHint")}
       icon="📜"
+      help={{ stepKeys: ["helpContractsStep1", "helpContractsStep2", "helpContractsStep3"], wikiSlug: "Contract-Arbitrage" }}
     >
       <SettingsGrid cols={4}>
         <SettingsField label={t("minContractPrice")}>
