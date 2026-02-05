@@ -111,7 +111,8 @@ Grab the latest release for your platform:
 |:--------:|:--------:|
 | <img src="https://img.icons8.com/color/48/windows-10.png" width="24"/> **Windows** | [`eve-flipper-windows-amd64.exe`](https://github.com/ilyaux/Eve-flipper/releases/latest) |
 | <img src="https://img.icons8.com/color/48/linux.png" width="24"/> **Linux** | [`eve-flipper-linux-amd64`](https://github.com/ilyaux/Eve-flipper/releases/latest) |
-| <img src="https://img.icons8.com/color/48/mac-os.png" width="24"/> **macOS** | [`eve-flipper-darwin-arm64`](https://github.com/ilyaux/Eve-flipper/releases/latest) |
+| <img src="https://img.icons8.com/color/48/mac-os.png" width="24"/> **macOS (Apple Silicon)** | [`eve-flipper-darwin-arm64`](https://github.com/ilyaux/Eve-flipper/releases/latest) |
+| <img src="https://img.icons8.com/color/48/mac-os.png" width="24"/> **macOS (Intel)** | [`eve-flipper-darwin-amd64`](https://github.com/ilyaux/Eve-flipper/releases/latest) |
 
 ### Run
 
