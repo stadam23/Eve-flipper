@@ -22,10 +22,18 @@ type Data struct {
 	Systems      map[int32]*SolarSystem // systemID -> system
 	SystemByName map[string]int32       // lowercase name -> systemID
 	SystemNames  []string               // all system names for autocomplete
+	Regions      map[int32]*Region      // regionID -> region
+	RegionByName map[string]int32       // lowercase name -> regionID
 	Types        map[int32]*ItemType    // typeID -> type
 	Stations     map[int64]*Station     // stationID -> station
 	Universe     *graph.Universe
 	Industry     *IndustryData          // blueprints, reprocessing, etc.
+}
+
+// Region represents an EVE region from the SDE.
+type Region struct {
+	ID   int32
+	Name string
 }
 
 // SolarSystem represents an EVE solar system from the SDE.
@@ -69,11 +77,17 @@ func Load(dataDir string) (*Data, error) {
 	data := &Data{
 		Systems:      make(map[int32]*SolarSystem),
 		SystemByName: make(map[string]int32),
+		Regions:      make(map[int32]*Region),
+		RegionByName: make(map[string]int32),
 		Types:        make(map[int32]*ItemType),
 		Stations:     make(map[int64]*Station),
 		Universe:     graph.NewUniverse(),
 	}
 
+	logger.Info("SDE", "Loading regions...")
+	if err := data.loadRegions(extractDir); err != nil {
+		return nil, err
+	}
 	logger.Info("SDE", "Loading solar systems...")
 	if err := data.loadSystems(extractDir); err != nil {
 		return nil, err
@@ -109,11 +123,43 @@ func Load(dataDir string) (*Data, error) {
 	data.Industry = industry
 
 	logger.Section("SDE Statistics")
+	logger.Stats("Regions", len(data.Regions))
 	logger.Stats("Systems", len(data.Systems))
 	logger.Stats("Item types", len(data.Types))
 	logger.Stats("Stations", len(data.Stations))
 	logger.Stats("Blueprints", len(data.Industry.Blueprints))
 	return data, nil
+}
+
+// RegionNames returns a map of region ID to region name.
+func (d *Data) RegionNames() map[int32]string {
+	names := make(map[int32]string, len(d.Regions))
+	for id, r := range d.Regions {
+		names[id] = r.Name
+	}
+	return names
+}
+
+func (d *Data) loadRegions(dir string) error {
+	return readJSONL(dir, "mapRegions", func(raw json.RawMessage) error {
+		var r struct {
+			Key  int32             `json:"_key"`
+			Name map[string]string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return err
+		}
+		name := r.Name["en"]
+		if name == "" {
+			return nil
+		}
+		d.Regions[r.Key] = &Region{
+			ID:   r.Key,
+			Name: name,
+		}
+		d.RegionByName[strings.ToLower(name)] = r.Key
+		return nil
+	})
 }
 
 func (d *Data) loadSystems(dir string) error {

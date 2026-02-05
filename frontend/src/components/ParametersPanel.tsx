@@ -1,6 +1,7 @@
 import { useState, useCallback } from "react";
 import { SystemAutocomplete } from "./SystemAutocomplete";
-import { useI18n, type TranslationKey } from "@/lib/i18n";
+import { RegionAutocomplete } from "./RegionAutocomplete";
+import { useI18n } from "@/lib/i18n";
 import { useGlobalToast } from "./Toast";
 import { TabHelp } from "./TabHelp";
 import type { ScanParams } from "@/lib/types";
@@ -87,7 +88,7 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
 
   return (
     <div className="bg-eve-panel border border-eve-border rounded-sm overflow-hidden">
-      {/* Header: help + preset row */}
+      {/* Header: preset + help */}
       <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-eve-border/60 bg-eve-panel/80">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-[10px] uppercase tracking-wider text-eve-dim font-medium shrink-0">
@@ -123,64 +124,88 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
         {help && <TabHelp stepKeys={help.steps} wikiSlug={help.wiki} />}
       </div>
 
-      <div className="p-4 w-full">
-        {/* Full-width grid: 4 equal columns, labels stay on one line */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-5 w-full">
-          <Field label={t("system")} title={t("system")}>
+      <div className="p-3">
+        {/* Main grid - 4 columns on desktop, 2 on mobile */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-3">
+          {/* Row 1 */}
+          <Field label={t("system")}>
             <SystemAutocomplete
               value={params.system_name}
               onChange={(v) => set("system_name", v)}
               isLoggedIn={isLoggedIn}
             />
           </Field>
-          <Field label={t("paramsCargo")} title={t("cargoCapacity")}>
-            <NumberInput
-              value={params.cargo_capacity}
-              onChange={(v) => set("cargo_capacity", v)}
-              min={1}
-              max={1000000}
-              className={inputClass}
-            />
-          </Field>
-          <Field label={t("paramsBuy")} title={t("buyRadius")}>
+          
+          {tab === "region" ? (
+            <Field label={t("targetRegion") || "Target Region"} hint={t("targetRegionHint")}>
+              <RegionAutocomplete
+                value={params.target_region ?? ""}
+                onChange={(v) => set("target_region", v)}
+                placeholder="Delve, Catch, Vale of the Silent..."
+              />
+            </Field>
+          ) : (
+            <Field label={t("paramsCargo")}>
+              <NumberInput
+                value={params.cargo_capacity}
+                onChange={(v) => set("cargo_capacity", v)}
+                min={1}
+                max={1000000}
+              />
+            </Field>
+          )}
+          
+          <Field label={t("paramsBuy")}>
             <NumberInput
               value={params.buy_radius}
               onChange={(v) => set("buy_radius", v)}
               min={1}
               max={50}
-              className={inputClass}
             />
           </Field>
-          <Field label={t("paramsSell")} title={t("sellRadius")}>
+          
+          <Field label={t("paramsSell")}>
             <NumberInput
               value={params.sell_radius}
               onChange={(v) => set("sell_radius", v)}
               min={1}
               max={50}
-              className={inputClass}
             />
           </Field>
-          <Field label={t("paramsMargin")} title={t("minMargin")}>
+
+          {/* Row 2 */}
+          {tab === "region" && (
+            <Field label={t("paramsCargo")}>
+              <NumberInput
+                value={params.cargo_capacity}
+                onChange={(v) => set("cargo_capacity", v)}
+                min={1}
+                max={1000000}
+              />
+            </Field>
+          )}
+          
+          <Field label={t("paramsMargin")}>
             <NumberInput
               value={params.min_margin}
               onChange={(v) => set("min_margin", v)}
               min={0.1}
               max={1000}
               step={0.1}
-              className={inputClass}
             />
           </Field>
-          <Field label={t("paramsTax")} title={t("salesTax")}>
+          
+          <Field label={t("paramsTax")}>
             <NumberInput
               value={params.sales_tax_percent}
               onChange={(v) => set("sales_tax_percent", v)}
               min={0}
               max={100}
               step={0.1}
-              className={inputClass}
             />
           </Field>
-          <Field label={t("paramsResults")} title={t("maxResults")}>
+          
+          <Field label={t("paramsResults")}>
             <select
               value={params.max_results ?? 100}
               onChange={(e) => set("max_results", parseInt(e.target.value))}
@@ -193,16 +218,10 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
               <option value={1000}>1000</option>
             </select>
           </Field>
-          <RouteSecurityField
-            value={params.min_route_security ?? 0}
-            onChange={(v) => set("min_route_security", v)}
-            inputClass={inputClass}
-            t={t}
-          />
         </div>
 
-        {/* Advanced: collapsible */}
-        <div className="border-t border-eve-border/50 mt-4 pt-3">
+        {/* Advanced filters toggle */}
+        <div className="border-t border-eve-border/50 mt-3 pt-2">
           <button
             type="button"
             onClick={() => setShowAdvanced((a) => !a)}
@@ -211,24 +230,37 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
             <span className={`transition-transform ${showAdvanced ? "rotate-90" : ""}`}>▸</span>
             {t("advancedFilters")}
           </button>
+          
           {showAdvanced && (
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-5 mt-3 w-full">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-3 mt-3">
+              <Field label={t("paramsSecurity")}>
+                <select
+                  value={String(params.min_route_security ?? 0)}
+                  onChange={(e) => set("min_route_security", parseFloat(e.target.value))}
+                  className={inputClass}
+                >
+                  <option value="0">{t("routeSecurityAll")}</option>
+                  <option value="0.45">{t("routeSecurityHighsec")}</option>
+                  <option value="0.5">{t("routeSecurityMin05")}</option>
+                  <option value="0.7">{t("routeSecurityMin07")}</option>
+                </select>
+              </Field>
+              
               <Field label={t("minDailyVolume")}>
                 <NumberInput
                   value={params.min_daily_volume ?? 0}
                   onChange={(v) => set("min_daily_volume", v)}
                   min={0}
                   max={999999999}
-                  className={inputClass}
                 />
               </Field>
+              
               <Field label={t("maxInvestment")}>
                 <NumberInput
                   value={params.max_investment ?? 0}
                   onChange={(v) => set("max_investment", v)}
                   min={0}
                   max={999999999999}
-                  className={inputClass}
                 />
               </Field>
             </div>
@@ -239,82 +271,27 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
   );
 }
 
-const ROUTE_SECURITY_PRESETS = [0, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9] as const;
-
-function RouteSecurityField({
-  value,
-  onChange,
-  inputClass,
-  t,
-}: {
-  value: number;
-  onChange: (v: number) => void;
-  inputClass: string;
-  t: (key: TranslationKey) => string;
-}) {
-  const isPreset = ROUTE_SECURITY_PRESETS.some((p) => Math.abs(p - value) < 1e-6);
-  const selectValue = isPreset ? String(value) : "custom";
-
-  return (
-    <Field label={t("paramsSecurity")} title={t("routeSecurityHint")}>
-      <div className="flex gap-2 items-stretch">
-        <select
-          value={selectValue}
-          onChange={(e) => {
-            const v = e.target.value;
-            if (v === "custom") {
-              // set to a value not in presets so that selectValue becomes "custom" and input appears
-              onChange(0.35);
-              return;
-            }
-            onChange(parseFloat(v));
-          }}
-          className={`flex-1 min-w-0 ${inputClass}`}
-        >
-          <option value="0">{t("routeSecurityAll")}</option>
-          <option value="0.45">{t("routeSecurityHighsec")}</option>
-          <option value="0.5">{t("routeSecurityMin05")}</option>
-          <option value="0.6">{t("routeSecurityMin06")}</option>
-          <option value="0.7">{t("routeSecurityMin07")}</option>
-          <option value="0.8">{t("routeSecurityMin08")}</option>
-          <option value="0.9">{t("routeSecurityMin09")}</option>
-          <option value="custom">{t("routeSecurityCustom")}</option>
-        </select>
-        {selectValue === "custom" && (
-          <input
-            type="number"
-            min={-1}
-            max={1}
-            step={0.1}
-            value={value}
-            onChange={(e) => {
-              const v = parseFloat(e.target.value);
-              if (!Number.isNaN(v)) onChange(Math.max(-1, Math.min(1, v)));
-            }}
-            className={`w-16 ${inputClass}`}
-            title={t("routeSecurityHint")}
-          />
-        )}
-      </div>
-    </Field>
-  );
-}
-
 function Field({
   label,
+  hint,
   children,
-  className = "",
-  title,
 }: {
   label: string;
+  hint?: string;
   children: React.ReactNode;
-  className?: string;
-  title?: string;
 }) {
   return (
-    <div className={`flex flex-col gap-1.5 min-w-0 ${className}`} title={title}>
-      <label className="text-[10px] uppercase tracking-wider text-eve-dim font-medium whitespace-nowrap truncate">
+    <div className="flex flex-col gap-1 min-w-0">
+      <label className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-eve-dim font-medium truncate" title={hint}>
         {label}
+        {hint && (
+          <span className="text-eve-dim/60 hover:text-eve-accent cursor-help" title={hint}>
+            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
+          </span>
+        )}
       </label>
       {children}
     </div>
@@ -327,14 +304,12 @@ function NumberInput({
   min,
   max,
   step = 1,
-  className = "",
 }: {
   value: number;
   onChange: (v: number) => void;
   min: number;
   max: number;
   step?: number;
-  className?: string;
 }) {
   return (
     <input
@@ -347,7 +322,7 @@ function NumberInput({
       min={min}
       max={max}
       step={step}
-      className={className || inputClass}
+      className={inputClass}
     />
   );
 }

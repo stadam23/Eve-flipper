@@ -16,6 +16,7 @@ import (
 	"eve-flipper/internal/engine"
 	"eve-flipper/internal/esi"
 	"eve-flipper/internal/sde"
+	"eve-flipper/internal/zkillboard"
 )
 
 // Server is the HTTP API server that connects the ESI client, scanner engine, and database.
@@ -24,6 +25,7 @@ type Server struct {
 	sdeData          *sde.Data
 	scanner          *engine.Scanner
 	industryAnalyzer *engine.IndustryAnalyzer
+	demandAnalyzer   *zkillboard.DemandAnalyzer
 	esi              *esi.Client
 	db               *db.DB
 	sso              *auth.SSOConfig
@@ -53,6 +55,10 @@ func (s *Server) SetSDE(data *sde.Data) {
 	scanner.History = s.db
 	s.scanner = scanner
 	s.industryAnalyzer = engine.NewIndustryAnalyzer(data, s.esi)
+	
+	// Initialize demand analyzer with region names from SDE
+	s.demandAnalyzer = zkillboard.NewDemandAnalyzer(data.RegionNames())
+	
 	s.ready = true
 }
 
@@ -69,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("POST /api/config", s.handleSetConfig)
 	mux.HandleFunc("GET /api/systems/autocomplete", s.handleAutocomplete)
+	mux.HandleFunc("GET /api/regions/autocomplete", s.handleRegionAutocomplete)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("POST /api/scan/multi-region", s.handleScanMultiRegion)
 	mux.HandleFunc("POST /api/scan/contracts", s.handleScanContracts)
@@ -96,6 +103,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/industry/search", s.handleIndustrySearch)
 	mux.HandleFunc("GET /api/industry/systems", s.handleIndustrySystems)
 	mux.HandleFunc("GET /api/industry/status", s.handleIndustryStatus)
+	// Demand / War Tracker
+	mux.HandleFunc("GET /api/demand/regions", s.handleDemandRegions)
+	mux.HandleFunc("GET /api/demand/hotzones", s.handleDemandHotZones)
+	mux.HandleFunc("GET /api/demand/region/{regionID}", s.handleDemandRegion)
+	mux.HandleFunc("GET /api/demand/opportunities/{regionID}", s.handleDemandOpportunities)
+	mux.HandleFunc("POST /api/demand/refresh", s.handleDemandRefresh)
 	return corsMiddleware(mux)
 }
 
@@ -219,6 +232,35 @@ func (s *Server) handleAutocomplete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string][]string{"systems": result})
 }
 
+func (s *Server) handleRegionAutocomplete(w http.ResponseWriter, r *http.Request) {
+	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	if q == "" || !s.isReady() {
+		writeJSON(w, map[string][]string{"regions": {}})
+		return
+	}
+
+	s.mu.RLock()
+	regions := s.sdeData.Regions
+	s.mu.RUnlock()
+
+	var prefix, contains []string
+	for _, region := range regions {
+		lower := strings.ToLower(region.Name)
+		if strings.HasPrefix(lower, q) {
+			prefix = append(prefix, region.Name)
+		} else if strings.Contains(lower, q) {
+			contains = append(contains, region.Name)
+		}
+	}
+
+	result := append(prefix, contains...)
+	if len(result) > 15 {
+		result = result[:15]
+	}
+
+	writeJSON(w, map[string][]string{"regions": result})
+}
+
 type scanRequest struct {
 	SystemName      string  `json:"system_name"`
 	CargoCapacity   float64 `json:"cargo_capacity"`
@@ -231,6 +273,7 @@ type scanRequest struct {
 	MaxInvestment    float64 `json:"max_investment"`
 	MaxResults       int     `json:"max_results"`
 	MinRouteSecurity float64 `json:"min_route_security"` // 0 = all; 0.45 = highsec only; 0.7 = min 0.7
+	TargetRegion     string  `json:"target_region"`      // Empty = search all by radius; region name = search only in that region
 	// Contract-specific filters
 	MinContractPrice  float64 `json:"min_contract_price"`
 	MaxContractMargin float64 `json:"max_contract_margin"`
@@ -245,7 +288,16 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 
 	s.mu.RLock()
 	systemID, ok := s.sdeData.SystemByName[strings.ToLower(req.SystemName)]
+	
+	// Parse target region if specified
+	var targetRegionID int32
+	if req.TargetRegion != "" {
+		if regionID, ok := s.sdeData.RegionByName[strings.ToLower(req.TargetRegion)]; ok {
+			targetRegionID = regionID
+		}
+	}
 	s.mu.RUnlock()
+	
 	if !ok {
 		return engine.ScanParams{}, fmt.Errorf("system not found: %s", req.SystemName)
 	}
@@ -261,6 +313,7 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 		MaxInvestment:     req.MaxInvestment,
 		MinRouteSecurity:  req.MinRouteSecurity,
 		MaxResults:        req.MaxResults,
+		TargetRegionID:    targetRegionID,
 		MinContractPrice:  req.MinContractPrice,
 		MaxContractMargin: req.MaxContractMargin,
 		MinPricedRatio:    req.MinPricedRatio,
@@ -1367,5 +1420,340 @@ func (s *Server) handleIndustryStatus(w http.ResponseWriter, r *http.Request) {
 		"products_with_bp":    productCount,
 		"total_types":         len(sdeData.Types),
 		"industry_data_ready": sdeData.Industry != nil,
+	})
+}
+
+// --- Demand / War Tracker Handlers ---
+
+// handleDemandRegions returns cached demand data for all regions.
+func (s *Server) handleDemandRegions(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	// Try to get from cache first
+	regions, err := s.db.GetDemandRegions()
+	if err != nil {
+		writeError(w, 500, "failed to get demand regions: "+err.Error())
+		return
+	}
+
+	// If cache is empty or stale, return what we have but suggest refresh
+	cacheAge := 0
+	if len(regions) > 0 {
+		cacheAge = int(time.Since(regions[0].UpdatedAt).Minutes())
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"regions":    regions,
+		"count":      len(regions),
+		"cache_age_minutes": cacheAge,
+		"stale":      len(regions) == 0 || !s.db.IsDemandCacheFresh(60*time.Minute),
+	})
+}
+
+// handleDemandHotZones returns regions with elevated kill activity.
+func (s *Server) handleDemandHotZones(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 20
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	// Check if cache is fresh (less than 1 hour old)
+	if s.db.IsDemandCacheFresh(60 * time.Minute) {
+		// Return from cache
+		zones, err := s.db.GetHotZones(limit)
+		if err != nil {
+			writeError(w, 500, "failed to get hot zones: "+err.Error())
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"hot_zones": zones,
+			"count":     len(zones),
+			"from_cache": true,
+		})
+		return
+	}
+
+	// Cache is stale - fetch fresh data
+	s.mu.RLock()
+	analyzer := s.demandAnalyzer
+	s.mu.RUnlock()
+
+	if analyzer == nil {
+		writeError(w, 503, "demand analyzer not ready")
+		return
+	}
+
+	zones, err := analyzer.GetHotZones(limit)
+	if err != nil {
+		writeError(w, 500, "failed to analyze hot zones: "+err.Error())
+		return
+	}
+
+	// Cache the results
+	for _, z := range zones {
+		s.db.SaveDemandRegion(&db.DemandRegion{
+			RegionID:      z.RegionID,
+			RegionName:    z.RegionName,
+			HotScore:      z.HotScore,
+			Status:        z.Status,
+			KillsToday:    z.KillsToday,
+			KillsBaseline: z.KillsBaseline,
+			ISKDestroyed:  z.ISKDestroyed,
+			ActivePlayers: z.ActivePlayers,
+			TopShips:      z.TopShips,
+		})
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"hot_zones": zones,
+		"count":     len(zones),
+		"from_cache": false,
+	})
+}
+
+// handleDemandRegion returns detailed demand data for a single region.
+func (s *Server) handleDemandRegion(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	regionIDStr := r.PathValue("regionID")
+	regionID, err := strconv.ParseInt(regionIDStr, 10, 32)
+	if err != nil {
+		writeError(w, 400, "invalid region ID")
+		return
+	}
+
+	// Try cache first
+	cached, err := s.db.GetDemandRegion(int32(regionID))
+	if err != nil {
+		writeError(w, 500, "failed to get region: "+err.Error())
+		return
+	}
+
+	if cached != nil && time.Since(cached.UpdatedAt) < 60*time.Minute {
+		writeJSON(w, map[string]interface{}{
+			"region":     cached,
+			"from_cache": true,
+		})
+		return
+	}
+
+	// Fetch fresh data
+	s.mu.RLock()
+	analyzer := s.demandAnalyzer
+	s.mu.RUnlock()
+
+	if analyzer == nil {
+		writeError(w, 503, "demand analyzer not ready")
+		return
+	}
+
+	zone, err := analyzer.GetSingleRegionStats(int32(regionID))
+	if err != nil {
+		writeError(w, 500, "failed to get region stats: "+err.Error())
+		return
+	}
+
+	if zone == nil {
+		writeError(w, 404, "region not found")
+		return
+	}
+
+	// Cache the result
+	s.db.SaveDemandRegion(&db.DemandRegion{
+		RegionID:      zone.RegionID,
+		RegionName:    zone.RegionName,
+		HotScore:      zone.HotScore,
+		Status:        zone.Status,
+		KillsToday:    zone.KillsToday,
+		KillsBaseline: zone.KillsBaseline,
+		ISKDestroyed:  zone.ISKDestroyed,
+		ActivePlayers: zone.ActivePlayers,
+		TopShips:      zone.TopShips,
+	})
+
+	writeJSON(w, map[string]interface{}{
+		"region":     zone,
+		"from_cache": false,
+	})
+}
+
+// handleDemandOpportunities returns trade opportunities for a specific region.
+func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	regionIDStr := r.PathValue("regionID")
+	regionIDInt, err := strconv.Atoi(regionIDStr)
+	if err != nil {
+		writeError(w, 400, "invalid region ID")
+		return
+	}
+	regionID := int32(regionIDInt)
+
+	s.mu.RLock()
+	analyzer := s.demandAnalyzer
+	esiClient := s.esi
+	sdeData := s.sdeData
+	s.mu.RUnlock()
+
+	if analyzer == nil {
+		writeError(w, 503, "demand analyzer not ready")
+		return
+	}
+
+	// Get opportunities
+	opportunities, err := analyzer.GetRegionOpportunities(regionID, esiClient)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("failed to get opportunities: %v", err))
+		return
+	}
+
+	if opportunities == nil {
+		writeError(w, 404, "region not found or no data")
+		return
+	}
+
+	// Resolve type names from SDE
+	if sdeData != nil {
+		for i := range opportunities.Ships {
+			if opportunities.Ships[i].TypeName == "" {
+				if t, ok := sdeData.Types[opportunities.Ships[i].TypeID]; ok {
+					opportunities.Ships[i].TypeName = t.Name
+				}
+			}
+		}
+		
+		// Calculate security class and jumps from Jita
+		const jitaSystemID = int32(30000142)
+		
+		// Find systems in this region and calculate security distribution
+		var highCount, lowCount, nullCount int
+		var closestDistance = 999999
+		var mainSystemName string
+		
+		for _, sys := range sdeData.Systems {
+			if sys.RegionID == regionID {
+				// Count security types
+				if sys.Security >= 0.45 {
+					highCount++
+				} else if sys.Security > 0.0 {
+					lowCount++
+				} else {
+					nullCount++
+				}
+				
+				// Find closest system to Jita (using graph if available)
+				if sdeData.Universe != nil {
+					dist := sdeData.Universe.ShortestPath(jitaSystemID, sys.ID)
+					if dist >= 0 && dist < closestDistance {
+						closestDistance = dist
+						mainSystemName = sys.Name
+					}
+				}
+			}
+		}
+		
+		// Determine dominant security class
+		total := highCount + lowCount + nullCount
+		if total > 0 {
+			// Build security blocks array
+			var blocks []string
+			if highCount > 0 {
+				blocks = append(blocks, "high")
+			}
+			if lowCount > 0 {
+				blocks = append(blocks, "low")
+			}
+			if nullCount > 0 {
+				blocks = append(blocks, "null")
+			}
+			opportunities.SecurityBlocks = blocks
+			
+			// Dominant class
+			if nullCount > highCount && nullCount > lowCount {
+				opportunities.SecurityClass = "nullsec"
+			} else if lowCount > highCount {
+				opportunities.SecurityClass = "lowsec"
+			} else if highCount > 0 {
+				opportunities.SecurityClass = "highsec"
+			} else {
+				opportunities.SecurityClass = "nullsec"
+			}
+		}
+		
+		// Set jumps from Jita
+		if closestDistance < 999999 {
+			opportunities.JumpsFromJita = closestDistance
+			opportunities.MainSystem = mainSystemName
+		}
+	}
+
+	writeJSON(w, opportunities)
+}
+
+// handleDemandRefresh forces a refresh of demand data for all regions.
+func (s *Server) handleDemandRefresh(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	s.mu.RLock()
+	analyzer := s.demandAnalyzer
+	s.mu.RUnlock()
+
+	if analyzer == nil {
+		writeError(w, 503, "demand analyzer not ready")
+		return
+	}
+
+	// Clear in-memory cache first to force fresh API calls
+	analyzer.ClearCache()
+	log.Printf("[Demand] Cache cleared, starting refresh...")
+
+	// Refresh synchronously (zkillboard rate limiting will pace requests)
+	zones, err := analyzer.GetHotZones(0) // 0 = no limit
+	if err != nil {
+		log.Printf("[Demand] Refresh failed: %v", err)
+		writeError(w, 500, fmt.Sprintf("refresh failed: %v", err))
+		return
+	}
+
+	// Cache all results to database
+	for _, z := range zones {
+		s.db.SaveDemandRegion(&db.DemandRegion{
+			RegionID:      z.RegionID,
+			RegionName:    z.RegionName,
+			HotScore:      z.HotScore,
+			Status:        z.Status,
+			KillsToday:    z.KillsToday,
+			KillsBaseline: z.KillsBaseline,
+			ISKDestroyed:  z.ISKDestroyed,
+			ActivePlayers: z.ActivePlayers,
+			TopShips:      z.TopShips,
+		})
+	}
+	log.Printf("[Demand] Refreshed %d regions", len(zones))
+
+	writeJSON(w, map[string]interface{}{
+		"status":  "refreshed",
+		"message": fmt.Sprintf("Refreshed %d regions", len(zones)),
+		"count":   len(zones),
 	})
 }

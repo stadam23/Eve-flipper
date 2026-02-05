@@ -107,6 +107,66 @@ const translations = {
 
     // Industry
     tabIndustry: "Индустрия",
+    
+    // War Tracker / Demand
+    tabDemand: "Война",
+    warTrackerTitle: "Трекер Войн",
+    warTrackerDesc: "Мониторинг боевой активности по регионам EVE для поиска торговых возможностей",
+    warZones: "Зоны войны",
+    conflicts: "Конфликты",
+    elevated: "Повышенная",
+    normal: "Нормальная",
+    warZonesTitle: "Активные зоны войны",
+    conflictsTitle: "Активные конфликты",
+    elevatedTitle: "Повышенная активность",
+    normalTitle: "Нормальная активность",
+    fromCache: "Из кэша",
+    refresh: "Обновить",
+    refreshing: "Обновление...",
+    loadingRegions: "Загрузка данных регионов...",
+    noDataYet: "Данных пока нет",
+    loadRegionData: "Загрузить данные регионов",
+    statusWar: "Активная война",
+    statusConflict: "Зона конфликта",
+    statusElevated: "Повышенная активность",
+    statusNormal: "Нормальная активность",
+    hotScore: "Индекс активности",
+    killsPerDay: "Убийств/день",
+    activePlayers: "Активных игроков",
+    vsBaseline: "vs среднее",
+    topDestroyedShips: "Топ уничтоженных кораблей",
+    tradingOpportunity: "Торговая возможность",
+    buyInJita: "Купи в Jita",
+    buyInJitaDesc: "лучшие цены на модули и боеприпасы",
+    transportTo: "Перевези в",
+    transportDesc: "используй JF или публичные контракты",
+    sellHighDemand: "Продай по высокому спросу",
+    sellHighDemandDesc: "цены на 50-200% выше во время войн",
+    suggestedModules: "Рекомендуемые модули",
+    suggestedAmmo: "Рекомендуемые расходники",
+    totalIskDestroyed: "Всего ISK уничтожено",
+    findArbitrageOpportunities: "Найти арбитраж возможности",
+    switchingToRegion: "Переключение на региональный арбитраж для",
+    activityIndex: "Индекс активности",
+    loadingOpportunities: "Загрузка торговых возможностей...",
+    dailyProfitPotential: "Потенциал дневной прибыли",
+    basedOnDestroyedShips: "На основе уничтоженных кораблей и спроса",
+    shipOpportunities: "Возможности по кораблям",
+    moduleOpportunities: "Возможности по модулям",
+    ammoOpportunities: "Боеприпасы и расходники",
+    noOpportunities: "Значительных торговых возможностей не найдено. Цены близки к Jita.",
+    region: "Регион",
+    noSupply: "Нет предложения",
+    demand: "Спрос",
+    noCompetition: "БЕЗ КОНКУРЕНЦИИ",
+    sellFor: "Продай за",
+    jumpsFromJita: "прыжков от Jita",
+    targetRegion: "Целевой регион",
+    targetRegionHint: "Опционально. Если указан — поиск только в этом регионе. Если пусто — поиск по радиусу.",
+    targetRegionPlaceholder: "например The Kalevala Expanse",
+    targetRegionSet: "Целевой регион установлен:",
+    clear: "Очистить",
+    
     industrySettings: "Настройки производства",
     industrySettingsHint: "Анализ цепочки производства",
     industrySelectItem: "Выберите предмет",
@@ -514,6 +574,66 @@ const translations = {
 
     // Industry
     tabIndustry: "Industry",
+    
+    // War Tracker / Demand
+    tabDemand: "War Tracker",
+    warTrackerTitle: "War Tracker",
+    warTrackerDesc: "Monitor kill activity across EVE regions to find war profit opportunities",
+    warZones: "War Zones",
+    conflicts: "Conflicts",
+    elevated: "Elevated",
+    normal: "Normal",
+    warZonesTitle: "Active War Zones",
+    conflictsTitle: "Active Conflicts",
+    elevatedTitle: "Elevated Activity",
+    normalTitle: "Normal Activity",
+    fromCache: "From cache",
+    refresh: "Refresh Data",
+    refreshing: "Refreshing...",
+    loadingRegions: "Loading region data...",
+    noDataYet: "No data yet",
+    loadRegionData: "Load Region Data",
+    statusWar: "Active War",
+    statusConflict: "Conflict Zone",
+    statusElevated: "Elevated Activity",
+    statusNormal: "Normal Activity",
+    hotScore: "Hot Score",
+    killsPerDay: "Kills/Day",
+    activePlayers: "Active Players",
+    vsBaseline: "vs Baseline",
+    topDestroyedShips: "Top Destroyed Ships",
+    tradingOpportunity: "Trading Opportunity",
+    buyInJita: "Buy in Jita",
+    buyInJitaDesc: "best prices for modules and ammo",
+    transportTo: "Transport to",
+    transportDesc: "use JF or public contracts",
+    sellHighDemand: "Sell at high demand",
+    sellHighDemandDesc: "prices are 50-200% higher during wars",
+    suggestedModules: "Suggested Modules",
+    suggestedAmmo: "Suggested Ammo/Consumables",
+    totalIskDestroyed: "Total ISK Destroyed (All Time)",
+    findArbitrageOpportunities: "Find Arbitrage Opportunities",
+    switchingToRegion: "Switching to Regional Arbitrage for",
+    activityIndex: "Activity Index",
+    loadingOpportunities: "Loading trade opportunities...",
+    dailyProfitPotential: "Daily Profit Potential",
+    basedOnDestroyedShips: "Based on destroyed ships and demand",
+    shipOpportunities: "Ship Opportunities",
+    moduleOpportunities: "Module Opportunities",
+    ammoOpportunities: "Ammo & Consumables",
+    noOpportunities: "No significant trade opportunities found. Prices may be similar to Jita.",
+    region: "Region",
+    noSupply: "No supply",
+    demand: "Demand",
+    noCompetition: "NO COMPETITION",
+    sellFor: "Sell for",
+    jumpsFromJita: "jumps from Jita",
+    targetRegion: "Target Region",
+    targetRegionHint: "Optional. If set — search only in this region. If empty — search by radius.",
+    targetRegionPlaceholder: "e.g. The Kalevala Expanse",
+    targetRegionSet: "Target region set to",
+    clear: "Clear",
+    
     industrySettings: "Production Settings",
     industrySettingsHint: "Production chain analysis",
     industrySelectItem: "Select item",
@@ -829,11 +949,23 @@ interface I18nContextType {
 
 const I18nContext = createContext<I18nContextType>(null!);
 
-export function I18nProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocale] = useState<Locale>(() => {
+function getDefaultLocale(): Locale {
+  // Check localStorage first
+  try {
     const saved = localStorage.getItem("eve-flipper-locale");
-    return (saved === "en" || saved === "ru") ? saved : "ru";
-  });
+    if (saved === "en" || saved === "ru") return saved;
+  } catch {
+    // localStorage may be unavailable (private mode, etc.)
+  }
+  // Fall back to browser language
+  const browserLang = navigator.language?.toLowerCase() ?? "";
+  if (browserLang.startsWith("ru")) return "ru";
+  // Default to English for all other languages
+  return "en";
+}
+
+export function I18nProvider({ children }: { children: ReactNode }) {
+  const [locale, setLocale] = useState<Locale>(getDefaultLocale);
 
   const changeLocale = useCallback((l: Locale) => {
     setLocale(l);

@@ -225,6 +225,45 @@ func (d *DB) migrate() error {
 		logger.Info("DB", "Applied migration v4 (scan history)")
 	}
 
+	if version < 5 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS demand_region_cache (
+				region_id      INTEGER PRIMARY KEY,
+				region_name    TEXT NOT NULL,
+				hot_score      REAL NOT NULL DEFAULT 0,
+				status         TEXT NOT NULL DEFAULT 'normal',
+				kills_today    INTEGER NOT NULL DEFAULT 0,
+				kills_baseline INTEGER NOT NULL DEFAULT 0,
+				isk_destroyed  REAL NOT NULL DEFAULT 0,
+				active_players INTEGER NOT NULL DEFAULT 0,
+				top_ships      TEXT DEFAULT '[]',
+				stats_json     TEXT DEFAULT '{}',
+				updated_at     TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS demand_item_cache (
+				id             INTEGER PRIMARY KEY AUTOINCREMENT,
+				region_id      INTEGER NOT NULL,
+				type_id        INTEGER NOT NULL,
+				type_name      TEXT,
+				group_id       INTEGER,
+				group_name     TEXT,
+				losses_per_day INTEGER NOT NULL DEFAULT 0,
+				demand_score   REAL NOT NULL DEFAULT 0,
+				updated_at     TEXT NOT NULL,
+				UNIQUE(region_id, type_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_demand_item_region ON demand_item_cache(region_id);
+			CREATE INDEX IF NOT EXISTS idx_demand_item_score ON demand_item_cache(demand_score DESC);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (5);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v5: %w", err)
+		}
+		logger.Info("DB", "Applied migration v5 (demand cache)")
+	}
+
 	return nil
 }
 

@@ -154,6 +154,8 @@ export interface ScanParams {
   max_results?: number;
   /** Route security: 0 = all space, 0.45 = highsec only, 0.7 = min 0.7 */
   min_route_security?: number;
+  /** Target region name for regional arbitrage (empty = search all by radius) */
+  target_region?: string;
   // Contract-specific filters
   min_contract_price?: number;
   max_contract_margin?: number;
@@ -329,4 +331,67 @@ export interface IndustrySystem {
   reaction: number;
   copying: number;
   invention: number;
+}
+
+// --- Demand / War Tracker Types ---
+
+export interface DemandRegion {
+  region_id: number;
+  region_name: string;
+  hot_score: number;
+  status: "war" | "conflict" | "elevated" | "normal";
+  kills_today: number;
+  kills_baseline: number;
+  isk_destroyed: number;
+  active_players: number;
+  top_ships: string[];
+  updated_at?: string;
+}
+
+export interface DemandRegionsResponse {
+  regions: DemandRegion[];
+  count: number;
+  cache_age_minutes: number;
+  stale: boolean;
+}
+
+export interface HotZonesResponse {
+  hot_zones: DemandRegion[];
+  count: number;
+  from_cache: boolean;
+}
+
+export interface DemandRegionResponse {
+  region: DemandRegion;
+  from_cache: boolean;
+}
+
+export interface TradeOpportunity {
+  type_id: number;
+  type_name: string;
+  category: "ship" | "module" | "ammo";
+  kills_per_day: number;
+  jita_price: number;
+  region_price: number;
+  profit_per_unit: number;
+  profit_percent: number;
+  daily_volume: number;
+  daily_profit: number;
+  jita_volume: number;
+  region_volume: number;
+}
+
+export interface RegionOpportunities {
+  region_id: number;
+  region_name: string;
+  status: string;
+  hot_score: number;
+  security_class: "highsec" | "lowsec" | "nullsec";
+  security_blocks: ("high" | "low" | "null")[];
+  jumps_from_jita: number;
+  main_system: string;
+  ships: TradeOpportunity[];
+  modules: TradeOpportunity[];
+  ammo: TradeOpportunity[];
+  total_potential: number;
 }

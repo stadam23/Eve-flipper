@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 
 	"eve-flipper/internal/esi"
@@ -100,11 +101,48 @@ func (s *Scanner) Scan(params ScanParams, progress func(string)) ([]FlipResult, 
 
 // ScanMultiRegion finds profitable flip opportunities across whole regions.
 func (s *Scanner) ScanMultiRegion(params ScanParams, progress func(string)) ([]FlipResult, error) {
+	minSec := params.MinRouteSecurity
+	
+	// If target region is specified, use it directly instead of radius search
+	if params.TargetRegionID > 0 {
+		progress(fmt.Sprintf("Searching target region %d...", params.TargetRegionID))
+		
+		// Buy from current system's region (or radius)
+		var buySystemsRadius map[int32]int
+		if minSec > 0 {
+			buySystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, minSec)
+		} else {
+			buySystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
+		}
+		buyRegions := s.SDE.Universe.RegionsInSet(buySystemsRadius)
+		buySystems := s.SDE.Universe.SystemsInRegions(buyRegions)
+		
+		// Sell only in target region
+		sellRegions := map[int32]bool{params.TargetRegionID: true}
+		sellSystems := s.SDE.Universe.SystemsInRegions(sellRegions)
+		
+		progress(fmt.Sprintf("Fetching orders: buy from %d regions, sell to target region...", len(buyRegions)))
+		var sellOrders, buyOrders []esi.MarketOrder
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sellOrders = s.fetchOrders(buyRegions, "sell", buySystems)
+		}()
+		go func() {
+			defer wg.Done()
+			buyOrders = s.fetchOrders(sellRegions, "buy", sellSystems)
+		}()
+		wg.Wait()
+		
+		return s.calculateResults(params, sellOrders, buyOrders, buySystemsRadius, progress)
+	}
+	
+	// Default behavior: search by radius
 	progress("Finding regions by radius...")
 	var buySystemsRadius, sellSystemsRadius map[int32]int
 	var wg sync.WaitGroup
 	wg.Add(2)
-	minSec := params.MinRouteSecurity
 	go func() {
 		defer wg.Done()
 		if minSec > 0 {
@@ -326,9 +364,23 @@ func (s *Scanner) calculateResults(
 		s.ESI.PrefetchStationNames(topStations)
 
 		// Fill station names from cache (instant, all prefetched)
+		// For citadels (player structures), fallback to system name
 		for i := range results {
 			results[i].BuyStation = s.ESI.StationName(results[i].BuyLocationID)
 			results[i].SellStation = s.ESI.StationName(results[i].SellLocationID)
+			
+			// If sell station is unresolved citadel, show system name instead
+			if strings.HasPrefix(results[i].SellStation, "Location ") {
+				if sys, ok := s.SDE.Systems[results[i].SellSystemID]; ok {
+					results[i].SellStation = fmt.Sprintf("Structure @ %s", sys.Name)
+				}
+			}
+			// Same for buy station
+			if strings.HasPrefix(results[i].BuyStation, "Location ") {
+				if sys, ok := s.SDE.Systems[results[i].BuySystemID]; ok {
+					results[i].BuyStation = fmt.Sprintf("Structure @ %s", sys.Name)
+				}
+			}
 		}
 	}
 

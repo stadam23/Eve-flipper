@@ -9,6 +9,7 @@ import { RouteBuilder } from "./components/RouteBuilder";
 import { WatchlistTab } from "./components/WatchlistTab";
 import { StationTrading } from "./components/StationTrading";
 import { IndustryTab } from "./components/IndustryTab";
+import { WarTracker } from "./components/WarTracker";
 import { ScanHistory } from "./components/ScanHistory";
 import { LanguageSwitcher } from "./components/LanguageSwitcher";
 import { useGlobalToast } from "./components/Toast";
@@ -19,7 +20,7 @@ import { useI18n } from "./lib/i18n";
 import { formatISK } from "./lib/format";
 import type { AuthStatus, ContractResult, FlipResult, ScanParams } from "./lib/types";
 
-type Tab = "radius" | "region" | "contracts" | "station" | "route" | "industry";
+type Tab = "radius" | "region" | "contracts" | "station" | "route" | "industry" | "demand";
 
 function App() {
   const { t } = useI18n();
@@ -334,8 +335,13 @@ function App() {
             onClick={() => setTab("industry")}
             label={t("tabIndustry")}
           />
+          <TabButton
+            active={tab === "demand"}
+            onClick={() => setTab("demand")}
+            label={t("tabDemand") || "War Tracker"}
+          />
           <div className="flex-1 min-w-[20px]" />
-          {tab !== "route" && tab !== "station" && tab !== "industry" && <button
+          {tab !== "route" && tab !== "station" && tab !== "industry" && tab !== "demand" && <button
             data-scan-button
             onClick={handleScan}
             disabled={!params.system_name}
@@ -375,6 +381,17 @@ function App() {
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "industry" ? "" : "hidden"}`}>
             <IndustryTab isLoggedIn={authStatus.logged_in} />
+          </div>
+          <div className={`flex-1 min-h-0 flex flex-col ${tab === "demand" ? "" : "hidden"}`}>
+            <WarTracker 
+              onError={(msg) => addToast(msg, "error")} 
+              onOpenRegionArbitrage={(regionName) => {
+                // Switch to Regional Arbitrage tab and set target region
+                setParams(p => ({ ...p, target_region: regionName }));
+                setTab("region");
+                addToast(`${t("targetRegionSet") || "Target region set to"} ${regionName}`, "success");
+              }}
+            />
           </div>
         </div>
       </div>

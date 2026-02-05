@@ -1,4 +1,4 @@
-import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, ContractResult, FlipResult, RouteResult, ScanParams, ScanRecord, StationInfo, StationTrade, WatchlistItem } from "./types";
+import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, ContractResult, DemandRegionResponse, DemandRegionsResponse, FlipResult, HotZonesResponse, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationTrade, WatchlistItem } from "./types";
 
 const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:13370";
 
@@ -108,6 +108,12 @@ export async function autocomplete(query: string): Promise<string[]> {
   const res = await fetch(`${BASE}/api/systems/autocomplete?q=${encodeURIComponent(query)}`);
   const data = await handleResponse<{ systems?: string[] }>(res);
   return data.systems ?? [];
+}
+
+export async function autocompleteRegion(query: string): Promise<string[]> {
+  const res = await fetch(`${BASE}/api/regions/autocomplete?q=${encodeURIComponent(query)}`);
+  const data = await handleResponse<{ regions?: string[] }>(res);
+  return data.regions ?? [];
 }
 
 export async function scan(
@@ -369,4 +375,31 @@ export async function searchBuildableItems(query: string, limit = 20): Promise<B
 export async function getIndustrySystems(): Promise<IndustrySystem[]> {
   const res = await fetch(`${BASE}/api/industry/systems`);
   return handleResponse<IndustrySystem[]>(res);
+}
+
+// --- Demand / War Tracker API ---
+
+export async function getDemandRegions(): Promise<DemandRegionsResponse> {
+  const res = await fetch(`${BASE}/api/demand/regions`);
+  return handleResponse<DemandRegionsResponse>(res);
+}
+
+export async function getHotZones(limit = 20): Promise<HotZonesResponse> {
+  const res = await fetch(`${BASE}/api/demand/hotzones?limit=${limit}`);
+  return handleResponse<HotZonesResponse>(res);
+}
+
+export async function getDemandRegion(regionId: number): Promise<DemandRegionResponse> {
+  const res = await fetch(`${BASE}/api/demand/region/${regionId}`);
+  return handleResponse<DemandRegionResponse>(res);
+}
+
+export async function getRegionOpportunities(regionId: number): Promise<RegionOpportunities> {
+  const res = await fetch(`${BASE}/api/demand/opportunities/${regionId}`);
+  return handleResponse<RegionOpportunities>(res);
+}
+
+export async function refreshDemandData(): Promise<{ status: string; message: string }> {
+  const res = await fetch(`${BASE}/api/demand/refresh`, { method: "POST" });
+  return handleResponse<{ status: string; message: string }>(res);
 }

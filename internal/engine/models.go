@@ -99,6 +99,7 @@ type ScanParams struct {
 	SecurityFilter    string  // "" = all, "highsec", "lowsec", "nullsec"
 	MinRouteSecurity  float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7 (route must stay in this security)
 	MaxResults        int     // 0 = use default (100)
+	TargetRegionID    int32   // 0 = search all by radius; >0 = search only in this specific region
 
 	// --- Contract-specific filters ---
 	MinContractPrice  float64 // Minimum contract price in ISK (0 = use default 10M)
