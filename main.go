@@ -25,6 +25,7 @@ var frontendFS embed.FS
 
 func main() {
 	port := flag.Int("port", 13370, "HTTP server port")
+	host := flag.String("host", "127.0.0.1", "Host to bind to (use 0.0.0.0 to allow LAN/remote access)")
 	flag.Parse()
 
 	logger.Banner(version)
@@ -96,7 +97,7 @@ func main() {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	addr := fmt.Sprintf("%s:%d", *host, *port)
 	logger.Server(addr)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		logger.Error("Server", fmt.Sprintf("Failed: %v", err))
