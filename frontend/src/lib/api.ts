@@ -1,4 +1,4 @@
-import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, ContractResult, DemandRegionResponse, DemandRegionsResponse, FlipResult, HotZonesResponse, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationTrade, WatchlistItem } from "./types";
+import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, ContractResult, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationTrade, WatchlistItem } from "./types";
 
 const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:13370";
 
@@ -200,6 +200,30 @@ export async function updateWatchlistItem(typeId: number, alertMinMargin: number
 export async function getStations(systemName: string): Promise<StationInfo[]> {
   const res = await fetch(`${BASE}/api/stations?system=${encodeURIComponent(systemName)}`);
   return handleResponse<StationInfo[]>(res);
+}
+
+export async function getExecutionPlan(params: {
+  type_id: number;
+  region_id: number;
+  location_id?: number;
+  quantity: number;
+  is_buy: boolean;
+  /** Days of history for impact calibration (λ, η, n*). From station trading "Period (days)" when present. */
+  impact_days?: number;
+}): Promise<ExecutionPlanResult> {
+  const res = await fetch(`${BASE}/api/execution/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      type_id: params.type_id,
+      region_id: params.region_id,
+      location_id: params.location_id ?? 0,
+      quantity: params.quantity,
+      is_buy: params.is_buy,
+      impact_days: params.impact_days ?? 0,
+    }),
+  });
+  return handleResponse<ExecutionPlanResult>(res);
 }
 
 export async function scanStation(
