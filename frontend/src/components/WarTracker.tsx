@@ -50,10 +50,6 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
     }
   };
 
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
   const formatISK = (value: number) => {
     if (value >= 1e15) return `${(value / 1e15).toFixed(1)}Q`;
     if (value >= 1e12) return `${(value / 1e12).toFixed(1)}T`;
@@ -110,7 +106,7 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
         </div>
       )}
 
-      {/* Loading */}
+      {/* Summary Stats */}
       {loading && hotZones.length === 0 && (
         <div className="flex-1 flex items-center justify-center">
           <div className="text-eve-dim text-sm animate-pulse">
@@ -119,7 +115,6 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
         </div>
       )}
 
-      {/* Summary Stats */}
       {hotZones.length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-sm">

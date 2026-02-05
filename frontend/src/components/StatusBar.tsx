@@ -54,14 +54,18 @@ export function StatusBar() {
     return t("esiUnavailable");
   };
 
+  const sdeOk =
+    (status?.sde_loaded ?? false) ||
+    ((status?.sde_systems ?? 0) > 0 && (status?.sde_types ?? 0) > 0);
+
   return (
     <div className="flex items-center gap-4 h-[34px] px-4 bg-eve-panel border border-eve-border rounded-sm">
       <StatusDot
-        ok={status?.sde_loaded ?? false}
+        ok={sdeOk}
         loading={status === null}
         label={
-          status?.sde_loaded
-            ? `SDE: ${status.sde_systems} ${t("sdeSystems")}, ${status.sde_types} ${t("sdeTypes")}`
+          sdeOk
+            ? `SDE: ${status?.sde_systems ?? 0} ${t("sdeSystems")}, ${status?.sde_types ?? 0} ${t("sdeTypes")}`
             : t("sdeLoading")
         }
       />
