@@ -135,7 +135,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		}
 	}
 
-	// Filter contracts: only item_exchange, not expired, price > threshold
+	// Filter contracts: only item_exchange, not expired, price > threshold, reachable location
 	var candidates []esi.PublicContract
 	for _, c := range allContracts {
 		if c.Type != "item_exchange" {
@@ -147,10 +147,17 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		if c.Price < minContractPrice {
 			continue // skip scam/bait contracts with very low prices
 		}
+		// Pre-filter: skip contracts in unreachable locations (not in buySystems)
+		sysID := s.locationToSystem(c.StartLocationID)
+		if sysID != 0 {
+			if _, ok := buySystems[sysID]; !ok {
+				continue // contract station is outside buy radius
+			}
+		}
 		candidates = append(candidates, c)
 	}
 
-	log.Printf("[DEBUG] ScanContracts: %d item_exchange candidates after filtering", len(candidates))
+	log.Printf("[DEBUG] ScanContracts: %d item_exchange candidates after filtering (location + price)", len(candidates))
 	progress(fmt.Sprintf("Evaluating %d contracts...", len(candidates)))
 
 	if len(candidates) == 0 {
@@ -163,7 +170,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		contractIDs[i] = c.ContractID
 	}
 
-	contractItems := s.ESI.FetchContractItemsBatch(contractIDs, func(done, total int) {
+	contractItems := s.ESI.FetchContractItemsBatch(contractIDs, s.ContractItemsCache, func(done, total int) {
 		progress(fmt.Sprintf("Fetching contract items %d/%d...", done, total))
 	})
 
@@ -181,12 +188,8 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		}
 	}
 
-	// Fetch market history for pricing validation (use first region for VWAP)
-	var primaryRegion int32
-	for rid := range buyRegions {
-		primaryRegion = rid
-		break
-	}
+	// Fetch market history for pricing validation — prefer trade hub region for VWAP
+	primaryRegion := bestHubRegion(buyRegions)
 
 	if s.History != nil && len(typeIDsNeedHistory) > 0 {
 		progress(fmt.Sprintf("Fetching market history for %d item types...", len(typeIDsNeedHistory)))
@@ -195,8 +198,9 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 
 	log.Printf("[DEBUG] ScanContracts: enriched %d types with history", len(typeIDsNeedHistory))
 
-	// Calculate profit for each contract
-	taxMult := 1.0 - params.SalesTaxPercent/100
+	// Calculate profit for each contract (sales tax + broker fee on sell side)
+	feePercent := params.SalesTaxPercent + params.BrokerFeePercent
+	taxMult := 1.0 - feePercent/100
 	if taxMult < 0 {
 		taxMult = 0
 	}
@@ -244,14 +248,15 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			// Determine the best price to use: prefer VWAP if available and reliable
 			var usePrice float64
 			if pd.HasHistory && pd.VWAP > 0 {
-				// Use VWAP as primary, but cap at min sell price (can't sell above market)
-				usePrice = math.Min(pd.VWAP, pd.MinSellPrice)
-
 				// Check if min sell deviates too much from VWAP (potential bait order)
 				if pd.MinSellPrice < pd.VWAP*0.5 {
-					// Sell price is <50% of VWAP — likely a bait order, use VWAP instead
-					usePrice = pd.VWAP * 0.9 // Conservative estimate
+					// Sell price is <50% of VWAP — likely a bait order.
+					// Use conservative estimate: min(70% VWAP, 2x MinSell) to avoid inflating value.
+					usePrice = math.Min(pd.VWAP*0.7, pd.MinSellPrice*2)
 					highDeviationItems++
+				} else {
+					// Normal case: use the lower of VWAP and market sell price
+					usePrice = math.Min(pd.VWAP, pd.MinSellPrice)
 				}
 			} else {
 				// No history — if RequireHistory is set, skip this item entirely
@@ -337,9 +342,19 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 
 		stationName := s.ESI.StationName(contract.StartLocationID)
 
+		// Resolve system and region for the contract location
+		sysID := s.locationToSystem(contract.StartLocationID)
+		sysName := ""
+		regionName := ""
+		if sysID != 0 {
+			sysName = s.systemName(sysID)
+			if sys, ok := s.SDE.Systems[sysID]; ok {
+				regionName = s.regionName(sys.RegionID)
+			}
+		}
+
 		// Calculate jumps from current system to contract station
 		jumps := 0
-		sysID := s.locationToSystem(contract.StartLocationID)
 		if sysID != 0 {
 			if d, ok := buySystems[sysID]; ok {
 				jumps = d
@@ -362,6 +377,8 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			MarginPercent: sanitizeFloat(margin),
 			Volume:        contract.Volume,
 			StationName:   stationName,
+			SystemName:    sysName,
+			RegionName:    regionName,
 			ItemCount:     itemCount,
 			Jumps:         jumps,
 			ProfitPerJump: sanitizeFloat(profitPerJump),
@@ -437,4 +454,20 @@ func (s *Scanner) fetchContractItemsHistory(typeIDs map[int32]bool, priceData ma
 	}
 
 	wg.Wait()
+}
+
+// bestHubRegion picks the highest-priority trade hub region from the set,
+// falling back to the lowest numeric ID for determinism.
+func bestHubRegion(regions map[int32]bool) int32 {
+	best := int32(0)
+	bestPri := int(^uint(0) >> 1) // max int
+	for rid := range regions {
+		if pri, ok := hubRegionPriority[rid]; ok && pri < bestPri {
+			best = rid
+			bestPri = pri
+		} else if best == 0 || (bestPri == int(^uint(0)>>1) && rid < best) {
+			best = rid
+		}
+	}
+	return best
 }

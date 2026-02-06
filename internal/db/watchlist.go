@@ -24,12 +24,24 @@ func (d *DB) GetWatchlist() []config.WatchlistItem {
 	return items
 }
 
-// AddWatchlistItem inserts a watchlist item (no-op if already exists).
-func (d *DB) AddWatchlistItem(item config.WatchlistItem) {
-	d.sql.Exec(
+// HasWatchlistItem checks if an item is already in the watchlist.
+func (d *DB) HasWatchlistItem(typeID int32) bool {
+	var count int
+	d.sql.QueryRow("SELECT COUNT(*) FROM watchlist WHERE type_id = ?", typeID).Scan(&count)
+	return count > 0
+}
+
+// AddWatchlistItem inserts a watchlist item. Returns true if inserted, false if duplicate.
+func (d *DB) AddWatchlistItem(item config.WatchlistItem) bool {
+	res, err := d.sql.Exec(
 		"INSERT OR IGNORE INTO watchlist (type_id, type_name, added_at, alert_min_margin) VALUES (?, ?, ?, ?)",
 		item.TypeID, item.TypeName, item.AddedAt, item.AlertMinMargin,
 	)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n > 0
 }
 
 // DeleteWatchlistItem removes a watchlist item by type ID.

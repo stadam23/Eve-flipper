@@ -16,10 +16,17 @@ type MarketOrder struct {
 	RegionID     int32   `json:"-"` // set by us
 }
 
-// FetchRegionOrders fetches all market orders for a region (direct decode, no double unmarshal).
+// FetchRegionOrders fetches all market orders for a region.
+// Uses in-memory cache with ETag/Expires — repeated calls within the ESI refresh
+// window (typically 5 min) return instantly without any network I/O.
 func (c *Client) FetchRegionOrders(regionID int32, orderType string) ([]MarketOrder, error) {
-	url := fmt.Sprintf("%s/markets/%d/orders/?datasource=tranquility&order_type=%s",
-		baseURL, regionID, orderType)
+	return c.FetchRegionOrdersCached(regionID, orderType)
+}
+
+// FetchRegionOrdersByType fetches all market orders for a specific type in a region.
+func (c *Client) FetchRegionOrdersByType(regionID int32, typeID int32) ([]MarketOrder, error) {
+	url := fmt.Sprintf("%s/markets/%d/orders/?datasource=tranquility&order_type=all&type_id=%d",
+		baseURL, regionID, typeID)
 
 	return c.GetPaginatedDirect(url, regionID)
 }

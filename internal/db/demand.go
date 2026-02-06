@@ -241,3 +241,102 @@ func (d *DB) ClearDemandCache() error {
 	`)
 	return err
 }
+
+// FittingDemandItem represents a cached fitting demand item.
+type FittingDemandItem struct {
+	RegionID       int32     `json:"region_id"`
+	TypeID         int32     `json:"type_id"`
+	TypeName       string    `json:"type_name"`
+	Category       string    `json:"category"`
+	TotalDestroyed int64     `json:"total_destroyed"`
+	KillmailCount  int       `json:"killmail_count"`
+	AvgPerKillmail float64   `json:"avg_per_killmail"`
+	EstDailyDemand float64   `json:"est_daily_demand"`
+	SampledKills   int       `json:"sampled_kills"`
+	TotalKills24h  int       `json:"total_kills_24h"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// SaveFittingDemandProfile saves fitting demand data for a region.
+func (d *DB) SaveFittingDemandProfile(regionID int32, items []FittingDemandItem) error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Clear old data for this region
+	if _, err := tx.Exec(`DELETE FROM demand_fitting_cache WHERE region_id = ?`, regionID); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO demand_fitting_cache
+		(region_id, type_id, type_name, category, total_destroyed, killmail_count,
+		 avg_per_killmail, est_daily_demand, sampled_kills, total_kills_24h, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().Format(time.RFC3339)
+	for _, item := range items {
+		if _, err := stmt.Exec(
+			regionID, item.TypeID, item.TypeName, item.Category,
+			item.TotalDestroyed, item.KillmailCount, item.AvgPerKillmail,
+			item.EstDailyDemand, item.SampledKills, item.TotalKills24h, now,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetFittingDemandProfile returns cached fitting demand data for a region.
+func (d *DB) GetFittingDemandProfile(regionID int32) ([]FittingDemandItem, error) {
+	rows, err := d.sql.Query(`
+		SELECT region_id, type_id, type_name, category, total_destroyed, killmail_count,
+		       avg_per_killmail, est_daily_demand, sampled_kills, total_kills_24h, updated_at
+		FROM demand_fitting_cache
+		WHERE region_id = ?
+		ORDER BY est_daily_demand DESC
+	`, regionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []FittingDemandItem
+	for rows.Next() {
+		var item FittingDemandItem
+		var updatedAtStr string
+		err := rows.Scan(&item.RegionID, &item.TypeID, &item.TypeName, &item.Category,
+			&item.TotalDestroyed, &item.KillmailCount, &item.AvgPerKillmail,
+			&item.EstDailyDemand, &item.SampledKills, &item.TotalKills24h, &updatedAtStr)
+		if err != nil {
+			continue
+		}
+		item.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAtStr)
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// IsFittingProfileFresh checks if fitting demand data for a region is recent enough.
+func (d *DB) IsFittingProfileFresh(regionID int32, maxAge time.Duration) bool {
+	var updatedAtStr string
+	err := d.sql.QueryRow(`
+		SELECT updated_at FROM demand_fitting_cache WHERE region_id = ? LIMIT 1
+	`, regionID).Scan(&updatedAtStr)
+	if err != nil {
+		return false
+	}
+	updatedAt, err := time.Parse(time.RFC3339, updatedAtStr)
+	if err != nil {
+		return false
+	}
+	return time.Since(updatedAt) < maxAge
+}

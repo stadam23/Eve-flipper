@@ -65,6 +65,25 @@ type StationTrade struct {
 	SlippageSellPct   float64 `json:"SlippageSellPct,omitempty"`
 }
 
+// stationSortProxy returns a pre-history ranking score for a StationTrade.
+// It penalises extreme margins (likely scam / junk) and rewards items that
+// have many competing orders (indicating a real market).
+func stationSortProxy(r *StationTrade) float64 {
+	// Cap margin contribution at 50% so extreme-margin items don't dominate.
+	cappedMargin := r.MarginPercent
+	if cappedMargin > 50 {
+		cappedMargin = 50
+	}
+	// Volume proxy: minimum of buy/sell volume avoids one-sided scam books.
+	minVol := float64(r.BuyVolume)
+	if float64(r.SellVolume) < minVol {
+		minVol = float64(r.SellVolume)
+	}
+	// Order count bonus: more competing orders → more likely a real market.
+	orderBonus := math.Log2(float64(r.BuyOrderCount+r.SellOrderCount) + 1)
+	return cappedMargin * minVol * orderBonus
+}
+
 // stationTypeKey uniquely identifies a station+type combination for order grouping.
 type stationTypeKey struct {
 	locationID int64
@@ -273,13 +292,25 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 
 	log.Printf("[DEBUG] StationTrades: %d profitable items", len(results))
 
-	// Sort by total profit descending
+	// Sort by a proxy that balances profit potential with legitimacy.
+	// Pure "ProfitPerUnit * OrderVolume" heavily favours scam/junk items with
+	// 1000%+ margins and large idle order volumes but zero actual trades.
+	// We cap the margin contribution and add an order-count bonus so items
+	// with many competing orders (= real market) are ranked higher.
 	sort.Slice(results, func(i, j int) bool {
-		return results[i].TotalProfit > results[j].TotalProfit
+		return stationSortProxy(&results[i]) > stationSortProxy(&results[j])
 	})
-	limit := EffectiveMaxResults(params.MaxResults, DefaultMaxResults)
-	if len(results) > limit {
-		results = results[:limit]
+
+	// Use a larger internal working set for history enrichment so that good items
+	// with moderate margins aren't discarded before we know their daily volume.
+	// After enrichment + filters we truncate to the user's requested limit.
+	userLimit := EffectiveMaxResults(params.MaxResults, DefaultMaxResults)
+	internalLimit := userLimit * 5
+	if internalLimit < 500 {
+		internalLimit = 500
+	}
+	if len(results) > internalLimit {
+		results = results[:internalLimit]
 	}
 
 	// Expected fill prices from execution plan — per unit of volume.
@@ -305,7 +336,10 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 				r.SlippageBuyPct = planBuy.SlippagePercent
 				r.SlippageSellPct = planSell.SlippagePercent
 				if r.ExpectedBuyPrice > 0 && r.ExpectedSellPrice > 0 {
-					r.ExpectedProfit = r.ExpectedSellPrice - r.ExpectedBuyPrice // per unit
+					// Account for fees: buy side pays broker fee, sell side pays broker fee + sales tax
+					effectiveBuy := r.ExpectedBuyPrice * (1 + params.BrokerFee/100)
+					effectiveSell := r.ExpectedSellPrice * taxMult * brokerMult
+					r.ExpectedProfit = effectiveSell - effectiveBuy // per unit, net of fees
 				}
 			}
 		}
@@ -332,6 +366,11 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 
 	log.Printf("[DEBUG] StationTrades: %d after all filters", len(results))
 
+	// Truncate to user-requested limit (was deferred to let filters work on a larger set)
+	if len(results) > userLimit {
+		results = results[:userLimit]
+	}
+
 	// Final sort by CTS (Composite Trading Score) descending
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].CTS > results[j].CTS
@@ -344,43 +383,61 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 // applyStationTradeFilters applies post-history filters based on params.
 func applyStationTradeFilters(results []StationTrade, params StationTradeParams) []StationTrade {
 	filtered := results[:0]
+
+	// Debug counters
+	var dropVol, dropDemand, dropROI, dropBvS, dropPVI, dropSDS, dropPrice int
+
 	for _, r := range results {
 		// Min daily volume
 		if params.MinDailyVolume > 0 && r.DailyVolume < params.MinDailyVolume {
+			dropVol++
 			continue
 		}
 		// Min demand per day
 		if params.MinDemandPerDay > 0 && r.BuyUnitsPerDay < params.MinDemandPerDay {
+			dropDemand++
 			continue
 		}
 		// Min Period ROI
 		if params.MinPeriodROI > 0 && r.PeriodROI < params.MinPeriodROI {
+			dropROI++
 			continue
 		}
 		// B v S Ratio range
 		if params.BvSRatioMin > 0 && r.BvSRatio < params.BvSRatioMin {
+			dropBvS++
 			continue
 		}
 		if params.BvSRatioMax > 0 && r.BvSRatio > params.BvSRatioMax {
+			dropBvS++
 			continue
 		}
 		// Max PVI (volatility)
 		if params.MaxPVI > 0 && r.PVI > params.MaxPVI {
+			dropPVI++
 			continue
 		}
 		// Max SDS (scam score)
 		if params.MaxSDS > 0 && r.SDS > params.MaxSDS {
+			dropSDS++
 			continue
 		}
 		// Price limit filter: don't place buy order above historical low + 10%
 		if params.LimitBuyToPriceLow && r.PriceLow > 0 {
 			maxBuyPrice := r.PriceLow * 1.1
 			if r.BuyPrice > maxBuyPrice {
+				dropPrice++
 				continue
 			}
 		}
 		filtered = append(filtered, r)
 	}
+
+	if len(results) != len(filtered) {
+		log.Printf("[DEBUG] StationFilter drops: vol=%d demand=%d roi=%d bvs=%d pvi=%d sds=%d price=%d",
+			dropVol, dropDemand, dropROI, dropBvS, dropPVI, dropSDS, dropPrice)
+	}
+
 	return filtered
 }
 
@@ -457,14 +514,18 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		results[idx].PriceHigh = sanitizeFloat(high)
 		results[idx].PriceLow = sanitizeFloat(low)
 
-		// Calculate Buy/Sell Units per Day
-		results[idx].BuyUnitsPerDay = avgDailyVolume(r.entries, 7)
+		// Calculate Buy/Sell Units per Day from market history
+		dailyVol := avgDailyVolume(r.entries, 7)
+		results[idx].BuyUnitsPerDay = dailyVol
 
-		// Estimate sell units per day from order count velocity
-		// Approximation: assume average order fills in ~3 days
-		if results[idx].SellOrderCount > 0 {
-			avgOrderSize := float64(results[idx].SellVolume) / float64(results[idx].SellOrderCount)
-			results[idx].SellUnitsPerDay = avgOrderSize * float64(results[idx].SellOrderCount) / 3.0
+		// SellUnitsPerDay: use the same daily volume as a base, but weight by
+		// sell order availability. If sell orders are scarce relative to buy orders,
+		// sell throughput is lower.
+		results[idx].SellUnitsPerDay = dailyVol
+		if results[idx].BuyVolume > 0 && results[idx].SellVolume > 0 {
+			// Adjust by supply ratio: if there are fewer sell orders, sell throughput is lower
+			supplyRatio := float64(results[idx].SellVolume) / float64(results[idx].BuyVolume+results[idx].SellVolume)
+			results[idx].SellUnitsPerDay = dailyVol * supplyRatio * 2 // *2 because ratio is 0-1 centered at 0.5
 		}
 
 		// B v S Ratio

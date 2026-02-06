@@ -128,13 +128,54 @@ func (c *Client) FetchContractItems(contractID int32) ([]ContractItem, error) {
 	return items, err
 }
 
+// ContractItemsCache caches fetched contract items (they never change once created).
+type ContractItemsCache struct {
+	mu    sync.RWMutex
+	items map[int32][]ContractItem // contractID -> items (nil = fetched but empty/error)
+}
+
+// NewContractItemsCache creates a new contract items cache.
+func NewContractItemsCache() *ContractItemsCache {
+	return &ContractItemsCache{items: make(map[int32][]ContractItem)}
+}
+
 // FetchContractItemsBatch fetches items for multiple contracts using a worker pool.
-// 50 parallel workers to maximize throughput without spawning thousands of goroutines.
+// Uses cache to skip already-fetched contracts. 50 parallel workers for throughput.
 // Returns a map of contractID -> []ContractItem. Failed fetches are silently skipped.
-func (c *Client) FetchContractItemsBatch(contractIDs []int32, progress func(done, total int)) map[int32][]ContractItem {
+func (c *Client) FetchContractItemsBatch(contractIDs []int32, cache *ContractItemsCache, progress func(done, total int)) map[int32][]ContractItem {
 	total := len(contractIDs)
 	if total == 0 {
 		return nil
+	}
+
+	out := make(map[int32][]ContractItem)
+
+	// Separate cached vs uncached
+	var uncached []int32
+	if cache != nil {
+		cache.mu.RLock()
+		for _, id := range contractIDs {
+			if items, ok := cache.items[id]; ok {
+				if items != nil {
+					out[id] = items
+				}
+			} else {
+				uncached = append(uncached, id)
+			}
+		}
+		cache.mu.RUnlock()
+	} else {
+		uncached = contractIDs
+	}
+
+	cachedCount := total - len(uncached)
+	if cachedCount > 0 {
+		log.Printf("[DEBUG] ContractItemsBatch: %d cached, %d to fetch", cachedCount, len(uncached))
+	}
+
+	if len(uncached) == 0 {
+		progress(total, total)
+		return out
 	}
 
 	const workers = 50
@@ -150,8 +191,8 @@ func (c *Client) FetchContractItemsBatch(contractIDs []int32, progress func(done
 	// Start workers
 	var wg sync.WaitGroup
 	numWorkers := workers
-	if total < numWorkers {
-		numWorkers = total
+	if len(uncached) < numWorkers {
+		numWorkers = len(uncached)
 	}
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -170,7 +211,7 @@ func (c *Client) FetchContractItemsBatch(contractIDs []int32, progress func(done
 
 	// Feed jobs
 	go func() {
-		for _, id := range contractIDs {
+		for _, id := range uncached {
 			jobs <- id
 		}
 		close(jobs)
@@ -183,11 +224,16 @@ func (c *Client) FetchContractItemsBatch(contractIDs []int32, progress func(done
 	}()
 
 	// Collect results
-	out := make(map[int32][]ContractItem)
-	done := 0
+	done := cachedCount
 	for r := range results {
 		if r.items != nil {
 			out[r.id] = r.items
+		}
+		// Cache the result (even nil for "no items" to avoid re-fetching)
+		if cache != nil {
+			cache.mu.Lock()
+			cache.items[r.id] = r.items
+			cache.mu.Unlock()
 		}
 		done++
 		if done%50 == 0 || done == total {

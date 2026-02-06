@@ -2,6 +2,8 @@ package esi
 
 import (
 	"fmt"
+	"math"
+	"sort"
 	"time"
 )
 
@@ -46,27 +48,39 @@ func ComputeMarketStats(entries []HistoryEntry, totalListed int32) MarketStats {
 		return MarketStats{}
 	}
 
+	// Sort entries by date to ensure correct first/last price for trend calculation.
+	// ESI does not guarantee chronological order.
+	sorted := make([]HistoryEntry, len(entries))
+	copy(sorted, entries)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Date < sorted[j].Date
+	})
+
 	now := time.Now().UTC()
 	cutoff7 := now.AddDate(0, 0, -7).Format("2006-01-02")
 
 	var vol7 int64
 	var count7 int
 	var firstPrice, lastPrice float64
+	firstSet := false
 
-	for _, e := range entries {
+	for _, e := range sorted {
 		if e.Date >= cutoff7 {
 			vol7 += e.Volume
 			count7++
-			if firstPrice == 0 {
+			if !firstSet {
 				firstPrice = e.Average
+				firstSet = true
 			}
 			lastPrice = e.Average
 		}
 	}
 
+	// Use float division to avoid rounding down small volumes.
+	// e.g. vol7=5, count7=3 → 1.67 → rounds to 2 instead of 1.
 	dailyVol := int64(0)
 	if count7 > 0 {
-		dailyVol = vol7 / int64(count7)
+		dailyVol = int64(math.Round(float64(vol7) / float64(count7)))
 	}
 
 	velocity := 0.0

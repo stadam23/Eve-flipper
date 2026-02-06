@@ -9,14 +9,16 @@ type FlipResult struct {
 	BuyStation      string
 	BuySystemName   string
 	BuySystemID     int32
-	BuyRegionID     int32 `json:"BuyRegionID"`
-	BuyLocationID   int64 `json:"BuyLocationID,omitempty"`
+	BuyRegionID     int32  `json:"BuyRegionID"`
+	BuyRegionName   string `json:"BuyRegionName,omitempty"`
+	BuyLocationID   int64  `json:"BuyLocationID,omitempty"`
 	SellPrice       float64
 	SellStation     string
 	SellSystemName  string
 	SellSystemID    int32
-	SellRegionID    int32 `json:"SellRegionID"`
-	SellLocationID  int64 `json:"SellLocationID,omitempty"`
+	SellRegionID    int32  `json:"SellRegionID"`
+	SellRegionName  string `json:"SellRegionName,omitempty"`
+	SellLocationID  int64  `json:"SellLocationID,omitempty"`
 	ProfitPerUnit   float64
 	MarginPercent   float64
 	UnitsToBuy      int32
@@ -32,6 +34,7 @@ type FlipResult struct {
 	PriceTrend      float64 `json:"PriceTrend"`
 	BuyCompetitors  int     `json:"BuyCompetitors"`
 	SellCompetitors int     `json:"SellCompetitors"`
+	DailyProfit     float64 `json:"DailyProfit"` // ProfitPerUnit * min(UnitsToBuy, DailyVolume)
 	// Execution-plan derived (expected fill prices from order book depth)
 	ExpectedBuyPrice  float64 `json:"ExpectedBuyPrice,omitempty"`
 	ExpectedSellPrice float64 `json:"ExpectedSellPrice,omitempty"`
@@ -50,6 +53,8 @@ type ContractResult struct {
 	MarginPercent float64
 	Volume        float64 // contract volume in m³
 	StationName   string
+	SystemName    string `json:"SystemName,omitempty"`
+	RegionName    string `json:"RegionName,omitempty"`
 	ItemCount     int32
 	Jumps         int
 	ProfitPerJump float64
@@ -57,20 +62,22 @@ type ContractResult struct {
 
 // RouteHop represents a single buy-haul-sell leg within a multi-hop trade route.
 type RouteHop struct {
-	SystemName     string
-	StationName    string
-	SystemID       int32 `json:"-"`
-	RegionID       int32 `json:"RegionID"` // Market region for execution plan / slippage
-	LocationID     int64 `json:"-"`
-	DestSystemID   int32 `json:"-"`
-	DestSystemName string
-	TypeName       string
-	TypeID         int32
-	BuyPrice       float64
-	SellPrice      float64
-	Units          int32
-	Profit         float64
-	Jumps          int // jumps to destination
+	SystemName      string
+	StationName     string
+	SystemID        int32 `json:"-"`
+	RegionID        int32 `json:"RegionID"` // Market region for execution plan / slippage
+	LocationID      int64 `json:"-"`
+	DestSystemID    int32 `json:"-"`
+	DestSystemName  string
+	DestStationName string `json:"DestStationName,omitempty"`
+	DestLocationID  int64  `json:"-"`
+	TypeName        string
+	TypeID          int32
+	BuyPrice        float64
+	SellPrice       float64
+	Units           int32
+	Profit          float64
+	Jumps           int // jumps to destination
 }
 
 // RouteResult represents a complete multi-hop trade route with aggregated profit.
@@ -88,6 +95,7 @@ type RouteParams struct {
 	CargoCapacity    float64
 	MinMargin        float64
 	SalesTaxPercent  float64
+	BrokerFeePercent float64
 	MinHops          int
 	MaxHops          int
 	MaxResults       int     // 0 = use default (50)
@@ -96,12 +104,13 @@ type RouteParams struct {
 
 // ScanParams holds the input parameters for radius and region scans.
 type ScanParams struct {
-	CurrentSystemID int32
-	CargoCapacity   float64
-	BuyRadius       int
-	SellRadius      int
-	MinMargin       float64
-	SalesTaxPercent float64
+	CurrentSystemID  int32
+	CargoCapacity    float64
+	BuyRadius        int
+	SellRadius       int
+	MinMargin        float64
+	SalesTaxPercent  float64
+	BrokerFeePercent float64 // 0 = no broker fee (instant trades); >0 = applied to both buy and sell sides
 	// Advanced filters
 	MinDailyVolume   int64   // 0 = no filter
 	MaxInvestment    float64 // 0 = no filter (max ISK per position)

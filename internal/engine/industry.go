@@ -56,17 +56,22 @@ type IndustryAnalysis struct {
 	TargetTypeName     string         `json:"target_type_name"`
 	Runs               int32          `json:"runs"`
 	TotalQuantity      int32          `json:"total_quantity"`
-	MarketBuyPrice     float64        `json:"market_buy_price"`     // Cost to buy ready product
+	MarketBuyPrice     float64        `json:"market_buy_price"`     // Cost to buy ready product (from sell orders, no broker fee)
 	TotalBuildCost     float64        `json:"total_build_cost"`     // Cost to build from scratch
 	OptimalBuildCost   float64        `json:"optimal_build_cost"`   // Cost with optimal buy/build decisions
 	Savings            float64        `json:"savings"`              // MarketBuyPrice - OptimalBuildCost
 	SavingsPercent     float64        `json:"savings_percent"`
+	SellRevenue        float64        `json:"sell_revenue"`         // Revenue after sales tax + broker fee
+	Profit             float64        `json:"profit"`               // SellRevenue - OptimalBuildCost
+	ProfitPercent      float64        `json:"profit_percent"`       // Profit / OptimalBuildCost * 100
+	ISKPerHour         float64        `json:"isk_per_hour"`         // Profit / manufacturing hours
+	ManufacturingTime  int32          `json:"manufacturing_time"`   // Total time in seconds
 	TotalJobCost       float64        `json:"total_job_cost"`       // Sum of all job installation costs
 	MaterialTree       *MaterialNode  `json:"material_tree"`
 	FlatMaterials      []*FlatMaterial `json:"flat_materials"`      // Flattened list of base materials
 	SystemCostIndex    float64        `json:"system_cost_index"`
-	RegionID           int32          `json:"region_id"`   // Market region for execution plan
-	RegionName         string         `json:"region_name"`  // Optional display name
+	RegionID           int32          `json:"region_id"`            // Market region for execution plan
+	RegionName         string         `json:"region_name"`          // Optional display name
 }
 
 // FlatMaterial is a simplified material for the shopping list.
@@ -147,9 +152,16 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 	}
 
 	progress("Building production tree...")
-	
-	// Build material tree recursively
-	tree := a.buildMaterialTree(params.TypeID, params.Runs, params, 0)
+
+	// FIX #1: Treat params.Runs as actual blueprint runs.
+	// Calculate total items produced: runs × productQuantity.
+	totalQuantity := params.Runs
+	if bp, ok := a.SDE.Industry.GetBlueprintForProduct(params.TypeID); ok {
+		totalQuantity = params.Runs * bp.ProductQuantity
+	}
+
+	// Build material tree recursively using totalQuantity as desired items
+	tree := a.buildMaterialTree(params.TypeID, totalQuantity, params, 0)
 	
 	// Calculate costs
 	progress("Calculating optimal costs...")
@@ -158,14 +170,9 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 	// Flatten materials for shopping list
 	flatMaterials := a.flattenMaterials(tree)
 
-	// Calculate totals (cost to buy product on market; include broker fee)
-	marketBuyPrice := a.marketPrices[params.TypeID] * float64(params.Runs)
-	if bp, ok := a.SDE.Industry.GetBlueprintForProduct(params.TypeID); ok {
-		marketBuyPrice *= float64(bp.ProductQuantity)
-	}
-	if params.BrokerFee > 0 {
-		marketBuyPrice *= (1.0 + params.BrokerFee/100)
-	}
+	// FIX #3: MarketBuyPrice = cost to buy from sell orders (NO broker fee).
+	// Buying instantly from sell orders doesn't incur broker fee in EVE.
+	marketBuyPrice := a.marketPrices[params.TypeID] * float64(totalQuantity)
 
 	optimalCost := tree.BuildCost
 	if tree.BuyPrice < tree.BuildCost && tree.BuyPrice > 0 {
@@ -176,6 +183,25 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 	savingsPercent := 0.0
 	if marketBuyPrice > 0 {
 		savingsPercent = savings / marketBuyPrice * 100
+	}
+
+	// FIX #6: Calculate profit if you sell the built product.
+	// Revenue = sell price × quantity × (1 - salesTax% - brokerFee%)
+	sellRevenue := marketBuyPrice * (1.0 - params.SalesTaxPercent/100 - params.BrokerFee/100)
+	profit := sellRevenue - optimalCost
+	profitPercent := 0.0
+	if optimalCost > 0 {
+		profitPercent = profit / optimalCost * 100
+	}
+
+	// Manufacturing time for ISK/hour
+	var mfgTime int32
+	if tree.Blueprint != nil {
+		mfgTime = tree.Blueprint.Time
+	}
+	iskPerHour := 0.0
+	if mfgTime > 0 {
+		iskPerHour = profit / (float64(mfgTime) / 3600.0)
 	}
 
 	totalJobCost := a.sumJobCosts(tree)
@@ -192,21 +218,26 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 	}
 
 	return &IndustryAnalysis{
-		TargetTypeID:     params.TypeID,
-		TargetTypeName:   typeInfo.Name,
-		Runs:             params.Runs,
-		TotalQuantity:    tree.Quantity,
-		MarketBuyPrice:   marketBuyPrice,
-		TotalBuildCost:   tree.BuildCost,
-		OptimalBuildCost: optimalCost,
-		Savings:          savings,
-		SavingsPercent:   savingsPercent,
-		TotalJobCost:     totalJobCost,
-		MaterialTree:     tree,
-		FlatMaterials:    flatMaterials,
-		SystemCostIndex:  costIndex,
-		RegionID:         regionID,
-		RegionName:       regionName,
+		TargetTypeID:      params.TypeID,
+		TargetTypeName:    typeInfo.Name,
+		Runs:              params.Runs,
+		TotalQuantity:     totalQuantity,
+		MarketBuyPrice:    marketBuyPrice,
+		TotalBuildCost:    tree.BuildCost,
+		OptimalBuildCost:  optimalCost,
+		Savings:           savings,
+		SavingsPercent:    savingsPercent,
+		SellRevenue:       sellRevenue,
+		Profit:            profit,
+		ProfitPercent:     profitPercent,
+		ISKPerHour:        iskPerHour,
+		ManufacturingTime: mfgTime,
+		TotalJobCost:      totalJobCost,
+		MaterialTree:      tree,
+		FlatMaterials:     flatMaterials,
+		SystemCostIndex:   costIndex,
+		RegionID:          regionID,
+		RegionName:        regionName,
 	}, nil
 }
 
@@ -246,19 +277,10 @@ func (a *IndustryAnalyzer) buildMaterialTree(typeID int32, quantity int32, param
 		Time:            bp.CalculateTimeWithTE(runsNeeded, params.TimeEfficiency),
 	}
 
-	// Get materials with ME applied
-	materials := bp.CalculateMaterialsWithME(runsNeeded, params.MaterialEfficiency)
-
-	// Apply structure bonus if any
-	if params.StructureBonus > 0 {
-		for i := range materials {
-			reduction := float64(materials[i].Quantity) * params.StructureBonus / 100
-			materials[i].Quantity -= int32(reduction)
-			if materials[i].Quantity < runsNeeded {
-				materials[i].Quantity = runsNeeded
-			}
-		}
-	}
+	// FIX #5: Apply ME and structure bonus in a single step before ceiling
+	// to avoid rounding errors from intermediate truncation.
+	// EVE formula: max(runs, ceil(base × runs × (1-ME/100) × (1-structureBonus/100)))
+	materials := bp.CalculateMaterialsWithMEAndStructure(runsNeeded, params.MaterialEfficiency, params.StructureBonus)
 
 	// Build children recursively
 	for _, mat := range materials {
@@ -309,12 +331,25 @@ func (a *IndustryAnalyzer) calculateCosts(node *MaterialNode, costIndex float64,
 }
 
 // calculateEIV calculates Estimated Item Value for job cost.
+// FIX #2: EVE uses BASE material quantities (before ME) for EIV, not ME-reduced.
+// Formula: EIV = sum(adjusted_price × base_quantity × runs)
 func (a *IndustryAnalyzer) calculateEIV(node *MaterialNode) float64 {
-	// EIV is sum of adjusted_price * quantity for all materials
+	bp, ok := a.SDE.Industry.GetBlueprintForProduct(node.TypeID)
+	if !ok || bp == nil {
+		return 0
+	}
+
+	// Calculate actual blueprint runs for this node
+	runsNeeded := node.Quantity / bp.ProductQuantity
+	if node.Quantity%bp.ProductQuantity != 0 {
+		runsNeeded++
+	}
+
 	var eiv float64
-	for _, child := range node.Children {
-		price := a.adjustedPrices[child.TypeID]
-		eiv += price * float64(child.Quantity)
+	for _, mat := range bp.Materials {
+		price := a.adjustedPrices[mat.TypeID]
+		// Use base_quantity × runs (NOT ME-adjusted quantities)
+		eiv += price * float64(mat.Quantity) * float64(runsNeeded)
 	}
 	return eiv
 }
@@ -380,13 +415,19 @@ func (a *IndustryAnalyzer) sumJobCosts(node *MaterialNode) float64 {
 }
 
 // fetchMarketPrices fetches best sell order prices for materials.
-// Uses Jita (The Forge region) as default market.
-// Results are cached for 10 minutes.
+// FIX #4: Uses the region of the user's selected system, falling back to The Forge (Jita).
+// Results are cached for 10 minutes per region.
 func (a *IndustryAnalyzer) fetchMarketPrices(params IndustryParams) (map[int32]float64, error) {
-	// The Forge region ID (Jita)
+	// Default: The Forge (Jita)
 	regionID := int32(10000002)
-	
-	// Use cached prices if available
+
+	// Use the region of the selected manufacturing system if available
+	if params.SystemID != 0 {
+		if sys, ok := a.SDE.Systems[params.SystemID]; ok && sys.RegionID != 0 {
+			regionID = sys.RegionID
+		}
+	}
+
 	return a.ESI.GetCachedMarketPrices(a.IndustryCache, regionID)
 }
 

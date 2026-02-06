@@ -38,7 +38,8 @@ type Scanner struct {
 	SDE            *sde.Data
 	ESI            *esi.Client
 	History        HistoryProvider
-	ContractsCache *esi.ContractsCache // Cache for contracts (5 min TTL)
+	ContractsCache      *esi.ContractsCache      // Cache for contracts (5 min TTL)
+	ContractItemsCache  *esi.ContractItemsCache  // Cache for contract items (immutable)
 }
 
 // NewScanner creates a Scanner with the given static data and ESI client.
@@ -46,14 +47,14 @@ func NewScanner(data *sde.Data, client *esi.Client) *Scanner {
 	return &Scanner{
 		SDE:            data,
 		ESI:            client,
-		ContractsCache: esi.NewContractsCache(),
+		ContractsCache:     esi.NewContractsCache(),
+		ContractItemsCache: esi.NewContractItemsCache(),
 	}
 }
 
 // Scan finds profitable flip opportunities based on the given parameters.
 func (s *Scanner) Scan(params ScanParams, progress func(string)) ([]FlipResult, error) {
 	progress("Finding systems within radius...")
-	// OPT: compute both BFS in parallel
 	var buySystems, sellSystems map[int32]int
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -82,21 +83,9 @@ func (s *Scanner) Scan(params ScanParams, progress func(string)) ([]FlipResult, 
 	log.Printf("[DEBUG] Scan: buySystems=%d, sellSystems=%d, buyRegions=%d, sellRegions=%d",
 		len(buySystems), len(sellSystems), len(buyRegions), len(sellRegions))
 
-	// OPT: fetch buy and sell orders in parallel
 	progress(fmt.Sprintf("Fetching orders from %d+%d regions...", len(buyRegions), len(sellRegions)))
-	var sellOrders, buyOrders []esi.MarketOrder
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		sellOrders = s.fetchOrders(buyRegions, "sell", buySystems)
-	}()
-	go func() {
-		defer wg.Done()
-		buyOrders = s.fetchOrders(sellRegions, "buy", sellSystems)
-	}()
-	wg.Wait()
-
-	return s.calculateResults(params, sellOrders, buyOrders, buySystems, progress)
+	idx := s.fetchAndIndex(buyRegions, buySystems, sellRegions, sellSystems)
+	return s.calculateResults(params, idx, buySystems, progress)
 }
 
 // ScanMultiRegion finds profitable flip opportunities across whole regions.
@@ -107,7 +96,6 @@ func (s *Scanner) ScanMultiRegion(params ScanParams, progress func(string)) ([]F
 	if params.TargetRegionID > 0 {
 		progress(fmt.Sprintf("Searching target region %d...", params.TargetRegionID))
 
-		// Buy from current system's region (or radius)
 		var buySystemsRadius map[int32]int
 		if minSec > 0 {
 			buySystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, minSec)
@@ -117,25 +105,12 @@ func (s *Scanner) ScanMultiRegion(params ScanParams, progress func(string)) ([]F
 		buyRegions := s.SDE.Universe.RegionsInSet(buySystemsRadius)
 		buySystems := s.SDE.Universe.SystemsInRegions(buyRegions)
 
-		// Sell only in target region
 		sellRegions := map[int32]bool{params.TargetRegionID: true}
 		sellSystems := s.SDE.Universe.SystemsInRegions(sellRegions)
 
 		progress(fmt.Sprintf("Fetching orders: buy from %d regions, sell to target region...", len(buyRegions)))
-		var sellOrders, buyOrders []esi.MarketOrder
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			sellOrders = s.fetchOrders(buyRegions, "sell", buySystems)
-		}()
-		go func() {
-			defer wg.Done()
-			buyOrders = s.fetchOrders(sellRegions, "buy", sellSystems)
-		}()
-		wg.Wait()
-
-		return s.calculateResults(params, sellOrders, buyOrders, buySystemsRadius, progress)
+		idx := s.fetchAndIndex(buyRegions, buySystems, sellRegions, sellSystems)
+		return s.calculateResults(params, idx, buySystemsRadius, progress)
 	}
 
 	// Default behavior: search by radius
@@ -167,90 +142,198 @@ func (s *Scanner) ScanMultiRegion(params ScanParams, progress func(string)) ([]F
 	sellSystems := s.SDE.Universe.SystemsInRegions(sellRegions)
 
 	progress(fmt.Sprintf("Fetching orders from %d+%d regions...", len(buyRegions), len(sellRegions)))
-	var sellOrders, buyOrders []esi.MarketOrder
+	idx := s.fetchAndIndex(buyRegions, buySystems, sellRegions, sellSystems)
+	return s.calculateResults(params, idx, buySystemsRadius, progress)
+}
+
+// --- Streaming order index types ---
+
+type sellInfo struct {
+	Price        float64
+	VolumeRemain int32
+	LocationID   int64
+	SystemID     int32
+	OrderCount   int
+}
+
+type buyInfo struct {
+	Price        float64
+	VolumeRemain int32
+	LocationID   int64
+	SystemID     int32
+	OrderCount   int
+}
+
+type locKey struct {
+	typeID     int32
+	locationID int64
+}
+
+// scanIndex holds pre-built maps from the streaming fetch phase.
+// Built concurrently while orders are still arriving from ESI.
+type scanIndex struct {
+	cheapestSell map[int32]sellInfo
+	sellCounts   map[locKey]int
+	highestBuy   map[int32]buyInfo
+	buyCounts    map[locKey]int
+	// Raw orders kept for execution plan (indexed by location+type).
+	sellOrders []esi.MarketOrder
+	buyOrders  []esi.MarketOrder
+}
+
+// hubRegionPriority maps known high-traffic region IDs to priority (lower = first).
+// These regions have the most orders and should be fetched earliest for pipeline benefit.
+var hubRegionPriority = map[int32]int{
+	10000002: 0, // The Forge (Jita)
+	10000043: 1, // Domain (Amarr)
+	10000032: 2, // Sinq Laison (Dodixie)
+	10000042: 3, // Metropolis (Hek)
+	10000030: 4, // Heimatar (Rens)
+}
+
+// fetchOrdersStream starts fetching orders for all regions concurrently and
+// streams batches of filtered orders through the returned channel.
+// Hub regions are launched first so the pipeline starts building maps from
+// the largest data sets sooner.
+func (s *Scanner) fetchOrdersStream(
+	regions map[int32]bool,
+	orderType string,
+	validSystems map[int32]int,
+) <-chan []esi.MarketOrder {
+	ch := make(chan []esi.MarketOrder, len(regions))
+
+	// Sort regions: hubs first, then the rest.
+	sorted := make([]int32, 0, len(regions))
+	for rid := range regions {
+		sorted = append(sorted, rid)
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		pi, oki := hubRegionPriority[sorted[i]]
+		pj, okj := hubRegionPriority[sorted[j]]
+		if oki && okj {
+			return pi < pj
+		}
+		if oki {
+			return true
+		}
+		if okj {
+			return false
+		}
+		return sorted[i] < sorted[j]
+	})
+
+	var wg sync.WaitGroup
+	for _, regionID := range sorted {
+		wg.Add(1)
+		go func(rid int32) {
+			defer wg.Done()
+			orders, err := s.ESI.FetchRegionOrders(rid, orderType)
+			if err != nil {
+				return
+			}
+			// Filter to valid systems
+			filtered := make([]esi.MarketOrder, 0, len(orders)/2)
+			for _, o := range orders {
+				if _, ok := validSystems[o.SystemID]; ok {
+					filtered = append(filtered, o)
+				}
+			}
+			if len(filtered) > 0 {
+				ch <- filtered
+			}
+		}(regionID)
+	}
+
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	return ch
+}
+
+// fetchAndIndex launches parallel streaming fetches for sell and buy orders,
+// building the scanIndex incrementally as regions complete.
+func (s *Scanner) fetchAndIndex(
+	buyRegions map[int32]bool, buySystems map[int32]int,
+	sellRegions map[int32]bool, sellSystems map[int32]int,
+) *scanIndex {
+	sellCh := s.fetchOrdersStream(buyRegions, "sell", buySystems)
+	buyCh := s.fetchOrdersStream(sellRegions, "buy", sellSystems)
+
+	idx := &scanIndex{
+		cheapestSell: make(map[int32]sellInfo),
+		sellCounts:   make(map[locKey]int),
+		highestBuy:   make(map[int32]buyInfo),
+		buyCounts:    make(map[locKey]int),
+	}
+
+	var wg sync.WaitGroup
 	wg.Add(2)
+
+	// Consumer 1: build sell-side maps while orders stream in
 	go func() {
 		defer wg.Done()
-		sellOrders = s.fetchOrders(buyRegions, "sell", buySystems)
+		for batch := range sellCh {
+			idx.sellOrders = append(idx.sellOrders, batch...)
+			for _, o := range batch {
+				idx.sellCounts[locKey{o.TypeID, o.LocationID}]++
+				if cur, ok := idx.cheapestSell[o.TypeID]; !ok || o.Price < cur.Price {
+					idx.cheapestSell[o.TypeID] = sellInfo{o.Price, o.VolumeRemain, o.LocationID, o.SystemID, 0}
+				}
+			}
+		}
+		// Fill order counts for cheapest sell locations
+		for tid, info := range idx.cheapestSell {
+			info.OrderCount = idx.sellCounts[locKey{tid, info.LocationID}]
+			idx.cheapestSell[tid] = info
+		}
 	}()
+
+	// Consumer 2: build buy-side maps while orders stream in
 	go func() {
 		defer wg.Done()
-		buyOrders = s.fetchOrders(sellRegions, "buy", sellSystems)
+		for batch := range buyCh {
+			idx.buyOrders = append(idx.buyOrders, batch...)
+			for _, o := range batch {
+				idx.buyCounts[locKey{o.TypeID, o.LocationID}]++
+				if cur, ok := idx.highestBuy[o.TypeID]; !ok || o.Price > cur.Price {
+					idx.highestBuy[o.TypeID] = buyInfo{o.Price, o.VolumeRemain, o.LocationID, o.SystemID, 0}
+				}
+			}
+		}
+		for tid, info := range idx.highestBuy {
+			info.OrderCount = idx.buyCounts[locKey{tid, info.LocationID}]
+			idx.highestBuy[tid] = info
+		}
 	}()
+
 	wg.Wait()
 
-	// For multi-region, use buySystemsRadius for BFS distances (from origin)
-	return s.calculateResults(params, sellOrders, buyOrders, buySystemsRadius, progress)
+	log.Printf("[DEBUG] fetchAndIndex: %d sell orders, %d buy orders", len(idx.sellOrders), len(idx.buyOrders))
+	log.Printf("[DEBUG] cheapestSell: %d types, highestBuy: %d types", len(idx.cheapestSell), len(idx.highestBuy))
+	return idx
 }
 
 // calculateResults is the shared profit calculation logic.
 // bfsDistances = pre-computed distances from origin (used for buyJumps lookup).
 func (s *Scanner) calculateResults(
 	params ScanParams,
-	sellOrders, buyOrders []esi.MarketOrder,
+	idx *scanIndex,
 	bfsDistances map[int32]int,
 	progress func(string),
 ) ([]FlipResult, error) {
-	log.Printf("[DEBUG] calculateResults: %d sell orders, %d buy orders", len(sellOrders), len(buyOrders))
-
-	// OPT: build type-grouped maps with only min-sell and max-buy per type
-	// This avoids storing all orders and does a single pass
-	type sellInfo struct {
-		Price        float64
-		VolumeRemain int32
-		LocationID   int64
-		SystemID     int32
-		OrderCount   int // number of sell orders at this location for this type
-	}
-	type buyInfo struct {
-		Price        float64
-		VolumeRemain int32
-		LocationID   int64
-		SystemID     int32
-		OrderCount   int // number of buy orders at this location for this type
-	}
-
-	// Single pass: find cheapest sell per type
-	cheapestSell := make(map[int32]sellInfo)
-	// Count sell orders per type+location
-	type locKey struct {
-		typeID     int32
-		locationID int64
-	}
-	sellCounts := make(map[locKey]int)
-	for _, o := range sellOrders {
-		sellCounts[locKey{o.TypeID, o.LocationID}]++
-		if cur, ok := cheapestSell[o.TypeID]; !ok || o.Price < cur.Price {
-			cheapestSell[o.TypeID] = sellInfo{o.Price, o.VolumeRemain, o.LocationID, o.SystemID, 0}
-		}
-	}
-	// Fill order counts for cheapest sell locations
-	for tid, info := range cheapestSell {
-		info.OrderCount = sellCounts[locKey{tid, info.LocationID}]
-		cheapestSell[tid] = info
-	}
-
-	// Single pass: find highest buy per type
-	highestBuy := make(map[int32]buyInfo)
-	buyCounts := make(map[locKey]int)
-	for _, o := range buyOrders {
-		buyCounts[locKey{o.TypeID, o.LocationID}]++
-		if cur, ok := highestBuy[o.TypeID]; !ok || o.Price > cur.Price {
-			highestBuy[o.TypeID] = buyInfo{o.Price, o.VolumeRemain, o.LocationID, o.SystemID, 0}
-		}
-	}
-	for tid, info := range highestBuy {
-		info.OrderCount = buyCounts[locKey{tid, info.LocationID}]
-		highestBuy[tid] = info
-	}
-
-	log.Printf("[DEBUG] cheapestSell: %d types, highestBuy: %d types", len(cheapestSell), len(highestBuy))
+	cheapestSell := idx.cheapestSell
+	highestBuy := idx.highestBuy
+	sellOrders := idx.sellOrders
+	buyOrders := idx.buyOrders
 
 	progress("Calculating profits...")
 	taxMult := 1.0 - params.SalesTaxPercent/100
 	if taxMult < 0 {
 		taxMult = 0
 	}
+	brokerMult := params.BrokerFeePercent / 100 // 0 for instant trades
 
 	var results []FlipResult
 
@@ -261,12 +344,14 @@ func (s *Scanner) calculateResults(
 		}
 
 		// OPT: early margin check before item lookup
-		effectiveSellPrice := buy.Price * taxMult
-		profitPerUnit := effectiveSellPrice - sell.Price
+		// Broker fee applies to both sides when placing limit orders (0 for instant trades)
+		effectiveBuyPrice := sell.Price * (1 + brokerMult)
+		effectiveSellPrice := buy.Price * taxMult * (1 - brokerMult)
+		profitPerUnit := effectiveSellPrice - effectiveBuyPrice
 		if profitPerUnit <= 0 {
 			continue
 		}
-		margin := profitPerUnit / sell.Price * 100
+		margin := profitPerUnit / effectiveBuyPrice * 100
 		if margin < params.MinMargin {
 			continue
 		}
@@ -330,12 +415,14 @@ func (s *Scanner) calculateResults(
 			BuySystemName:   s.systemName(sell.SystemID),
 			BuySystemID:     sell.SystemID,
 			BuyRegionID:     buyRegionID,
+			BuyRegionName:   s.regionName(buyRegionID),
 			BuyLocationID:   sell.LocationID,
 			SellPrice:       buy.Price,
 			SellStation:     "",
 			SellSystemName:  s.systemName(buy.SystemID),
 			SellSystemID:    buy.SystemID,
 			SellRegionID:    sellRegionID,
+			SellRegionName:  s.regionName(sellRegionID),
 			SellLocationID:  buy.LocationID,
 			ProfitPerUnit:   profitPerUnit,
 			MarginPercent:   margin,
@@ -363,31 +450,38 @@ func (s *Scanner) calculateResults(
 		results = results[:limit]
 	}
 
-	// Enrich with execution-plan expected prices (same order book, no extra ESI)
+	// Enrich with execution-plan expected prices (same order book, no extra ESI).
+	// Filter orders by location_id for more accurate slippage estimates.
 	if len(results) > 0 {
 		progress("Expected fill prices...")
-		type regionTypeKey struct{ regionID, typeID int32 }
-		sellByRT := make(map[regionTypeKey][]esi.MarketOrder)
-		for _, o := range sellOrders {
-			k := regionTypeKey{o.RegionID, o.TypeID}
-			sellByRT[k] = append(sellByRT[k], o)
+		type locTypeKey struct {
+			locationID int64
+			typeID     int32
 		}
-		buyByRT := make(map[regionTypeKey][]esi.MarketOrder)
+		// Index sell orders by location+type (for buy-side execution plan at specific station)
+		sellByLT := make(map[locTypeKey][]esi.MarketOrder)
+		for _, o := range sellOrders {
+			k := locTypeKey{o.LocationID, o.TypeID}
+			sellByLT[k] = append(sellByLT[k], o)
+		}
+		// Index buy orders by location+type (for sell-side execution plan at specific station)
+		buyByLT := make(map[locTypeKey][]esi.MarketOrder)
 		for _, o := range buyOrders {
-			k := regionTypeKey{o.RegionID, o.TypeID}
-			buyByRT[k] = append(buyByRT[k], o)
+			k := locTypeKey{o.LocationID, o.TypeID}
+			buyByLT[k] = append(buyByLT[k], o)
 		}
 		for i := range results {
 			r := &results[i]
-			planBuy := ComputeExecutionPlan(sellByRT[regionTypeKey{r.BuyRegionID, r.TypeID}], r.UnitsToBuy, true)
-			planSell := ComputeExecutionPlan(buyByRT[regionTypeKey{r.SellRegionID, r.TypeID}], r.UnitsToBuy, false)
+			planBuy := ComputeExecutionPlan(sellByLT[locTypeKey{r.BuyLocationID, r.TypeID}], r.UnitsToBuy, true)
+			planSell := ComputeExecutionPlan(buyByLT[locTypeKey{r.SellLocationID, r.TypeID}], r.UnitsToBuy, false)
 			r.ExpectedBuyPrice = planBuy.ExpectedPrice
 			r.ExpectedSellPrice = planSell.ExpectedPrice
 			r.SlippageBuyPct = planBuy.SlippagePercent
 			r.SlippageSellPct = planSell.SlippagePercent
 			if r.ExpectedBuyPrice > 0 && r.ExpectedSellPrice > 0 {
-				effSell := r.ExpectedSellPrice * taxMult
-				r.ExpectedProfit = (effSell - r.ExpectedBuyPrice) * float64(r.UnitsToBuy)
+				effBuy := r.ExpectedBuyPrice * (1 + brokerMult)
+				effSell := r.ExpectedSellPrice * taxMult * (1 - brokerMult)
+				r.ExpectedProfit = (effSell - effBuy) * float64(r.UnitsToBuy)
 			}
 		}
 	}
@@ -426,6 +520,15 @@ func (s *Scanner) calculateResults(
 	// Enrich with market history (volume, velocity, trend)
 	s.enrichWithHistory(results, progress)
 
+	// Compute DailyProfit = ProfitPerUnit * min(UnitsToBuy, DailyVolume)
+	for i := range results {
+		sellablePerDay := int64(results[i].UnitsToBuy)
+		if results[i].DailyVolume > 0 && results[i].DailyVolume < sellablePerDay {
+			sellablePerDay = results[i].DailyVolume
+		}
+		results[i].DailyProfit = results[i].ProfitPerUnit * float64(sellablePerDay)
+	}
+
 	// Post-filter: min daily volume
 	if params.MinDailyVolume > 0 {
 		filtered := results[:0]
@@ -441,31 +544,13 @@ func (s *Scanner) calculateResults(
 	return results, nil
 }
 
+// fetchOrders is the legacy blocking version, kept for non-scan callers.
 func (s *Scanner) fetchOrders(regions map[int32]bool, orderType string, validSystems map[int32]int) []esi.MarketOrder {
-	var mu sync.Mutex
+	ch := s.fetchOrdersStream(regions, orderType, validSystems)
 	var all []esi.MarketOrder
-	var wg sync.WaitGroup
-
-	for regionID := range regions {
-		wg.Add(1)
-		go func(rid int32) {
-			defer wg.Done()
-			orders, err := s.ESI.FetchRegionOrders(rid, orderType)
-			if err != nil {
-				return
-			}
-			var filtered []esi.MarketOrder
-			for _, o := range orders {
-				if _, ok := validSystems[o.SystemID]; ok {
-					filtered = append(filtered, o)
-				}
-			}
-			mu.Lock()
-			all = append(all, filtered...)
-			mu.Unlock()
-		}(regionID)
+	for batch := range ch {
+		all = append(all, batch...)
 	}
-	wg.Wait()
 	log.Printf("[DEBUG] fetchOrders(%s): %d orders after filtering", orderType, len(all))
 	return all
 }
@@ -509,6 +594,13 @@ func (s *Scanner) systemName(systemID int32) string {
 		return sys.Name
 	}
 	return fmt.Sprintf("System %d", systemID)
+}
+
+func (s *Scanner) regionName(regionID int32) string {
+	if r, ok := s.SDE.Regions[regionID]; ok {
+		return r.Name
+	}
+	return fmt.Sprintf("Region %d", regionID)
 }
 
 // enrichWithHistory fetches market history for top results and fills DailyVolume/Velocity/PriceTrend.

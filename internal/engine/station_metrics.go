@@ -244,15 +244,16 @@ func CalcCI(orders []esi.MarketOrder) int {
 	// Base score: number of unique orders
 	score := len(orders)
 
-	// Count "0.01 ISK wars" (orders with very tight spreads)
-	tightSpreadCount := countTightSpreadOrders(orders, 0.01)
+	// Count "0.01 ISK wars" (orders with very tight relative spreads)
+	tightSpreadCount := countTightSpreadOrders(orders)
 	score += tightSpreadCount * 2
 
 	return score
 }
 
-// countTightSpreadOrders counts orders within threshold ISK of each other.
-func countTightSpreadOrders(orders []esi.MarketOrder, threshold float64) int {
+// countTightSpreadOrders counts orders within 0.01% of each other's price.
+// Uses relative threshold to work correctly for both cheap (< 1 ISK) and expensive (> 1B ISK) items.
+func countTightSpreadOrders(orders []esi.MarketOrder) int {
 	if len(orders) < 2 {
 		return 0
 	}
@@ -266,7 +267,17 @@ func countTightSpreadOrders(orders []esi.MarketOrder, threshold float64) int {
 
 	count := 0
 	for i := 1; i < len(prices); i++ {
-		if prices[i]-prices[i-1] <= threshold {
+		if prices[i] <= 0 {
+			continue
+		}
+		// Relative threshold: 0.01% of the price (e.g., 0.01 ISK for a 100 ISK item,
+		// 100,000 ISK for a 1B ISK item)
+		relativeThreshold := prices[i] * 0.0001
+		// Floor at 0.01 ISK (EVE minimum price increment)
+		if relativeThreshold < 0.01 {
+			relativeThreshold = 0.01
+		}
+		if prices[i]-prices[i-1] <= relativeThreshold {
 			count++
 		}
 	}
@@ -277,12 +288,18 @@ func countTightSpreadOrders(orders []esi.MarketOrder, threshold float64) int {
 // Higher is better.
 func CalcCTS(periodROI, obds, pvi float64, ci, sds int, dailyVolume float64) float64 {
 	// Normalize each component to 0-100 scale
-	roiScore := normalize(periodROI, 0, 100)       // Higher ROI = better
-	obdsScore := normalize(obds, 0, 2) * 100       // Higher depth = better
-	pviScore := 100 - normalize(pvi, 0, 50)*100    // Lower volatility = better
-	ciScore := 100 - normalize(float64(ci), 0, 100)*100  // Lower competition = better
+	roiScore := normalize(periodROI, 0, 100)              // Higher ROI = better
+	obdsScore := normalize(obds, 0, 2) * 100              // Higher depth = better
+	pviScore := 100 - normalize(pvi, 0, 50)*100           // Lower volatility = better
+	ciScore := 100 - normalize(float64(ci), 0, 100)*100   // Lower competition = better
 	sdsScore := 100 - normalize(float64(sds), 0, 100)*100 // Lower scam score = better
-	volScore := normalize(dailyVolume, 0, 100)     // Higher volume = better (capped at 100)
+
+	// Volume score: use log scale so both low-volume (10/day) and high-volume (10000/day)
+	// items are fairly represented. log10(10)=1, log10(100)=2, log10(1000)=3, log10(10000)=4
+	var volScore float64
+	if dailyVolume > 1 {
+		volScore = normalize(math.Log10(dailyVolume), 0, 4) * 100 // 0..10000 units/day mapped to 0..100
+	}
 
 	// Weighted sum (weights should sum to 1.0)
 	return roiScore*0.25 +
@@ -309,6 +326,8 @@ func normalize(value, minVal, maxVal float64) float64 {
 }
 
 // CalcPeriodROI calculates ROI based on historical average prices.
+// Uses 10th/90th percentile of daily prices instead of absolute min/max
+// to avoid outlier distortion.
 func CalcPeriodROI(history []esi.HistoryEntry, days int) float64 {
 	entries := filterLastNDays(history, days)
 	if len(entries) < 2 {
@@ -321,28 +340,56 @@ func CalcPeriodROI(history []esi.HistoryEntry, days int) float64 {
 		return 0
 	}
 
-	// Find min and max for potential spread
-	var minPrice float64 = math.MaxFloat64
-	var maxPrice float64
+	// Collect all daily low and high prices
+	lows := make([]float64, 0, len(entries))
+	highs := make([]float64, 0, len(entries))
 	for _, h := range entries {
-		if h.Lowest < minPrice {
-			minPrice = h.Lowest
+		if h.Lowest > 0 {
+			lows = append(lows, h.Lowest)
 		}
-		if h.Highest > maxPrice {
-			maxPrice = h.Highest
+		if h.Highest > 0 {
+			highs = append(highs, h.Highest)
 		}
 	}
-
-	if minPrice >= math.MaxFloat64 || minPrice <= 0 {
+	if len(lows) < 2 || len(highs) < 2 {
 		return 0
 	}
 
-	// Period ROI approximation: (typical sell - typical buy) / typical buy
-	// Using avg between high-low range as typical prices
-	typicalBuy := (minPrice + vwap) / 2
-	typicalSell := (maxPrice + vwap) / 2
+	sort.Float64s(lows)
+	sort.Float64s(highs)
+
+	// Use 10th percentile of lows (typical buy) and 90th percentile of highs (typical sell)
+	// to filter out outlier spikes / crashes
+	p10Low := percentile(lows, 10)
+	p90High := percentile(highs, 90)
+
+	if p10Low <= 0 {
+		return 0
+	}
+
+	// Period ROI: blend percentile with VWAP for stability
+	typicalBuy := (p10Low + vwap) / 2
+	typicalSell := (p90High + vwap) / 2
 
 	return (typicalSell - typicalBuy) / typicalBuy * 100
+}
+
+// percentile returns the p-th percentile from a sorted slice (p in 0..100).
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if len(sorted) == 1 {
+		return sorted[0]
+	}
+	idx := p / 100 * float64(len(sorted)-1)
+	lower := int(math.Floor(idx))
+	upper := int(math.Ceil(idx))
+	if lower == upper || upper >= len(sorted) {
+		return sorted[lower]
+	}
+	frac := idx - float64(lower)
+	return sorted[lower]*(1-frac) + sorted[upper]*frac
 }
 
 // CalcAvgPriceStats returns average, high, and low prices over N days.

@@ -3,6 +3,7 @@ package sde
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"eve-flipper/internal/logger"
 )
@@ -308,20 +309,32 @@ func (ind *IndustryData) GetBlueprintForProduct(typeID int32) (*Blueprint, bool)
 // CalculateMaterialsWithME calculates required materials with Material Efficiency applied.
 // ME ranges from 0-10 (each level reduces materials by 1%).
 func (bp *Blueprint) CalculateMaterialsWithME(runs int32, me int32) []BlueprintMaterial {
+	return bp.CalculateMaterialsWithMEAndStructure(runs, me, 0)
+}
+
+// CalculateMaterialsWithMEAndStructure calculates required materials with both ME and
+// structure bonus applied in a single step (before ceiling) to avoid rounding errors.
+// EVE formula: max(runs, ceil(base * runs * (1 - ME/100) * (1 - structureBonus/100)))
+func (bp *Blueprint) CalculateMaterialsWithMEAndStructure(runs int32, me int32, structureBonus float64) []BlueprintMaterial {
 	if me < 0 {
 		me = 0
 	}
 	if me > 10 {
 		me = 10
 	}
+	if structureBonus < 0 {
+		structureBonus = 0
+	}
 
 	meMultiplier := 1.0 - float64(me)/100.0
+	structureMultiplier := 1.0 - structureBonus/100.0
+
 	result := make([]BlueprintMaterial, len(bp.Materials))
 
 	for i, mat := range bp.Materials {
-		// Formula: max(runs, ceil(base * runs * (1 - ME/100)))
-		baseQty := float64(mat.Quantity) * float64(runs) * meMultiplier
-		finalQty := int32(baseQty + 0.999999) // Ceiling
+		// Combined formula: max(runs, ceil(base * runs * (1 - ME/100) * (1 - structureBonus/100)))
+		baseQty := float64(mat.Quantity) * float64(runs) * meMultiplier * structureMultiplier
+		finalQty := int32(math.Ceil(baseQty))
 		if finalQty < runs {
 			finalQty = runs
 		}

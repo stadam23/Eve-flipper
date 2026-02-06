@@ -2,7 +2,10 @@ module eve-flipper
 
 go 1.25.4
 
-require modernc.org/sqlite v1.44.3
+require (
+	golang.org/x/sync v0.17.0
+	modernc.org/sqlite v1.44.3
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

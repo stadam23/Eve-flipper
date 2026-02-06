@@ -21,6 +21,8 @@ type TradeOpportunity struct {
 	DailyProfit   float64 `json:"daily_profit"`    // Potential daily profit
 	JitaVolume    int32   `json:"jita_volume"`     // Available volume in Jita
 	RegionVolume  int32   `json:"region_volume"`   // Available volume in region
+	DataSource    string  `json:"data_source"`     // "killmail" or "static"
+	Volume        float64 `json:"volume"`          // Item volume in m³ (from SDE)
 }
 
 // RegionOpportunities contains all trade opportunities for a region.
@@ -39,7 +41,7 @@ type RegionOpportunities struct {
 	TotalPotential float64            `json:"total_potential"` // Sum of daily profits
 }
 
-// Common PvP modules that are always in demand during conflicts
+// Common PvP modules — fallback when killmail data is not available
 var commonPvPModules = []struct {
 	TypeID   int32
 	Name     string
@@ -70,10 +72,9 @@ var commonPvPModules = []struct {
 	{22291, "Gyrostabilizer II", "module"},
 	{10190, "Ballistic Control System II", "module"},
 	{22919, "Heat Sink II", "module"},
-	{4405, "Magnetic Field Stabilizer II", "module"},
 }
 
-// Common ammo types in demand
+// Common ammo types — fallback when killmail data is not available
 var commonAmmo = []struct {
 	TypeID   int32
 	Name     string
@@ -134,7 +135,8 @@ var commonAmmo = []struct {
 const jitaRegionID = int32(10000002) // The Forge
 
 // GetRegionOpportunities analyzes trade opportunities for a war region.
-func (d *DemandAnalyzer) GetRegionOpportunities(regionID int32, esiClient *esi.Client) (*RegionOpportunities, error) {
+// If fittingProfile is non-nil, uses real killmail data instead of hardcoded lists.
+func (d *DemandAnalyzer) GetRegionOpportunities(regionID int32, esiClient *esi.Client, fittingProfile *RegionDemandProfile) (*RegionOpportunities, error) {
 	// Get region stats from zkillboard
 	stats, err := d.client.GetRegionStats(regionID)
 	if err != nil {
@@ -153,28 +155,49 @@ func (d *DemandAnalyzer) GetRegionOpportunities(regionID int32, esiClient *esi.C
 		HotScore:   zone.HotScore,
 	}
 
+	// Determine data source
+	useFittingData := fittingProfile != nil && len(fittingProfile.Items) > 0
+	dataSource := "static"
+	if useFittingData {
+		dataSource = "killmail"
+	}
+
 	// Collect all type IDs we need prices for
 	typeIDs := make(map[int32]struct{})
-	shipKills := make(map[int32]int) // typeID -> kills
+	shipKills := make(map[int32]int)          // typeID -> kills (from zkillboard stats)
+	fittingDemand := make(map[int32]float64)  // typeID -> est_daily_demand (from killmails)
+	fittingCategory := make(map[int32]string) // typeID -> category
+	fittingNames := make(map[int32]string)    // typeID -> name
 
-	// Get top ships from zkillboard stats
-	for _, list := range stats.TopLists {
-		if list.Type == "shipType" {
-			for _, v := range list.Values {
-				if v.ShipTypeID > 0 {
-					typeIDs[v.ShipTypeID] = struct{}{}
-					shipKills[v.ShipTypeID] = v.Kills
+	if useFittingData {
+		// Use real killmail data
+		for typeID, profile := range fittingProfile.Items {
+			if profile.EstDailyDemand < 1 {
+				continue
+			}
+			typeIDs[typeID] = struct{}{}
+			fittingDemand[typeID] = profile.EstDailyDemand
+			fittingCategory[typeID] = profile.Category
+			fittingNames[typeID] = profile.TypeName
+		}
+	} else {
+		// Fallback: use hardcoded lists + top ships from zkillboard
+		for _, list := range stats.TopLists {
+			if list.Type == "shipType" {
+				for _, v := range list.Values {
+					if v.ShipTypeID > 0 {
+						typeIDs[v.ShipTypeID] = struct{}{}
+						shipKills[v.ShipTypeID] = v.Kills
+					}
 				}
 			}
 		}
-	}
-
-	// Add common modules and ammo
-	for _, m := range commonPvPModules {
-		typeIDs[m.TypeID] = struct{}{}
-	}
-	for _, a := range commonAmmo {
-		typeIDs[a.TypeID] = struct{}{}
+		for _, m := range commonPvPModules {
+			typeIDs[m.TypeID] = struct{}{}
+		}
+		for _, a := range commonAmmo {
+			typeIDs[a.TypeID] = struct{}{}
+		}
 	}
 
 	// Convert to slice
@@ -189,7 +212,6 @@ func (d *DemandAnalyzer) GetRegionOpportunities(regionID int32, esiClient *esi.C
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	// Fetch Jita prices
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -199,7 +221,6 @@ func (d *DemandAnalyzer) GetRegionOpportunities(regionID int32, esiClient *esi.C
 		mu.Unlock()
 	}()
 
-	// Fetch target region prices (only if different from Jita)
 	if regionID != jitaRegionID {
 		wg.Add(1)
 		go func() {
@@ -214,45 +235,87 @@ func (d *DemandAnalyzer) GetRegionOpportunities(regionID int32, esiClient *esi.C
 	wg.Wait()
 
 	// Build opportunities
-	// Ships
-	for typeID, kills := range shipKills {
-		jita := jitaPrices[typeID]
-		region := regionPrices[typeID]
+	if useFittingData {
+		// Dynamic mode: use real killmail data
+		for typeID, demand := range fittingDemand {
+			jita := jitaPrices[typeID]
+			region := regionPrices[typeID]
+			if jita.sellPrice <= 0 {
+				continue
+			}
 
-		if jita.sellPrice > 0 {
-			opp := buildOpportunity(typeID, "", "ship", kills, jita, region)
-			if opp != nil && opp.ProfitPercent > 5 { // Only show if >5% margin
-				result.Ships = append(result.Ships, *opp)
+			category := fittingCategory[typeID]
+			name := fittingNames[typeID]
+			dailyDemand := int(demand)
+			if dailyDemand < 1 {
+				dailyDemand = 1
+			}
+
+			opp := buildOpportunity(typeID, name, category, dailyDemand, jita, region)
+			if opp == nil {
+				continue
+			}
+			opp.DataSource = dataSource
+
+			// Apply category-specific margin thresholds
+			switch category {
+			case "ship":
+				if opp.ProfitPercent > 5 {
+					result.Ships = append(result.Ships, *opp)
+				}
+			case "module":
+				if opp.ProfitPercent > 10 {
+					result.Modules = append(result.Modules, *opp)
+				}
+			case "ammo":
+				if opp.ProfitPercent > 15 {
+					result.Ammo = append(result.Ammo, *opp)
+				}
+			case "drone":
+				// Drones go into ammo category for display
+				if opp.ProfitPercent > 10 {
+					opp.Category = "ammo"
+					result.Ammo = append(result.Ammo, *opp)
+				}
 			}
 		}
-	}
-
-	// Modules
-	for _, m := range commonPvPModules {
-		jita := jitaPrices[m.TypeID]
-		region := regionPrices[m.TypeID]
-
-		if jita.sellPrice > 0 {
-			// Estimate demand based on region activity
-			estimatedKills := int(float64(zone.KillsToday) * 0.5) // ~50% of kills need these
-			opp := buildOpportunity(m.TypeID, m.Name, m.Category, estimatedKills, jita, region)
-			if opp != nil && opp.ProfitPercent > 10 { // Higher threshold for modules
-				result.Modules = append(result.Modules, *opp)
+	} else {
+		// Static mode: use hardcoded lists (original behavior)
+		for typeID, kills := range shipKills {
+			jita := jitaPrices[typeID]
+			region := regionPrices[typeID]
+			if jita.sellPrice > 0 {
+				opp := buildOpportunity(typeID, "", "ship", kills, jita, region)
+				if opp != nil && opp.ProfitPercent > 5 {
+					opp.DataSource = dataSource
+					result.Ships = append(result.Ships, *opp)
+				}
 			}
 		}
-	}
 
-	// Ammo
-	for _, a := range commonAmmo {
-		jita := jitaPrices[a.TypeID]
-		region := regionPrices[a.TypeID]
+		for _, m := range commonPvPModules {
+			jita := jitaPrices[m.TypeID]
+			region := regionPrices[m.TypeID]
+			if jita.sellPrice > 0 {
+				estimatedKills := int(float64(zone.KillsToday) * 0.5)
+				opp := buildOpportunity(m.TypeID, m.Name, m.Category, estimatedKills, jita, region)
+				if opp != nil && opp.ProfitPercent > 10 {
+					opp.DataSource = dataSource
+					result.Modules = append(result.Modules, *opp)
+				}
+			}
+		}
 
-		if jita.sellPrice > 0 {
-			// Ammo is consumed heavily
-			estimatedKills := int(float64(zone.KillsToday) * 100) // ~100 units per kill
-			opp := buildOpportunity(a.TypeID, a.Name, a.Category, estimatedKills, jita, region)
-			if opp != nil && opp.ProfitPercent > 15 { // Even higher for ammo due to low margins
-				result.Ammo = append(result.Ammo, *opp)
+		for _, a := range commonAmmo {
+			jita := jitaPrices[a.TypeID]
+			region := regionPrices[a.TypeID]
+			if jita.sellPrice > 0 {
+				estimatedKills := int(float64(zone.KillsToday) * 100)
+				opp := buildOpportunity(a.TypeID, a.Name, a.Category, estimatedKills, jita, region)
+				if opp != nil && opp.ProfitPercent > 15 {
+					opp.DataSource = dataSource
+					result.Ammo = append(result.Ammo, *opp)
+				}
 			}
 		}
 	}
@@ -324,19 +387,42 @@ func fetchBestPrices(esiClient *esi.Client, regionID int32, typeIDs []int32) map
 	return prices
 }
 
+// defaultSellFeePercent is the estimated total sell-side fee (broker + sales tax).
+// Assumes moderate skills: ~3% broker fee + ~5% sales tax = ~8%.
+const defaultSellFeePercent = 8.0
+
 func buildOpportunity(typeID int32, name string, category string, kills int, jita, region priceInfo) *TradeOpportunity {
 	if jita.sellPrice <= 0 {
 		return nil
 	}
 
-	profitPerUnit := region.sellPrice - jita.sellPrice
-	if profitPerUnit <= 0 {
-		// No profit if region price is lower or equal
-		// But might be opportunity if no supply in region
+	sellPrice := region.sellPrice
+	noSupply := false
+
+	if sellPrice <= 0 || sellPrice <= jita.sellPrice {
 		if region.sellVolume == 0 && jita.sellPrice > 0 {
-			// No supply in region - estimate 20% markup
-			profitPerUnit = jita.sellPrice * 0.2
+			// No supply in region — use Jita price as reference but mark as "no supply"
+			// The frontend already shows "NO COMPETITION" badge and suggested price.
+			// We don't fabricate a fake profit; instead use Jita price so margin = 0
+			// and let the frontend handle the display.
+			noSupply = true
+			sellPrice = 0
 		} else {
+			return nil
+		}
+	}
+
+	// FIX #1: Account for fees when selling in the target region.
+	// Net revenue per unit = regionPrice * (1 - feePercent/100) - jitaPrice
+	var profitPerUnit float64
+	if noSupply {
+		// For empty regions, estimate minimum viable margin (30% markup over Jita + fees)
+		profitPerUnit = jita.sellPrice * 0.30 * (1 - defaultSellFeePercent/100)
+		sellPrice = jita.sellPrice * 1.30
+	} else {
+		netSellPrice := sellPrice * (1 - defaultSellFeePercent/100)
+		profitPerUnit = netSellPrice - jita.sellPrice
+		if profitPerUnit <= 0 {
 			return nil
 		}
 	}
@@ -353,7 +439,7 @@ func buildOpportunity(typeID int32, name string, category string, kills int, jit
 		Category:      category,
 		KillsPerDay:   kills,
 		JitaPrice:     jita.sellPrice,
-		RegionPrice:   region.sellPrice,
+		RegionPrice:   sellPrice,
 		ProfitPerUnit: profitPerUnit,
 		ProfitPercent: profitPercent,
 		DailyVolume:   dailyVolume,

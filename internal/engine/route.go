@@ -69,7 +69,8 @@ func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params Rou
 		return nil
 	}
 
-	taxMult := 1.0 - params.SalesTaxPercent/100
+	feePercent := params.SalesTaxPercent + params.BrokerFeePercent
+	taxMult := 1.0 - feePercent/100
 	if taxMult < 0 {
 		taxMult = 0
 	}
@@ -141,19 +142,20 @@ func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params Rou
 			}
 			candidates = append(candidates, candidate{
 				hop: RouteHop{
-					SystemName:     s.systemName(fromSystemID),
-					SystemID:       fromSystemID,
-					RegionID:       regionID,
-					LocationID:     sell.LocationID,
-					DestSystemID:   buySystemID,
-					DestSystemName: s.systemName(buySystemID),
-					TypeName:       itemType.Name,
-					TypeID:         typeID,
-					BuyPrice:       sell.Price,
-					SellPrice:      buy.Price,
-					Units:          actualUnits,
-					Profit:         profit,
-					Jumps:          jumps,
+					SystemName:      s.systemName(fromSystemID),
+					SystemID:        fromSystemID,
+					RegionID:        regionID,
+					LocationID:      sell.LocationID,
+					DestSystemID:    buySystemID,
+					DestSystemName:  s.systemName(buySystemID),
+					DestLocationID:  buy.LocationID,
+					TypeName:        itemType.Name,
+					TypeID:          typeID,
+					BuyPrice:        sell.Price,
+					SellPrice:       buy.Price,
+					Units:           actualUnits,
+					Profit:          profit,
+					Jumps:           jumps,
 				},
 				score: ppj,
 			})
@@ -225,11 +227,10 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 	progress("Building order index...")
 	idx := buildOrderIndex(sellOrders, buyOrders)
 
-	const (
-		beamWidth    = 20 // keep top N partial routes per level
-		branchFactor = 5  // explore top N trades per system
-		maxRoutes    = 50 // max completed routes to return
-	)
+	// Scale beam search parameters based on requested depth
+	beamWidth := 50    // keep top N partial routes per level
+	branchFactor := 10 // explore top N trades per system
+	defaultMaxRoutes := 100
 
 	type partialRoute struct {
 		hops        []RouteHop
@@ -240,7 +241,7 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 
 	// Seed with initial trades from start system
 	progress("Exploring routes...")
-	initialTrades := s.findBestTrades(idx, systemID, params, branchFactor*4) // wider initial search
+	initialTrades := s.findBestTrades(idx, systemID, params, branchFactor*3) // wider initial search
 	if len(initialTrades) == 0 {
 		progress("No profitable trades found")
 		return []RouteResult{}, nil
@@ -336,28 +337,47 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		}
 	}
 
-	// Deduplicate and sort
+	// Deduplicate: keep highest-profit version of routes with same hop sequence
+	seen := make(map[string]bool)
+	var unique []RouteResult
+	// Sort by profit desc first so we keep the best version
 	sort.Slice(completedRoutes, func(i, j int) bool {
 		return completedRoutes[i].TotalProfit > completedRoutes[j].TotalProfit
 	})
-	routeLimit := EffectiveMaxResults(params.MaxResults, maxRoutes)
+	for _, r := range completedRoutes {
+		key := routeKey(r)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, r)
+	}
+	completedRoutes = unique
+
+	routeLimit := EffectiveMaxResults(params.MaxResults, defaultMaxRoutes)
 	if len(completedRoutes) > routeLimit {
 		completedRoutes = completedRoutes[:routeLimit]
 	}
 
-	// Prefetch station names for all hops
+	// Prefetch station names for all hops (buy and sell stations)
 	if len(completedRoutes) > 0 {
 		progress("Fetching station names...")
 		stations := make(map[int64]bool)
 		for _, route := range completedRoutes {
 			for _, hop := range route.Hops {
 				stations[hop.LocationID] = true
+				if hop.DestLocationID != 0 {
+					stations[hop.DestLocationID] = true
+				}
 			}
 		}
 		s.ESI.PrefetchStationNames(stations)
 		for i := range completedRoutes {
 			for j := range completedRoutes[i].Hops {
 				completedRoutes[i].Hops[j].StationName = s.ESI.StationName(completedRoutes[i].Hops[j].LocationID)
+				if completedRoutes[i].Hops[j].DestLocationID != 0 {
+					completedRoutes[i].Hops[j].DestStationName = s.ESI.StationName(completedRoutes[i].Hops[j].DestLocationID)
+				}
 			}
 		}
 	}
@@ -371,4 +391,13 @@ func copyHops(hops []RouteHop) []RouteHop {
 	c := make([]RouteHop, len(hops))
 	copy(c, hops)
 	return c
+}
+
+// routeKey generates a unique string key for a route based on the sequence of systems and items.
+func routeKey(r RouteResult) string {
+	parts := make([]string, len(r.Hops))
+	for i, h := range r.Hops {
+		parts[i] = fmt.Sprintf("%d>%d:%d", h.SystemID, h.DestSystemID, h.TypeID)
+	}
+	return strings.Join(parts, "|")
 }

@@ -101,6 +101,7 @@ func (d *DB) DeleteHistory(id int64) error {
 	tx.Exec("DELETE FROM flip_results WHERE scan_id = ?", id)
 	tx.Exec("DELETE FROM contract_results WHERE scan_id = ?", id)
 	tx.Exec("DELETE FROM station_results WHERE scan_id = ?", id)
+	tx.Exec("DELETE FROM route_results WHERE scan_id = ?", id)
 	tx.Exec("DELETE FROM scan_history WHERE id = ?", id)
 	return tx.Commit()
 }
@@ -134,6 +135,7 @@ func (d *DB) ClearHistory(olderThanDays int) (int64, error) {
 		tx.Exec("DELETE FROM flip_results WHERE scan_id = ?", id)
 		tx.Exec("DELETE FROM contract_results WHERE scan_id = ?", id)
 		tx.Exec("DELETE FROM station_results WHERE scan_id = ?", id)
+		tx.Exec("DELETE FROM route_results WHERE scan_id = ?", id)
 	}
 	result, err := tx.Exec("DELETE FROM scan_history WHERE timestamp < ?", cutoff)
 	if err != nil {

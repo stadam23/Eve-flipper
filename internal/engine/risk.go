@@ -36,6 +36,9 @@ type PortfolioRiskSummary struct {
 	// CapacityMultiplier is a rough estimate of how much more
 	// notional the player could hold at similar risk (e.g. 1.8x).
 	CapacityMultiplier float64 `json:"capacity_multiplier"`
+
+	// LowSample is true when VaR/ES are unreliable due to small sample size (<20 days).
+	LowSample bool `json:"low_sample"`
 }
 
 const (
@@ -153,17 +156,18 @@ func ComputePortfolioRiskFromTransactions(txns []esi.WalletTransaction) *Portfol
 	}
 
 	return &PortfolioRiskSummary{
-		RiskScore:         score,
-		RiskLevel:         level,
-		Var95:             -var95, // report as positive loss
-		Var99:             -var99,
-		ES95:              -es95,
-		ES99:              -es99,
-		TypicalDailyPnl:   typical,
-		WorstDayLoss:      -worstLoss,
-		SampleDays:        len(pnls),
-		WindowDays:        portfolioLookbackDays,
+		RiskScore:          score,
+		RiskLevel:          level,
+		Var95:              -var95, // report as positive loss
+		Var99:              -var99,
+		ES95:               -es95,
+		ES99:               -es99,
+		TypicalDailyPnl:    typical,
+		WorstDayLoss:       -worstLoss,
+		SampleDays:         len(pnls),
+		WindowDays:         portfolioLookbackDays,
 		CapacityMultiplier: capacity,
+		LowSample:         len(pnls) < 20, // VaR/ES unreliable with <20 data points
 	}
 }
 

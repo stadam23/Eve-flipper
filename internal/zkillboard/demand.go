@@ -29,12 +29,12 @@ type RegionHotZone struct {
 	RegionID      int32    `json:"region_id"`
 	RegionName    string   `json:"region_name"`
 	HotScore      float64  `json:"hot_score"`      // Current vs baseline ratio
-	Status        string   `json:"status"`         // "war", "conflict", "elevated", "normal"
-	KillsToday    int64    `json:"kills_today"`    // Estimated kills in last 24h
-	KillsBaseline int64    `json:"kills_baseline"` // Average daily kills (baseline)
-	ISKDestroyed  float64  `json:"isk_destroyed"`  // Total ISK destroyed (all time)
-	ActivePlayers int      `json:"active_players"` // Currently active PVP players
-	TopShips      []string `json:"top_ships"`      // Most destroyed ship types
+	Status        string   `json:"status"`          // "war", "conflict", "elevated", "normal"
+	KillsToday    int64    `json:"kills_today"`     // Average daily kills this month (not literal "today")
+	KillsBaseline int64    `json:"kills_baseline"`  // Average daily kills (baseline from prior months)
+	ISKDestroyed  float64  `json:"isk_destroyed"`   // Total ISK destroyed (all time)
+	ActivePlayers int      `json:"active_players"`  // Currently active PVP players
+	TopShips      []string `json:"top_ships"`       // Most destroyed ship types
 }
 
 // DemandItem represents an item with high demand due to kills.
@@ -279,6 +279,15 @@ func (d *DemandAnalyzer) analyzeRegion(regionID int32, stats *RegionStats) *Regi
 		hotScore = currentDaily / baselineDaily
 	} else if currentDaily > 0 {
 		hotScore = 2.0 // No baseline but has activity
+	}
+
+	// FIX #4: Dampen hot score when we have very few days of data.
+	// Early in the month (1-3 days), a single busy day can create false positives.
+	// We blend toward 1.0 (neutral) proportionally to how little data we have.
+	const minReliableDays = 5
+	if daysPassed < minReliableDays {
+		weight := float64(daysPassed) / float64(minReliableDays)
+		hotScore = 1.0 + (hotScore-1.0)*weight
 	}
 
 	// Determine status based on activity ratio

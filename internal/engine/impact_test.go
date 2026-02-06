@@ -8,6 +8,21 @@ import (
 	"eve-flipper/internal/esi"
 )
 
+func TestVariance(t *testing.T) {
+	// Population variance: [1,2,3,4,5] mean=3, var = (4+1+0+1+4)/5 = 2
+	x := []float64{1, 2, 3, 4, 5}
+	got := variance(x)
+	if math.Abs(got-2.0) > 1e-9 {
+		t.Errorf("variance(%v) = %v, want 2", x, got)
+	}
+	if variance(nil) != 0 {
+		t.Errorf("variance(nil) want 0")
+	}
+	if variance([]float64{7}) != 0 {
+		t.Errorf("variance(single) want 0")
+	}
+}
+
 func TestCalibrateImpact(t *testing.T) {
 	// Use dates within last 30 days so filterLastNDays keeps them
 	base := time.Now().AddDate(0, 0, -10).Format("2006-01-02")

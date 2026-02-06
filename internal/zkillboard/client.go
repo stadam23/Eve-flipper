@@ -142,19 +142,31 @@ func (c *Client) GetRecentKills(regionID int32, pastSeconds int) ([]map[string]i
 	return kills, nil
 }
 
+const maxRetries = 3
+
 // getJSON fetches a URL and decodes JSON with rate limiting.
 func (c *Client) getJSON(url string, dst interface{}) error {
+	return c.getJSONWithRetry(url, dst, 0)
+}
+
+func (c *Client) getJSONWithRetry(url string, dst interface{}, attempt int) error {
 	c.sem <- struct{}{}
 	defer func() { <-c.sem }()
 
-	// Rate limit: minimum 200ms between requests
+	// FIX #7: compute sleep duration under mutex, but sleep outside it
+	// so other goroutines aren't blocked during the wait.
 	c.mu.Lock()
 	elapsed := time.Since(c.lastReq)
+	var sleepDur time.Duration
 	if elapsed < 200*time.Millisecond {
-		time.Sleep(200*time.Millisecond - elapsed)
+		sleepDur = 200*time.Millisecond - elapsed
 	}
-	c.lastReq = time.Now()
+	c.lastReq = time.Now().Add(sleepDur)
 	c.mu.Unlock()
+
+	if sleepDur > 0 {
+		time.Sleep(sleepDur)
+	}
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -170,10 +182,14 @@ func (c *Client) getJSON(url string, dst interface{}) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 429 {
-		// Rate limited - wait and retry
-		logger.Warn("Zkillboard", "Rate limited, waiting 10 seconds...")
-		time.Sleep(10 * time.Second)
-		return c.getJSON(url, dst)
+		// FIX #3: Rate limited - retry with limit to prevent infinite recursion.
+		if attempt >= maxRetries {
+			return fmt.Errorf("zkillboard rate limited after %d retries: %s", maxRetries, url)
+		}
+		wait := time.Duration(5*(attempt+1)) * time.Second
+		logger.Warn("Zkillboard", fmt.Sprintf("Rate limited, waiting %v (attempt %d/%d)...", wait, attempt+1, maxRetries))
+		time.Sleep(wait)
+		return c.getJSONWithRetry(url, dst, attempt+1)
 	}
 
 	if resp.StatusCode != 200 {

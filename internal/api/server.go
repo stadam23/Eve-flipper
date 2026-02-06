@@ -33,6 +33,11 @@ type Server struct {
 	mu               sync.RWMutex
 	ready            bool
 	ssoState         string // CSRF state for current login flow
+
+	// Wallet transaction cache for P&L tab (TTL 2 min).
+	txnCacheMu   sync.RWMutex
+	txnCache     []esi.WalletTransaction
+	txnCacheTime time.Time
 }
 
 // NewServer creates a Server with the given config, ESI client, and database.
@@ -55,10 +60,10 @@ func (s *Server) SetSDE(data *sde.Data) {
 	scanner.History = s.db
 	s.scanner = scanner
 	s.industryAnalyzer = engine.NewIndustryAnalyzer(data, s.esi)
-	
+
 	// Initialize demand analyzer with region names from SDE
 	s.demandAnalyzer = zkillboard.NewDemandAnalyzer(data.RegionNames())
-	
+
 	s.ready = true
 }
 
@@ -98,6 +103,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("GET /api/auth/character", s.handleAuthCharacter)
 	mux.HandleFunc("GET /api/auth/location", s.handleAuthLocation)
+	mux.HandleFunc("GET /api/auth/undercuts", s.handleAuthUndercuts)
+	mux.HandleFunc("GET /api/auth/portfolio", s.handleAuthPortfolio)
 	// Industry
 	mux.HandleFunc("POST /api/industry/analyze", s.handleIndustryAnalyze)
 	mux.HandleFunc("GET /api/industry/search", s.handleIndustrySearch)
@@ -109,6 +116,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/demand/hotzones", s.handleDemandHotZones)
 	mux.HandleFunc("GET /api/demand/region/{regionID}", s.handleDemandRegion)
 	mux.HandleFunc("GET /api/demand/opportunities/{regionID}", s.handleDemandOpportunities)
+	mux.HandleFunc("GET /api/demand/fittings/{regionID}", s.handleDemandFittings)
 	mux.HandleFunc("POST /api/demand/refresh", s.handleDemandRefresh)
 	return corsMiddleware(mux)
 }
@@ -242,19 +250,34 @@ func (s *Server) handleRegionAutocomplete(w http.ResponseWriter, r *http.Request
 
 	s.mu.RLock()
 	regions := s.sdeData.Regions
+	systems := s.sdeData.Systems
 	s.mu.RUnlock()
 
-	var prefix, contains []string
+	seen := map[string]bool{}
+	var prefix, contains, bySystem []string
 	for _, region := range regions {
 		lower := strings.ToLower(region.Name)
 		if strings.HasPrefix(lower, q) {
 			prefix = append(prefix, region.Name)
+			seen[region.Name] = true
 		} else if strings.Contains(lower, q) {
 			contains = append(contains, region.Name)
+			seen[region.Name] = true
+		}
+	}
+
+	// Also match by system name → suggest the region that system belongs to
+	for _, sys := range systems {
+		if strings.HasPrefix(strings.ToLower(sys.Name), q) {
+			if r, ok := regions[sys.RegionID]; ok && !seen[r.Name] {
+				bySystem = append(bySystem, r.Name+" ("+sys.Name+")")
+				seen[r.Name] = true
+			}
 		}
 	}
 
 	result := append(prefix, contains...)
+	result = append(result, bySystem...)
 	if len(result) > 15 {
 		result = result[:15]
 	}
@@ -263,12 +286,13 @@ func (s *Server) handleRegionAutocomplete(w http.ResponseWriter, r *http.Request
 }
 
 type scanRequest struct {
-	SystemName      string  `json:"system_name"`
-	CargoCapacity   float64 `json:"cargo_capacity"`
-	BuyRadius       int     `json:"buy_radius"`
-	SellRadius      int     `json:"sell_radius"`
-	MinMargin       float64 `json:"min_margin"`
-	SalesTaxPercent float64 `json:"sales_tax_percent"`
+	SystemName       string  `json:"system_name"`
+	CargoCapacity    float64 `json:"cargo_capacity"`
+	BuyRadius        int     `json:"buy_radius"`
+	SellRadius       int     `json:"sell_radius"`
+	MinMargin        float64 `json:"min_margin"`
+	SalesTaxPercent  float64 `json:"sales_tax_percent"`
+	BrokerFeePercent float64 `json:"broker_fee_percent"` // 0 = instant trades (no broker fee); >0 = applied to both sides
 	// Advanced filters
 	MinDailyVolume   int64   `json:"min_daily_volume"`
 	MaxInvestment    float64 `json:"max_investment"`
@@ -289,27 +313,32 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 
 	s.mu.RLock()
 	systemID, ok := s.sdeData.SystemByName[strings.ToLower(req.SystemName)]
-	
+
 	// Parse target region if specified
 	var targetRegionID int32
 	if req.TargetRegion != "" {
-		if regionID, ok := s.sdeData.RegionByName[strings.ToLower(req.TargetRegion)]; ok {
-			targetRegionID = regionID
+		rid, regionOK := s.sdeData.RegionByName[strings.ToLower(req.TargetRegion)]
+		if regionOK {
+			targetRegionID = rid
+		} else {
+			s.mu.RUnlock()
+			return engine.ScanParams{}, fmt.Errorf("region not found: %s", req.TargetRegion)
 		}
 	}
 	s.mu.RUnlock()
-	
+
 	if !ok {
 		return engine.ScanParams{}, fmt.Errorf("system not found: %s", req.SystemName)
 	}
 
 	return engine.ScanParams{
-		CurrentSystemID:   systemID,
-		CargoCapacity:     req.CargoCapacity,
-		BuyRadius:         req.BuyRadius,
-		SellRadius:        req.SellRadius,
-		MinMargin:         req.MinMargin,
-		SalesTaxPercent:   req.SalesTaxPercent,
+		CurrentSystemID:  systemID,
+		CargoCapacity:    req.CargoCapacity,
+		BuyRadius:        req.BuyRadius,
+		SellRadius:       req.SellRadius,
+		MinMargin:        req.MinMargin,
+		SalesTaxPercent:  req.SalesTaxPercent,
+		BrokerFeePercent: req.BrokerFeePercent,
 		MinDailyVolume:    req.MinDailyVolume,
 		MaxInvestment:     req.MaxInvestment,
 		MinRouteSecurity:  req.MinRouteSecurity,
@@ -535,6 +564,7 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 		CargoCapacity    float64 `json:"cargo_capacity"`
 		MinMargin        float64 `json:"min_margin"`
 		SalesTaxPercent  float64 `json:"sales_tax_percent"`
+		BrokerFeePercent float64 `json:"broker_fee_percent"`
 		MinHops          int     `json:"min_hops"`
 		MaxHops          int     `json:"max_hops"`
 		MaxResults       int     `json:"max_results"`
@@ -554,8 +584,8 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	if req.MaxHops < req.MinHops {
 		req.MaxHops = req.MinHops + 2
 	}
-	if req.MaxHops > 10 {
-		req.MaxHops = 10
+	if req.MaxHops > 25 {
+		req.MaxHops = 25
 	}
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -575,6 +605,7 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 		CargoCapacity:    req.CargoCapacity,
 		MinMargin:        req.MinMargin,
 		SalesTaxPercent:  req.SalesTaxPercent,
+		BrokerFeePercent: req.BrokerFeePercent,
 		MinHops:          req.MinHops,
 		MaxHops:          req.MaxHops,
 		MaxResults:       req.MaxResults,
@@ -584,6 +615,7 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API] RouteFind: system=%s, cargo=%.0f, margin=%.1f, hops=%d-%d",
 		req.SystemName, req.CargoCapacity, req.MinMargin, req.MinHops, req.MaxHops)
 
+	startTime := time.Now()
 	results, err := scanner.FindRoutes(params, func(msg string) {
 		line, _ := json.Marshal(map[string]string{"type": "progress", "message": msg})
 		fmt.Fprintf(w, "%s\n", line)
@@ -597,16 +629,21 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] RouteFind complete: %d routes", len(results))
-	tp := 0.0
-	for _, r := range results {
-		if r.TotalProfit > tp {
-			tp = r.TotalProfit
-		}
-	}
-	s.db.InsertHistory("route", req.SystemName, len(results), tp)
+	durationMs := time.Since(startTime).Milliseconds()
+	log.Printf("[API] RouteFind complete: %d routes in %dms", len(results), durationMs)
 
-	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results)})
+	var topProfit, totalProfit float64
+	for _, r := range results {
+		if r.TotalProfit > topProfit {
+			topProfit = r.TotalProfit
+		}
+		totalProfit += r.TotalProfit
+	}
+
+	scanID := s.db.InsertHistoryFull("route", req.SystemName, len(results), topProfit, totalProfit, durationMs, req)
+	go s.db.InsertRouteResults(scanID, results)
+
+	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
 	if marshalErr != nil {
 		log.Printf("[API] RouteFind JSON marshal error: %v", marshalErr)
 		errLine, _ := json.Marshal(map[string]string{"type": "error", "message": "JSON: " + marshalErr.Error()})
@@ -630,9 +667,33 @@ func (s *Server) handleAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid json")
 		return
 	}
+
+	// Validate type_id against SDE
+	s.mu.RLock()
+	sdeData := s.sdeData
+	s.mu.RUnlock()
+	if sdeData != nil {
+		if _, ok := sdeData.Types[item.TypeID]; !ok {
+			writeError(w, 400, fmt.Sprintf("unknown type_id %d", item.TypeID))
+			return
+		}
+		// Use canonical SDE name if client didn't provide one
+		if item.TypeName == "" {
+			item.TypeName = sdeData.Types[item.TypeID].Name
+		}
+	}
+
 	item.AddedAt = time.Now().Format(time.RFC3339)
-	s.db.AddWatchlistItem(item)
-	writeJSON(w, s.db.GetWatchlist())
+	inserted := s.db.AddWatchlistItem(item)
+
+	type addResponse struct {
+		Items    []config.WatchlistItem `json:"items"`
+		Inserted bool                   `json:"inserted"`
+	}
+	writeJSON(w, addResponse{
+		Items:    s.db.GetWatchlist(),
+		Inserted: inserted,
+	})
 }
 
 func (s *Server) handleDeleteWatchlist(w http.ResponseWriter, r *http.Request) {
@@ -668,10 +729,10 @@ func (s *Server) handleUpdateWatchlist(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		StationID       int64   `json:"station_id"`       // 0 = all stations
-		RegionID        int32   `json:"region_id"`         // required
-		SystemName      string  `json:"system_name"`       // for radius-based scan
-		Radius          int     `json:"radius"`            // 0 = single system
+		StationID       int64   `json:"station_id"`  // 0 = all stations
+		RegionID        int32   `json:"region_id"`   // required
+		SystemName      string  `json:"system_name"` // for radius-based scan
+		Radius          int     `json:"radius"`      // 0 = single system
 		MinMargin       float64 `json:"min_margin"`
 		SalesTaxPercent float64 `json:"sales_tax_percent"`
 		BrokerFee       float64 `json:"broker_fee"`
@@ -815,7 +876,7 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	// Save to history with full params
 	scanID := s.db.InsertHistoryFull("station", historyLabel, len(allResults), topProfit, totalProfit, durationMs, req)
 	if scanID > 0 {
-		s.db.InsertStationResults(scanID, allResults)
+		go s.db.InsertStationResults(scanID, allResults)
 	}
 
 	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": allResults, "count": len(allResults), "scan_id": scanID})
@@ -1008,6 +1069,8 @@ func (s *Server) handleGetHistoryResults(w http.ResponseWriter, r *http.Request)
 		results = s.db.GetStationResults(id)
 	case "contracts":
 		results = s.db.GetContractResults(id)
+	case "route":
+		results = s.db.GetRouteResults(id)
 	default:
 		results = s.db.GetFlipResults(id)
 	}
@@ -1165,40 +1228,68 @@ func (s *Server) handleAuthCharacter(w http.ResponseWriter, r *http.Request) {
 		CharacterName: sess.CharacterName,
 	}
 
-	// Fetch wallet
-	if balance, err := esi.GetWalletBalance(sess.CharacterID, token); err == nil {
-		result.Wallet = balance
-	} else {
-		log.Printf("[AUTH] Wallet error: %v", err)
-	}
+	// Fetch all character data in parallel for faster popup loading.
+	var wgChar sync.WaitGroup
+	var muChar sync.Mutex
 
-	// Fetch active orders
-	if orders, err := esi.GetCharacterOrders(sess.CharacterID, token); err == nil {
-		result.Orders = orders
-	} else {
-		log.Printf("[AUTH] Orders error: %v", err)
-	}
+	wgChar.Add(5)
 
-	// Fetch order history
-	if history, err := esi.GetOrderHistory(sess.CharacterID, token); err == nil {
-		result.OrderHistory = history
-	} else {
-		log.Printf("[AUTH] Order history error: %v", err)
-	}
+	go func() {
+		defer wgChar.Done()
+		if balance, err := s.esi.GetWalletBalance(sess.CharacterID, token); err == nil {
+			muChar.Lock()
+			result.Wallet = balance
+			muChar.Unlock()
+		} else {
+			log.Printf("[AUTH] Wallet error: %v", err)
+		}
+	}()
 
-	// Fetch wallet transactions
-	if txns, err := esi.GetWalletTransactions(sess.CharacterID, token); err == nil {
-		result.Transactions = txns
-	} else {
-		log.Printf("[AUTH] Transactions error: %v", err)
-	}
+	go func() {
+		defer wgChar.Done()
+		if orders, err := s.esi.GetCharacterOrders(sess.CharacterID, token); err == nil {
+			muChar.Lock()
+			result.Orders = orders
+			muChar.Unlock()
+		} else {
+			log.Printf("[AUTH] Orders error: %v", err)
+		}
+	}()
 
-	// Fetch skills
-	if skills, err := esi.GetSkills(sess.CharacterID, token); err == nil {
-		result.Skills = skills
-	} else {
-		log.Printf("[AUTH] Skills error: %v", err)
-	}
+	go func() {
+		defer wgChar.Done()
+		if history, err := s.esi.GetOrderHistory(sess.CharacterID, token); err == nil {
+			muChar.Lock()
+			result.OrderHistory = history
+			muChar.Unlock()
+		} else {
+			log.Printf("[AUTH] Order history error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wgChar.Done()
+		if txns, err := s.esi.GetWalletTransactions(sess.CharacterID, token); err == nil {
+			muChar.Lock()
+			result.Transactions = txns
+			muChar.Unlock()
+		} else {
+			log.Printf("[AUTH] Transactions error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wgChar.Done()
+		if skills, err := s.esi.GetSkills(sess.CharacterID, token); err == nil {
+			muChar.Lock()
+			result.Skills = skills
+			muChar.Unlock()
+		} else {
+			log.Printf("[AUTH] Skills error: %v", err)
+		}
+	}()
+
+	wgChar.Wait()
 
 	// Enrich orders with type/location names
 	s.mu.RLock()
@@ -1266,7 +1357,7 @@ func (s *Server) handleAuthLocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	loc, err := esi.GetCharacterLocation(sess.CharacterID, token)
+	loc, err := s.esi.GetCharacterLocation(sess.CharacterID, token)
 	if err != nil {
 		writeError(w, 500, "failed to get location: "+err.Error())
 		return
@@ -1301,6 +1392,140 @@ func (s *Server) handleAuthLocation(w http.ResponseWriter, r *http.Request) {
 		result.StationName = s.esi.StationName(loc.StructureID)
 	}
 
+	writeJSON(w, result)
+}
+
+func (s *Server) handleAuthUndercuts(w http.ResponseWriter, r *http.Request) {
+	token, err := s.sessions.EnsureValidToken(s.sso)
+	if err != nil {
+		writeError(w, 401, err.Error())
+		return
+	}
+	sess := s.sessions.Get()
+	if sess == nil {
+		writeError(w, 401, "not logged in")
+		return
+	}
+
+	// Fetch active orders using the shared ESI client.
+	orders, err := s.esi.GetCharacterOrders(sess.CharacterID, token)
+	if err != nil {
+		writeError(w, 500, "failed to fetch orders: "+err.Error())
+		return
+	}
+
+	if len(orders) == 0 {
+		writeJSON(w, []engine.UndercutStatus{})
+		return
+	}
+
+	// Collect unique (region, type) pairs.
+	type regionType struct {
+		regionID int32
+		typeID   int32
+	}
+	pairs := make(map[regionType]bool)
+	for _, o := range orders {
+		pairs[regionType{o.RegionID, o.TypeID}] = true
+	}
+
+	// Fetch regional orders for each unique type (concurrently, with semaphore).
+	// Limit concurrency to 10 to avoid ESI rate-limit issues.
+	type fetchResult struct {
+		orders []esi.MarketOrder
+		err    error
+	}
+	results := make(map[regionType]fetchResult)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	undercutSem := make(chan struct{}, 10) // limit to 10 concurrent ESI requests
+
+	for pair := range pairs {
+		wg.Add(1)
+		go func(rt regionType) {
+			defer wg.Done()
+			undercutSem <- struct{}{}
+			ro, fetchErr := s.esi.FetchRegionOrdersByType(rt.regionID, rt.typeID)
+			<-undercutSem
+			mu.Lock()
+			results[rt] = fetchResult{ro, fetchErr}
+			mu.Unlock()
+		}(pair)
+	}
+	wg.Wait()
+
+	// Flatten all regional orders into one slice.
+	var allRegional []esi.MarketOrder
+	for _, fr := range results {
+		if fr.err == nil {
+			allRegional = append(allRegional, fr.orders...)
+		}
+	}
+
+	undercuts := engine.AnalyzeUndercuts(orders, allRegional)
+	writeJSON(w, undercuts)
+}
+
+func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {
+	token, err := s.sessions.EnsureValidToken(s.sso)
+	if err != nil {
+		writeError(w, 401, err.Error())
+		return
+	}
+	sess := s.sessions.Get()
+	if sess == nil {
+		writeError(w, 401, "not logged in")
+		return
+	}
+
+	daysStr := r.URL.Query().Get("days")
+	days := 30
+	if daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 && d <= 365 {
+			days = d
+		}
+	}
+
+	// Use cached wallet transactions (TTL 2 min) to avoid hammering ESI
+	// when the user switches between P&L periods.
+	s.txnCacheMu.RLock()
+	cached := s.txnCache
+	cacheAge := time.Since(s.txnCacheTime)
+	s.txnCacheMu.RUnlock()
+
+	var txns []esi.WalletTransaction
+	if cached != nil && cacheAge < 2*time.Minute {
+		txns = cached
+	} else {
+		freshTxns, fetchErr := s.esi.GetWalletTransactions(sess.CharacterID, token)
+		if fetchErr != nil {
+			writeError(w, 500, "failed to fetch transactions: "+fetchErr.Error())
+			return
+		}
+
+		// Enrich type names from SDE
+		s.mu.RLock()
+		sdeData := s.sdeData
+		s.mu.RUnlock()
+
+		if sdeData != nil {
+			for i := range freshTxns {
+				if t, ok := sdeData.Types[freshTxns[i].TypeID]; ok {
+					freshTxns[i].TypeName = t.Name
+				}
+			}
+		}
+
+		// Store in cache
+		s.txnCacheMu.Lock()
+		s.txnCache = freshTxns
+		s.txnCacheTime = time.Now()
+		s.txnCacheMu.Unlock()
+
+		txns = freshTxns
+	}
+
+	result := engine.ComputePortfolioPnL(txns, days)
 	writeJSON(w, result)
 }
 
@@ -1532,10 +1757,10 @@ func (s *Server) handleDemandRegions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]interface{}{
-		"regions":    regions,
-		"count":      len(regions),
+		"regions":           regions,
+		"count":             len(regions),
 		"cache_age_minutes": cacheAge,
-		"stale":      len(regions) == 0 || !s.db.IsDemandCacheFresh(60*time.Minute),
+		"stale":             len(regions) == 0 || !s.db.IsDemandCacheFresh(60*time.Minute),
 	})
 }
 
@@ -1563,8 +1788,8 @@ func (s *Server) handleDemandHotZones(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]interface{}{
-			"hot_zones": zones,
-			"count":     len(zones),
+			"hot_zones":  zones,
+			"count":      len(zones),
 			"from_cache": true,
 		})
 		return
@@ -1602,8 +1827,8 @@ func (s *Server) handleDemandHotZones(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]interface{}{
-		"hot_zones": zones,
-		"count":     len(zones),
+		"hot_zones":  zones,
+		"count":      len(zones),
 		"from_cache": false,
 	})
 }
@@ -1703,8 +1928,31 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Get opportunities
-	opportunities, err := analyzer.GetRegionOpportunities(regionID, esiClient)
+	// Try to load fitting profile from cache (TTL 2 hours)
+	var fittingProfile *zkillboard.RegionDemandProfile
+	if s.db.IsFittingProfileFresh(regionID, 2*time.Hour) {
+		items, err := s.db.GetFittingDemandProfile(regionID)
+		if err == nil && len(items) > 0 {
+			fittingProfile = &zkillboard.RegionDemandProfile{
+				RegionID: regionID,
+				Items:    make(map[int32]*zkillboard.ItemDemandProfile),
+			}
+			for _, item := range items {
+				fittingProfile.Items[item.TypeID] = &zkillboard.ItemDemandProfile{
+					TypeID:         item.TypeID,
+					TypeName:       item.TypeName,
+					Category:       item.Category,
+					TotalDestroyed: item.TotalDestroyed,
+					KillmailCount:  item.KillmailCount,
+					AvgPerKillmail: item.AvgPerKillmail,
+					EstDailyDemand: item.EstDailyDemand,
+				}
+			}
+		}
+	}
+
+	// Get opportunities (with fitting profile if available)
+	opportunities, err := analyzer.GetRegionOpportunities(regionID, esiClient, fittingProfile)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("failed to get opportunities: %v", err))
 		return
@@ -1715,24 +1963,31 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Resolve type names from SDE
+	// Resolve type names + volumes from SDE
 	if sdeData != nil {
-		for i := range opportunities.Ships {
-			if opportunities.Ships[i].TypeName == "" {
-				if t, ok := sdeData.Types[opportunities.Ships[i].TypeID]; ok {
-					opportunities.Ships[i].TypeName = t.Name
+		resolveTypeInfo := func(opps []zkillboard.TradeOpportunity) {
+			for i := range opps {
+				if t, ok := sdeData.Types[opps[i].TypeID]; ok {
+					if opps[i].TypeName == "" {
+						opps[i].TypeName = t.Name
+					}
+					// FIX #6: Populate Volume (m³) from SDE
+					opps[i].Volume = t.Volume
 				}
 			}
 		}
-		
+		resolveTypeInfo(opportunities.Ships)
+		resolveTypeInfo(opportunities.Modules)
+		resolveTypeInfo(opportunities.Ammo)
+
 		// Calculate security class and jumps from Jita
 		const jitaSystemID = int32(30000142)
-		
+
 		// Find systems in this region and calculate security distribution
 		var highCount, lowCount, nullCount int
 		var closestDistance = 999999
 		var mainSystemName string
-		
+
 		for _, sys := range sdeData.Systems {
 			if sys.RegionID == regionID {
 				// Count security types
@@ -1743,7 +1998,7 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 				} else {
 					nullCount++
 				}
-				
+
 				// Find closest system to Jita (using graph if available)
 				if sdeData.Universe != nil {
 					dist := sdeData.Universe.ShortestPath(jitaSystemID, sys.ID)
@@ -1754,7 +2009,7 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 				}
 			}
 		}
-		
+
 		// Determine dominant security class
 		total := highCount + lowCount + nullCount
 		if total > 0 {
@@ -1770,7 +2025,7 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 				blocks = append(blocks, "null")
 			}
 			opportunities.SecurityBlocks = blocks
-			
+
 			// Dominant class
 			if nullCount > highCount && nullCount > lowCount {
 				opportunities.SecurityClass = "nullsec"
@@ -1782,7 +2037,7 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 				opportunities.SecurityClass = "nullsec"
 			}
 		}
-		
+
 		// Set jumps from Jita
 		if closestDistance < 999999 {
 			opportunities.JumpsFromJita = closestDistance
@@ -1793,11 +2048,39 @@ func (s *Server) handleDemandOpportunities(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, opportunities)
 }
 
+// handleDemandFittings returns raw fitting demand data for a region.
+func (s *Server) handleDemandFittings(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	regionIDStr := r.PathValue("regionID")
+	regionIDInt, err := strconv.Atoi(regionIDStr)
+	if err != nil {
+		writeError(w, 400, "invalid region ID")
+		return
+	}
+	regionID := int32(regionIDInt)
+
+	items, err := s.db.GetFittingDemandProfile(regionID)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("failed to get fitting data: %v", err))
+		return
+	}
+
+	fresh := s.db.IsFittingProfileFresh(regionID, 2*time.Hour)
+
+	writeJSON(w, map[string]interface{}{
+		"region_id":  regionID,
+		"items":      items,
+		"count":      len(items),
+		"from_cache": fresh,
+	})
+}
+
 // handleDemandRefresh forces a refresh of demand data for all regions.
-// The refresh now runs in the background so that the HTTP request returns
-// quickly and does not block other scans or the UI. Results are written
-// to the demand cache as they arrive, and subsequent /hotzones requests
-// will start using fresh data once available.
+// Uses NDJSON streaming so the frontend can track progress in real time.
 func (s *Server) handleDemandRefresh(w http.ResponseWriter, r *http.Request) {
 	if !s.isReady() {
 		writeError(w, 503, "SDE not loaded yet")
@@ -1813,39 +2096,100 @@ func (s *Server) handleDemandRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Kick off background refresh
-	go func() {
-		// Clear in-memory cache first to force fresh API calls
-		analyzer.ClearCache()
-		log.Printf("[Demand] Cache cleared, starting background refresh...")
+	s.mu.RLock()
+	esiClient := s.esi
+	sdeData := s.sdeData
+	s.mu.RUnlock()
 
-		zones, err := analyzer.GetHotZones(0) // 0 = no limit
-		if err != nil {
-			log.Printf("[Demand] Background refresh failed: %v", err)
-			return
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, 500, "streaming not supported")
+		return
+	}
+
+	sendProgress := func(msg string) {
+		line, _ := json.Marshal(map[string]string{"type": "progress", "message": msg})
+		fmt.Fprintf(w, "%s\n", line)
+		flusher.Flush()
+	}
+
+	sendProgress("Clearing cache...")
+	analyzer.ClearCache()
+	log.Printf("[Demand] Cache cleared, starting refresh...")
+
+	sendProgress("Fetching region kill data from zKillboard...")
+	zones, err := analyzer.GetHotZones(0)
+	if err != nil {
+		log.Printf("[Demand] Refresh failed: %v", err)
+		line, _ := json.Marshal(map[string]string{"type": "error", "message": err.Error()})
+		fmt.Fprintf(w, "%s\n", line)
+		flusher.Flush()
+		return
+	}
+
+	sendProgress(fmt.Sprintf("Saving %d regions...", len(zones)))
+	for _, z := range zones {
+		if err := s.db.SaveDemandRegion(&db.DemandRegion{
+			RegionID:      z.RegionID,
+			RegionName:    z.RegionName,
+			HotScore:      z.HotScore,
+			Status:        z.Status,
+			KillsToday:    z.KillsToday,
+			KillsBaseline: z.KillsBaseline,
+			ISKDestroyed:  z.ISKDestroyed,
+			ActivePlayers: z.ActivePlayers,
+			TopShips:      z.TopShips,
+		}); err != nil {
+			log.Printf("[Demand] Failed to save region %d: %v", z.RegionID, err)
 		}
+	}
+	log.Printf("[Demand] Region refresh completed: %d regions", len(zones))
 
-		// Cache all results to database
-		for _, z := range zones {
-			if err := s.db.SaveDemandRegion(&db.DemandRegion{
-				RegionID:      z.RegionID,
-				RegionName:    z.RegionName,
-				HotScore:      z.HotScore,
-				Status:        z.Status,
-				KillsToday:    z.KillsToday,
-				KillsBaseline: z.KillsBaseline,
-				ISKDestroyed:  z.ISKDestroyed,
-				ActivePlayers: z.ActivePlayers,
-				TopShips:      z.TopShips,
-			}); err != nil {
-				log.Printf("[Demand] Failed to save region %d: %v", z.RegionID, err)
+	// Analyze fittings for hot regions (elevated+)
+	var hotRegions []zkillboard.RegionHotZone
+	for _, z := range zones {
+		if z.HotScore >= 1.15 {
+			hotRegions = append(hotRegions, z)
+		}
+	}
+	if len(hotRegions) > 0 && esiClient != nil && sdeData != nil {
+		sendProgress(fmt.Sprintf("Analyzing killmail fittings for %d hot regions...", len(hotRegions)))
+		for i, z := range hotRegions {
+			sendProgress(fmt.Sprintf("Analyzing fittings: %s (%d/%d)...", z.RegionName, i+1, len(hotRegions)))
+			profile, err := analyzer.AnalyzeRegionFittings(z.RegionID, esiClient, sdeData, 100)
+			if err != nil {
+				log.Printf("[Demand] Fitting analysis failed for region %d: %v", z.RegionID, err)
+				continue
+			}
+			var dbItems []db.FittingDemandItem
+			for _, item := range profile.Items {
+				dbItems = append(dbItems, db.FittingDemandItem{
+					RegionID:       z.RegionID,
+					TypeID:         item.TypeID,
+					TypeName:       item.TypeName,
+					Category:       item.Category,
+					TotalDestroyed: item.TotalDestroyed,
+					KillmailCount:  item.KillmailCount,
+					AvgPerKillmail: item.AvgPerKillmail,
+					EstDailyDemand: item.EstDailyDemand,
+					SampledKills:   profile.SampledKills,
+					TotalKills24h:  profile.TotalKills24h,
+				})
+			}
+			if err := s.db.SaveFittingDemandProfile(z.RegionID, dbItems); err != nil {
+				log.Printf("[Demand] Failed to save fitting profile for region %d: %v", z.RegionID, err)
 			}
 		}
-		log.Printf("[Demand] Background refresh completed: %d regions", len(zones))
-	}()
+		log.Printf("[Demand] Fitting analysis completed for %d regions", len(hotRegions))
+	}
 
-	writeJSON(w, map[string]interface{}{
-		"status":  "started",
-		"message": "Demand refresh started in background",
+	line, _ := json.Marshal(map[string]interface{}{
+		"type":    "result",
+		"status":  "completed",
+		"regions": len(zones),
 	})
+	fmt.Fprintf(w, "%s\n", line)
+	flusher.Flush()
 }

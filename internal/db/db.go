@@ -300,6 +300,87 @@ func (d *DB) migrate() error {
 		logger.Info("DB", "Applied migration v6 (station_results ensure)")
 	}
 
+	if version < 7 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS demand_fitting_cache (
+				region_id        INTEGER NOT NULL,
+				type_id          INTEGER NOT NULL,
+				type_name        TEXT,
+				category         TEXT NOT NULL,
+				total_destroyed  INTEGER NOT NULL DEFAULT 0,
+				killmail_count   INTEGER NOT NULL DEFAULT 0,
+				avg_per_killmail REAL NOT NULL DEFAULT 0,
+				est_daily_demand REAL NOT NULL DEFAULT 0,
+				sampled_kills    INTEGER NOT NULL DEFAULT 0,
+				total_kills_24h  INTEGER NOT NULL DEFAULT 0,
+				updated_at       TEXT NOT NULL,
+				PRIMARY KEY (region_id, type_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_demand_fitting_region ON demand_fitting_cache(region_id);
+			CREATE INDEX IF NOT EXISTS idx_demand_fitting_demand ON demand_fitting_cache(est_daily_demand DESC);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (7);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v7: %w", err)
+		}
+		logger.Info("DB", "Applied migration v7 (demand fitting cache)")
+	}
+
+	if version < 8 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS demand_history (
+				region_id      INTEGER NOT NULL,
+				snapshot_at    TEXT NOT NULL,
+				hot_score      REAL NOT NULL,
+				status         TEXT NOT NULL,
+				kills_today    INTEGER NOT NULL,
+				active_players INTEGER NOT NULL,
+				PRIMARY KEY (region_id, snapshot_at)
+			);
+			CREATE INDEX IF NOT EXISTS idx_demand_history_region ON demand_history(region_id, snapshot_at);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (8);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v8: %w", err)
+		}
+		logger.Info("DB", "Applied migration v8 (demand history)")
+	}
+
+	if version < 10 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS route_results (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				scan_id          INTEGER NOT NULL REFERENCES scan_history(id),
+				route_index      INTEGER NOT NULL DEFAULT 0,
+				hop_index        INTEGER NOT NULL DEFAULT 0,
+				system_name      TEXT,
+				station_name     TEXT,
+				dest_system_name TEXT,
+				dest_station_name TEXT,
+				type_name        TEXT,
+				type_id          INTEGER,
+				buy_price        REAL,
+				sell_price       REAL,
+				units            INTEGER,
+				profit           REAL,
+				jumps            INTEGER,
+				total_profit     REAL,
+				total_jumps      INTEGER,
+				profit_per_jump  REAL,
+				hop_count        INTEGER
+			);
+			CREATE INDEX IF NOT EXISTS idx_route_scan ON route_results(scan_id);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (10);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v10: %w", err)
+		}
+		logger.Info("DB", "Applied migration v10 (route results)")
+	}
+
 	return nil
 }
 

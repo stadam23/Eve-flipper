@@ -40,10 +40,11 @@ type IndustryCache struct {
 	prices          map[int32]*IndustryPrice // typeID -> prices
 	pricesTime      time.Time
 	
-	// Market prices cache (sell order minimums)
-	marketPricesMu   sync.RWMutex
-	marketPrices     map[int32]float64 // typeID -> min sell price
-	marketPricesTime time.Time
+	// Market prices cache (sell order minimums), keyed by region
+	marketPricesMu       sync.RWMutex
+	marketPrices         map[int32]float64 // typeID -> min sell price
+	marketPricesRegionID int32             // which region these prices belong to
+	marketPricesTime     time.Time
 }
 
 // NewIndustryCache creates a new industry cache.
@@ -212,11 +213,13 @@ func (c *Client) GetAllAdjustedPrices(cache *IndustryCache) (map[int32]float64, 
 }
 
 // GetCachedMarketPrices returns cached market prices or fetches fresh ones.
-// Uses 10-minute cache for sell order minimums.
+// Uses 10-minute cache for sell order minimums, keyed by region.
 func (c *Client) GetCachedMarketPrices(cache *IndustryCache, regionID int32) (map[int32]float64, error) {
 	cache.marketPricesMu.RLock()
-	if time.Since(cache.marketPricesTime) < MarketPricesCacheTTL && len(cache.marketPrices) > 0 {
-		// Return cached prices
+	if cache.marketPricesRegionID == regionID &&
+		time.Since(cache.marketPricesTime) < MarketPricesCacheTTL &&
+		len(cache.marketPrices) > 0 {
+		// Return cached prices for the same region
 		result := make(map[int32]float64, len(cache.marketPrices))
 		for k, v := range cache.marketPrices {
 			result[k] = v
@@ -231,7 +234,9 @@ func (c *Client) GetCachedMarketPrices(cache *IndustryCache, regionID int32) (ma
 	defer cache.marketPricesMu.Unlock()
 
 	// Double-check after acquiring write lock
-	if time.Since(cache.marketPricesTime) < MarketPricesCacheTTL && len(cache.marketPrices) > 0 {
+	if cache.marketPricesRegionID == regionID &&
+		time.Since(cache.marketPricesTime) < MarketPricesCacheTTL &&
+		len(cache.marketPrices) > 0 {
 		result := make(map[int32]float64, len(cache.marketPrices))
 		for k, v := range cache.marketPrices {
 			result[k] = v
@@ -253,8 +258,9 @@ func (c *Client) GetCachedMarketPrices(cache *IndustryCache, regionID int32) (ma
 		}
 	}
 
-	// Update cache
+	// Update cache with region tag
 	cache.marketPrices = prices
+	cache.marketPricesRegionID = regionID
 	cache.marketPricesTime = time.Now()
 
 	return prices, nil
