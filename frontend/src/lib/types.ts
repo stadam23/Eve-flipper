@@ -7,12 +7,14 @@ export interface FlipResult {
   BuySystemName: string;
   BuySystemID: number;
   BuyRegionID?: number;
+  BuyRegionName?: string;
   BuyLocationID?: number;
   SellPrice: number;
   SellStation: string;
   SellSystemName: string;
   SellSystemID: number;
   SellRegionID?: number;
+  SellRegionName?: string;
   SellLocationID?: number;
   ProfitPerUnit: number;
   MarginPercent: number;
@@ -29,6 +31,7 @@ export interface FlipResult {
   PriceTrend: number;
   BuyCompetitors: number;
   SellCompetitors: number;
+  DailyProfit: number;
   /** Expected fill prices from execution plan (order book depth) */
   ExpectedBuyPrice?: number;
   ExpectedSellPrice?: number;
@@ -46,6 +49,8 @@ export interface ContractResult {
   MarginPercent: number;
   Volume: number;
   StationName: string;
+  SystemName?: string;
+  RegionName?: string;
   ItemCount: number;
   Jumps: number;
   ProfitPerJump: number;
@@ -60,6 +65,7 @@ export interface RouteHop {
   SystemName: string;
   StationName: string;
   DestSystemName: string;
+  DestStationName?: string;
   TypeName: string;
   TypeID: number;
   BuyPrice: number;
@@ -207,6 +213,7 @@ export interface ScanParams {
   sell_radius: number;
   min_margin: number;
   sales_tax_percent: number;
+  broker_fee_percent: number;
   min_daily_volume?: number;
   max_investment?: number;
   max_results?: number;
@@ -324,6 +331,26 @@ export interface CharacterRiskSummary {
   sample_days: number;
   window_days: number;
   capacity_multiplier: number;
+  low_sample?: boolean;
+}
+
+// --- Undercut Monitor Types ---
+
+export interface UndercutStatus {
+  order_id: number;
+  position: number;
+  total_orders: number;
+  best_price: number;
+  undercut_amount: number;
+  undercut_pct: number;
+  suggested_price: number;
+  book_levels: BookLevel[];
+}
+
+export interface BookLevel {
+  price: number;
+  volume: number;
+  is_player: boolean;
 }
 
 // --- Industry Types ---
@@ -382,6 +409,11 @@ export interface IndustryAnalysis {
   optimal_build_cost: number;
   savings: number;
   savings_percent: number;
+  sell_revenue: number;
+  profit: number;
+  profit_percent: number;
+  isk_per_hour: number;
+  manufacturing_time: number;
   total_job_cost: number;
   material_tree: MaterialNode;
   flat_materials: FlatMaterial[];
@@ -408,6 +440,53 @@ export interface IndustrySystem {
   reaction: number;
   copying: number;
   invention: number;
+}
+
+// --- Portfolio P&L Types ---
+
+export interface DailyPnLEntry {
+  date: string;
+  buy_total: number;
+  sell_total: number;
+  net_pnl: number;
+  cumulative_pnl: number;
+  transactions: number;
+}
+
+export interface PortfolioPnLStats {
+  total_pnl: number;
+  avg_daily_pnl: number;
+  best_day_pnl: number;
+  best_day_date: string;
+  worst_day_pnl: number;
+  worst_day_date: string;
+  profitable_days: number;
+  losing_days: number;
+  total_days: number;
+  win_rate: number;
+  total_bought: number;
+  total_sold: number;
+  roi_percent: number;
+}
+
+export interface ItemPnL {
+  type_id: number;
+  type_name: string;
+  total_bought: number;
+  total_sold: number;
+  net_pnl: number;
+  qty_bought: number;
+  qty_sold: number;
+  avg_buy_price: number;
+  avg_sell_price: number;
+  margin_percent: number;
+  transactions: number;
+}
+
+export interface PortfolioPnL {
+  daily_pnl: DailyPnLEntry[];
+  summary: PortfolioPnLStats;
+  top_items: ItemPnL[];
 }
 
 // --- Demand / War Tracker Types ---
@@ -446,7 +525,7 @@ export interface DemandRegionResponse {
 export interface TradeOpportunity {
   type_id: number;
   type_name: string;
-  category: "ship" | "module" | "ammo";
+  category: "ship" | "module" | "ammo" | "drone";
   kills_per_day: number;
   jita_price: number;
   region_price: number;
@@ -456,6 +535,8 @@ export interface TradeOpportunity {
   daily_profit: number;
   jita_volume: number;
   region_volume: number;
+  data_source?: "killmail" | "static";
+  volume?: number;
 }
 
 export interface RegionOpportunities {

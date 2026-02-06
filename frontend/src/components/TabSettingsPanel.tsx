@@ -8,6 +8,8 @@ interface TabSettingsPanelProps {
   defaultExpanded?: boolean;
   /** Optional help: step keys and wiki slug for ? button */
   help?: { stepKeys: string[]; wikiSlug: string };
+  /** Optional extra content in the header row (e.g. preset picker) */
+  headerExtra?: ReactNode;
   children: ReactNode;
 }
 
@@ -21,26 +23,28 @@ export function TabSettingsPanel({
   icon = "⚙",
   defaultExpanded = false,
   help,
+  headerExtra,
   children,
 }: TabSettingsPanelProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
   return (
-    <div className="bg-eve-panel border border-eve-border rounded-sm">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full px-3 py-2 flex items-center justify-between text-left hover:bg-eve-accent/5 transition-colors"
-      >
-        <div className="flex items-center gap-2">
+    <div className="bg-eve-panel border border-eve-border rounded-sm overflow-visible">
+      <div className="flex items-center justify-between px-3 py-2">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center gap-2 text-left hover:bg-eve-accent/5 transition-colors rounded-sm px-1 -ml-1"
+        >
           <span className="text-eve-accent text-sm">{icon}</span>
           <span className="text-sm font-medium text-eve-text">{title}</span>
-          {hint && <span className="text-xs text-eve-dim">— {hint}</span>}
-        </div>
-        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-          {help && <TabHelp stepKeys={help.stepKeys} wikiSlug={help.wikiSlug} />}
+          {hint && <span className="text-xs text-eve-dim hidden sm:inline">— {hint}</span>}
           <span className="text-eve-dim text-xs">{expanded ? "▲" : "▼"}</span>
+        </button>
+        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+          {headerExtra}
+          {help && <TabHelp stepKeys={help.stepKeys} wikiSlug={help.wikiSlug} />}
         </div>
-      </button>
+      </div>
 
       {expanded && (
         <div className="px-3 pb-3 border-t border-eve-border/50">

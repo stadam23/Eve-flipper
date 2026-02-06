@@ -45,16 +45,23 @@ export function RegionAutocomplete({ value, onChange, placeholder }: Props) {
       return;
     }
     timerRef.current = setTimeout(async () => {
-      const results = await autocompleteRegion(val);
-      setSuggestions(results);
-      setSelectedIndex(0);
-      setOpen(results.length > 0);
+      try {
+        const results = await autocompleteRegion(val);
+        setSuggestions(results);
+        setSelectedIndex(0);
+        setOpen(results.length > 0);
+      } catch {
+        setSuggestions([]);
+        setOpen(false);
+      }
     }, 200);
   };
 
   const select = (name: string) => {
-    setQuery(name);
-    onChange(name);
+    // Strip system hint suffix, e.g. "The Forge (Jita)" → "The Forge"
+    const clean = name.includes(" (") ? name.slice(0, name.lastIndexOf(" (")) : name;
+    setQuery(clean);
+    onChange(clean);
     setOpen(false);
   };
 

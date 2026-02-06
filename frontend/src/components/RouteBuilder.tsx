@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { findRoutes } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import type { RouteResult, RouteHop, ScanParams } from "@/lib/types";
@@ -15,6 +15,8 @@ type SortDir = "asc" | "desc";
 
 interface Props {
   params: ScanParams;
+  /** Results loaded externally (e.g. from history) */
+  loadedResults?: RouteResult[] | null;
 }
 
 function formatISK(v: number): string {
@@ -28,11 +30,18 @@ function formatISKFull(v: number): string {
   return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-export function RouteBuilder({ params }: Props) {
+export function RouteBuilder({ params, loadedResults }: Props) {
   const { t } = useI18n();
   const [minHops, setMinHops] = useState<number | "">(2);
   const [maxHops, setMaxHops] = useState<number | "">(5);
   const [results, setResults] = useState<RouteResult[]>([]);
+
+  // Accept externally loaded results (from history)
+  useEffect(() => {
+    if (loadedResults && loadedResults.length > 0) {
+      setResults(loadedResults);
+    }
+  }, [loadedResults]);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState("");
   const [selectedRoute, setSelectedRoute] = useState<RouteResult | null>(null);
@@ -110,7 +119,7 @@ export function RouteBuilder({ params }: Props) {
                   value={typeof minHops === "number" ? minHops : 2}
                   onChange={(v) => setMinHops(v)}
                   min={1}
-                  max={10}
+                  max={25}
                 />
               </SettingsField>
               <SettingsField label={t("routeMaxHops")}>
@@ -118,7 +127,7 @@ export function RouteBuilder({ params }: Props) {
                   value={typeof maxHops === "number" ? maxHops : 5}
                   onChange={(v) => setMaxHops(v)}
                   min={typeof minHops === "number" ? minHops : 1}
-                  max={10}
+                  max={25}
                 />
               </SettingsField>
             </SettingsGrid>
@@ -303,7 +312,7 @@ function RouteDetailPopup({
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-eve-dim">→ {t("routeDeliverTo")}:</span>
-                    <span className="text-eve-text">{hop.DestSystemName}</span>
+                    <span className="text-eve-text">{hop.DestStationName || hop.DestSystemName}</span>
                     <span className="text-eve-dim font-mono">({hop.Jumps} {t("routeJumpsUnit")})</span>
                   </div>
                   <div className="flex items-center gap-2">

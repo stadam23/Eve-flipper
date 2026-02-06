@@ -14,6 +14,21 @@ import { EmptyState } from "./EmptyState";
 import { useGlobalToast } from "./Toast";
 import { ExecutionPlannerPopup } from "./ExecutionPlannerPopup";
 
+// Format duration in seconds to human-readable string
+function formatDuration(seconds: number): string {
+  if (seconds <= 0) return "—";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  if (parts.length === 0) parts.push(`${s}s`);
+  return parts.join(" ");
+}
+
 // Highlight matching text in search results
 function HighlightMatch({ text, query }: { text: string; query: string }) {
   if (!query.trim()) return <>{text}</>;
@@ -345,23 +360,52 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
           <div className="shrink-0 grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
             <SummaryCard
               label={t("industryMarketPrice")}
-              value={formatISK(result.market_buy_price)}
+              value={formatISK(result.market_buy_price ?? 0)}
+              subtext={`${(result.total_quantity ?? 0).toLocaleString()} ${t("industryUnits")}`}
               color="text-eve-dim"
             />
             <SummaryCard
               label={t("industryBuildCost")}
-              value={formatISK(result.optimal_build_cost)}
+              value={formatISK(result.optimal_build_cost ?? 0)}
+              subtext={`${t("industryJobCost")}: ${formatISK(result.total_job_cost ?? 0)}`}
               color="text-eve-accent"
             />
             <SummaryCard
               label={t("industrySavings")}
-              value={formatISK(result.savings)}
-              subtext={`${result.savings_percent.toFixed(1)}%`}
-              color={result.savings > 0 ? "text-green-400" : "text-red-400"}
+              value={formatISK(result.savings ?? 0)}
+              subtext={`${(result.savings_percent ?? 0).toFixed(1)}%`}
+              color={(result.savings ?? 0) > 0 ? "text-green-400" : "text-red-400"}
+            />
+            <SummaryCard
+              label={t("industryProfit")}
+              value={formatISK(result.profit ?? 0)}
+              subtext={`${(result.profit_percent ?? 0).toFixed(1)}% ROI`}
+              color={(result.profit ?? 0) > 0 ? "text-green-400" : "text-red-400"}
+            />
+          </div>
+
+          {/* ISK/hour and Manufacturing Time */}
+          <div className="shrink-0 grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+            <SummaryCard
+              label={t("industryISKPerHour")}
+              value={formatISK(result.isk_per_hour ?? 0)}
+              color={(result.isk_per_hour ?? 0) > 0 ? "text-yellow-400" : "text-red-400"}
+            />
+            <SummaryCard
+              label={t("industryMfgTime")}
+              value={formatDuration(result.manufacturing_time ?? 0)}
+              color="text-eve-dim"
+            />
+            <SummaryCard
+              label={t("industrySellRevenue")}
+              value={formatISK(result.sell_revenue ?? 0)}
+              subtext={`-${salesTaxPercent}% tax -${brokerFee}% broker`}
+              color="text-eve-dim"
             />
             <SummaryCard
               label={t("industryJobCost")}
-              value={formatISK(result.total_job_cost)}
+              value={formatISK(result.total_job_cost ?? 0)}
+              subtext={`SCI: ${((result.system_cost_index ?? 0) * 100).toFixed(2)}%`}
               color="text-eve-dim"
             />
           </div>

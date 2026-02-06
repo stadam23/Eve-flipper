@@ -23,26 +23,51 @@ interface Props {
   scanCompletedWithZero?: boolean;
   /** Sales tax % for execution plan calculator profit (from params). */
   salesTaxPercent?: number;
+  /** When true, show BuyRegion/SellRegion columns (for regional arbitrage). */
+  showRegions?: boolean;
 }
 
-const columnDefs: { key: SortKey; labelKey: TranslationKey; width: string; numeric: boolean }[] = [
-  { key: "TypeName", labelKey: "colItem", width: "min-w-[180px]", numeric: false },
-  { key: "BuyPrice", labelKey: "colBuyPrice", width: "min-w-[110px]", numeric: true },
-  { key: "BuyStation", labelKey: "colBuyStation", width: "min-w-[150px]", numeric: false },
-  { key: "SellPrice", labelKey: "colSellPrice", width: "min-w-[110px]", numeric: true },
-  { key: "SellStation", labelKey: "colSellStation", width: "min-w-[150px]", numeric: false },
-  { key: "MarginPercent", labelKey: "colMargin", width: "min-w-[80px]", numeric: true },
-  { key: "UnitsToBuy", labelKey: "colUnitsToBuy", width: "min-w-[80px]", numeric: true },
-  { key: "BuyOrderRemain", labelKey: "colAcceptQty", width: "min-w-[80px]", numeric: true },
-  { key: "TotalProfit", labelKey: "colProfit", width: "min-w-[120px]", numeric: true },
-  { key: "ExpectedProfit", labelKey: "colExpectedProfit", width: "min-w-[100px]", numeric: true },
-  { key: "ProfitPerJump", labelKey: "colProfitPerJump", width: "min-w-[110px]", numeric: true },
-  { key: "TotalJumps", labelKey: "colJumps", width: "min-w-[60px]", numeric: true },
-  { key: "DailyVolume", labelKey: "colDailyVolume", width: "min-w-[80px]", numeric: true },
-  { key: "PriceTrend", labelKey: "colPriceTrend", width: "min-w-[70px]", numeric: true },
-  { key: "BuyCompetitors", labelKey: "colBuyCompetitors", width: "min-w-[70px]", numeric: true },
-  { key: "SellCompetitors", labelKey: "colSellCompetitors", width: "min-w-[70px]", numeric: true },
+type ColumnDef = { key: SortKey; labelKey: TranslationKey; width: string; gridWidth: string; numeric: boolean };
+
+const baseColumnDefs: ColumnDef[] = [
+  { key: "TypeName", labelKey: "colItem", width: "min-w-[180px]", gridWidth: "180px", numeric: false },
+  { key: "BuyPrice", labelKey: "colBuyPrice", width: "min-w-[110px]", gridWidth: "110px", numeric: true },
+  { key: "BuyStation", labelKey: "colBuyStation", width: "min-w-[150px]", gridWidth: "150px", numeric: false },
+  { key: "SellPrice", labelKey: "colSellPrice", width: "min-w-[110px]", gridWidth: "110px", numeric: true },
+  { key: "SellStation", labelKey: "colSellStation", width: "min-w-[150px]", gridWidth: "150px", numeric: false },
+  { key: "MarginPercent", labelKey: "colMargin", width: "min-w-[80px]", gridWidth: "80px", numeric: true },
+  { key: "UnitsToBuy", labelKey: "colUnitsToBuy", width: "min-w-[80px]", gridWidth: "80px", numeric: true },
+  { key: "BuyOrderRemain", labelKey: "colAcceptQty", width: "min-w-[80px]", gridWidth: "80px", numeric: true },
+  { key: "TotalProfit", labelKey: "colProfit", width: "min-w-[120px]", gridWidth: "120px", numeric: true },
+  { key: "ExpectedProfit", labelKey: "colExpectedProfit", width: "min-w-[100px]", gridWidth: "100px", numeric: true },
+  { key: "ProfitPerJump", labelKey: "colProfitPerJump", width: "min-w-[110px]", gridWidth: "110px", numeric: true },
+  { key: "TotalJumps", labelKey: "colJumps", width: "min-w-[60px]", gridWidth: "60px", numeric: true },
+  { key: "DailyVolume", labelKey: "colDailyVolume", width: "min-w-[80px]", gridWidth: "80px", numeric: true },
+  { key: "DailyProfit", labelKey: "colDailyProfit", width: "min-w-[110px]", gridWidth: "110px", numeric: true },
+  { key: "PriceTrend", labelKey: "colPriceTrend", width: "min-w-[70px]", gridWidth: "70px", numeric: true },
+  { key: "BuyCompetitors", labelKey: "colBuyCompetitors", width: "min-w-[70px]", gridWidth: "70px", numeric: true },
+  { key: "SellCompetitors", labelKey: "colSellCompetitors", width: "min-w-[70px]", gridWidth: "70px", numeric: true },
 ];
+
+const regionColumnDefs: ColumnDef[] = [
+  { key: "BuyRegionName" as SortKey, labelKey: "colBuyRegion" as TranslationKey, width: "min-w-[120px]", gridWidth: "120px", numeric: false },
+  { key: "SellRegionName" as SortKey, labelKey: "colSellRegion" as TranslationKey, width: "min-w-[120px]", gridWidth: "120px", numeric: false },
+];
+
+function buildColumnDefs(showRegions: boolean): ColumnDef[] {
+  if (!showRegions) return baseColumnDefs;
+  // Insert region columns after their respective station columns
+  const cols = [...baseColumnDefs];
+  const sellStationIdx = cols.findIndex((c) => c.key === "SellStation");
+  if (sellStationIdx >= 0) cols.splice(sellStationIdx + 1, 0, regionColumnDefs[1]);
+  const buyStationIdx = cols.findIndex((c) => c.key === "BuyStation");
+  if (buyStationIdx >= 0) cols.splice(buyStationIdx + 1, 0, regionColumnDefs[0]);
+  return cols;
+}
+
+function gridTemplateCols(cols: ColumnDef[]): string {
+  return `32px 32px ${cols.map((c) => c.gridWidth).join(" ")}`;
+}
 
 // Unique key for a row
 function rowKey(row: FlipResult) {
@@ -52,8 +77,9 @@ function rowKey(row: FlipResult) {
 // Virtualized row props (passed via List rowProps)
 interface VirtualRowProps {
   sorted: FlipResult[];
-  formatCell: (col: (typeof columnDefs)[number], row: FlipResult) => string;
-  columnDefs: typeof columnDefs;
+  formatCell: (col: ColumnDef, row: FlipResult) => string;
+  columnDefs: ColumnDef[];
+  gridTemplate: string;
   pinnedKeys: Set<string>;
   selectedKeys: Set<string>;
   toggleSelect: (key: string) => void;
@@ -70,6 +96,7 @@ function VirtualRow({
   sorted,
   formatCell,
   columnDefs,
+  gridTemplate,
   pinnedKeys,
   selectedKeys,
   toggleSelect,
@@ -85,9 +112,9 @@ function VirtualRow({
   const isSelected = selectedKeys.has(key);
   return (
     <div
-      style={style}
+      style={{ ...style, display: "grid", gridTemplateColumns: gridTemplate }}
       onContextMenu={(e) => handleContextMenu(e, row)}
-      className={`grid grid-cols-[32px_32px_180px_110px_150px_110px_150px_80px_80px_80px_120px_100px_110px_60px_80px_70px_70px_70px] gap-0 border-b border-eve-border/50 hover:bg-eve-accent/5 transition-colors ${compactMode ? "text-xs" : "text-sm"} ${
+      className={`gap-0 border-b border-eve-border/50 hover:bg-eve-accent/5 transition-colors ${compactMode ? "text-xs" : "text-sm"} ${
         isPinned ? "bg-eve-accent/10 border-l-2 border-l-eve-accent" : isSelected ? "bg-eve-accent/5" : index % 2 === 0 ? "bg-eve-panel" : "bg-[#161616]"
       }`}
     >
@@ -122,10 +149,13 @@ function VirtualRow({
   );
 }
 
-export function ScanResultsTable({ results, scanning, progress, scanCompletedWithZero, salesTaxPercent }: Props) {
+export function ScanResultsTable({ results, scanning, progress, scanCompletedWithZero, salesTaxPercent, showRegions = false }: Props) {
   const { t } = useI18n();
   const emptyReason: EmptyReason = scanCompletedWithZero ? "no_results" : "no_scan_yet";
   const { addToast } = useGlobalToast();
+
+  const columnDefs = useMemo(() => buildColumnDefs(showRegions), [showRegions]);
+  const gridTemplate = useMemo(() => gridTemplateCols(columnDefs), [columnDefs]);
 
   // Sort
   const [sortKey, setSortKey] = useState<SortKey>("TotalProfit");
@@ -372,9 +402,9 @@ export function ScanResultsTable({ results, scanning, progress, scanCompletedWit
     addToast(t("copied"), "success", 2000);
   };
 
-  const formatCell = (col: (typeof columnDefs)[number], row: FlipResult): string => {
+  const formatCell = (col: ColumnDef, row: FlipResult): string => {
     const val = row[col.key];
-    if (col.key === "BuyPrice" || col.key === "SellPrice" || col.key === "TotalProfit" || col.key === "ProfitPerJump") {
+    if (col.key === "BuyPrice" || col.key === "SellPrice" || col.key === "TotalProfit" || col.key === "ProfitPerJump" || col.key === "DailyProfit") {
       return formatISK(val as number);
     }
     if (col.key === "MarginPercent") return formatMargin(val as number);
@@ -445,7 +475,7 @@ export function ScanResultsTable({ results, scanning, progress, scanCompletedWit
         {useVirtual ? (
           <>
             {/* Virtualized: sticky header */}
-            <div className="shrink-0 grid grid-cols-[32px_32px_180px_110px_150px_110px_150px_80px_80px_80px_120px_100px_110px_60px_80px_70px_70px_70px] gap-0 bg-eve-dark border-b border-eve-border text-[11px] uppercase tracking-wider text-eve-dim font-medium">
+            <div className="shrink-0 grid gap-0 bg-eve-dark border-b border-eve-border text-[11px] uppercase tracking-wider text-eve-dim font-medium" style={{ gridTemplateColumns: gridTemplate }}>
               <div className="px-1 py-2" />
               <div className="px-1 py-2" />
               {columnDefs.map((col) => (
@@ -461,6 +491,7 @@ export function ScanResultsTable({ results, scanning, progress, scanCompletedWit
                   sorted,
                   formatCell,
                   columnDefs,
+                  gridTemplate,
                   pinnedKeys,
                   selectedKeys,
                   toggleSelect,
@@ -648,9 +679,20 @@ export function ScanResultsTable({ results, scanning, progress, scanCompletedWit
               onClick={() => {
                 const row = contextMenu.row;
                 if (watchlistIds.has(row.TypeID)) {
-                  removeFromWatchlist(row.TypeID).then(setWatchlist).catch(() => {});
+                  removeFromWatchlist(row.TypeID)
+                    .then(setWatchlist)
+                    .then(() => addToast(t("watchlistRemoved" as any) || "Removed from watchlist", "success", 2000))
+                    .catch(() => addToast(t("watchlistError" as any) || "Operation failed", "error", 3000));
                 } else {
-                  addToWatchlist(row.TypeID, row.TypeName).then(setWatchlist).catch(() => {});
+                  addToWatchlist(row.TypeID, row.TypeName)
+                    .then((r) => {
+                      setWatchlist(r.items);
+                      addToast(r.inserted
+                        ? (t("watchlistItemAdded" as any) || "Added to watchlist")
+                        : (t("watchlistAlready" as any) || "Already in watchlist"),
+                        r.inserted ? "success" : "info", 2000);
+                    })
+                    .catch(() => addToast(t("watchlistError" as any) || "Operation failed", "error", 3000));
                 }
                 setContextMenu(null);
               }}

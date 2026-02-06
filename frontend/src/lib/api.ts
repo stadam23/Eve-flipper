@@ -1,4 +1,4 @@
-import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, ContractResult, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationTrade, WatchlistItem } from "./types";
+import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, ContractResult, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, PortfolioPnL, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationTrade, UndercutStatus, WatchlistItem } from "./types";
 
 const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:13370";
 
@@ -154,6 +154,7 @@ export async function findRoutes(
       cargo_capacity: params.cargo_capacity,
       min_margin: params.min_margin,
       sales_tax_percent: params.sales_tax_percent,
+      broker_fee_percent: params.broker_fee_percent,
       min_hops: minHops,
       max_hops: maxHops,
       max_results: params.max_results,
@@ -172,13 +173,18 @@ export async function getWatchlist(): Promise<WatchlistItem[]> {
   return handleResponse<WatchlistItem[]>(res);
 }
 
-export async function addToWatchlist(typeId: number, typeName: string, alertMinMargin: number = 0): Promise<WatchlistItem[]> {
+export interface AddWatchlistResult {
+  items: WatchlistItem[];
+  inserted: boolean;
+}
+
+export async function addToWatchlist(typeId: number, typeName: string, alertMinMargin: number = 0): Promise<AddWatchlistResult> {
   const res = await fetch(`${BASE}/api/watchlist`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ type_id: typeId, type_name: typeName, alert_min_margin: alertMinMargin }),
   });
-  return handleResponse<WatchlistItem[]>(res);
+  return handleResponse<AddWatchlistResult>(res);
 }
 
 export async function removeFromWatchlist(typeId: number): Promise<WatchlistItem[]> {
@@ -324,6 +330,16 @@ export async function getCharacterLocation(): Promise<CharacterLocation> {
   return handleResponse<CharacterLocation>(res);
 }
 
+export async function getUndercuts(): Promise<UndercutStatus[]> {
+  const res = await fetch(`${BASE}/api/auth/undercuts`);
+  return handleResponse<UndercutStatus[]>(res);
+}
+
+export async function getPortfolioPnL(days: number = 30): Promise<PortfolioPnL> {
+  const res = await fetch(`${BASE}/api/auth/portfolio?days=${days}`);
+  return handleResponse<PortfolioPnL>(res);
+}
+
 // --- Industry ---
 
 import type { IndustryParams, IndustryAnalysis, BuildableItem, IndustrySystem, NdjsonIndustryMessage } from "./types";
@@ -423,7 +439,47 @@ export async function getRegionOpportunities(regionId: number): Promise<RegionOp
   return handleResponse<RegionOpportunities>(res);
 }
 
-export async function refreshDemandData(): Promise<{ status: string; message: string }> {
+export async function getRegionFittings(regionId: number): Promise<{ region_id: number; items: unknown[]; count: number; from_cache: boolean }> {
+  const res = await fetch(`${BASE}/api/demand/fittings/${regionId}`);
+  return handleResponse<{ region_id: number; items: unknown[]; count: number; from_cache: boolean }>(res);
+}
+
+export async function refreshDemandData(onProgress?: (msg: string) => void): Promise<void> {
   const res = await fetch(`${BASE}/api/demand/refresh`, { method: "POST" });
-  return handleResponse<{ status: string; message: string }>(res);
+  if (!res.ok) {
+    let errMsg = "Refresh failed";
+    try {
+      const err = await res.json();
+      errMsg = err.error || err.message || errMsg;
+    } catch { /* not JSON */ }
+    throw new Error(errMsg);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line) as { type: string; message?: string; status?: string };
+      if (msg.type === "progress" && msg.message) {
+        onProgress?.(msg.message);
+      } else if (msg.type === "error") {
+        throw new Error(msg.message || "Refresh failed");
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    const msg = JSON.parse(buffer) as { type: string; message?: string };
+    if (msg.type === "error") throw new Error(msg.message || "Refresh failed");
+  }
 }

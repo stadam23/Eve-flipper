@@ -18,7 +18,7 @@ import { CharacterPopup } from "./components/CharacterPopup";
 import { getConfig, updateConfig, scan, scanMultiRegion, scanContracts, getWatchlist, getAuthStatus, logout as apiLogout, getLoginUrl, getStatus } from "./lib/api";
 import { useI18n } from "./lib/i18n";
 import { formatISK } from "./lib/format";
-import type { AuthStatus, ContractResult, FlipResult, ScanParams } from "./lib/types";
+import type { AuthStatus, ContractResult, FlipResult, RouteResult, ScanParams, StationTrade } from "./lib/types";
 import logo from "./assets/logo.svg";
 
 type Tab = "radius" | "region" | "contracts" | "station" | "route" | "industry" | "demand";
@@ -33,15 +33,30 @@ function App() {
     sell_radius: 10,
     min_margin: 5,
     sales_tax_percent: 8,
+    broker_fee_percent: 0,
     max_results: 100,
   });
 
-  const [tab, setTab] = useState<Tab>("radius");
+  const [tab, setTabRaw] = useState<Tab>(() => {
+    try {
+      const saved = localStorage.getItem("eve-flipper-active-tab");
+      if (saved && ["radius", "region", "contracts", "station", "route", "industry", "demand"].includes(saved)) {
+        return saved as Tab;
+      }
+    } catch { /* ignore */ }
+    return "radius";
+  });
+  const setTab = useCallback((t: Tab) => {
+    setTabRaw(t);
+    try { localStorage.setItem("eve-flipper-active-tab", t); } catch { /* ignore */ }
+  }, []);
   const [authStatus, setAuthStatus] = useState<AuthStatus>({ logged_in: false });
 
   const [radiusResults, setRadiusResults] = useState<FlipResult[]>([]);
   const [regionResults, setRegionResults] = useState<FlipResult[]>([]);
   const [contractResults, setContractResults] = useState<ContractResult[]>([]);
+  const [stationLoadedResults, setStationLoadedResults] = useState<StationTrade[] | null>(null);
+  const [routeLoadedResults, setRouteLoadedResults] = useState<RouteResult[] | null>(null);
 
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState("");
@@ -167,6 +182,7 @@ function App() {
           sell_radius: cfg.sell_radius || 10,
           min_margin: cfg.min_margin || 5,
           sales_tax_percent: cfg.sales_tax_percent || 8,
+          broker_fee_percent: 0,
         });
       })
       .catch(() => {});
@@ -453,7 +469,7 @@ function App() {
             <ScanResultsTable results={radiusResults} scanning={scanning && tab === "radius"} progress={tab === "radius" ? progress : ""} salesTaxPercent={params.sales_tax_percent} />
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "region" ? "" : "hidden"}`}>
-            <ScanResultsTable results={regionResults} scanning={scanning && tab === "region"} progress={tab === "region" ? progress : ""} salesTaxPercent={params.sales_tax_percent} />
+            <ScanResultsTable results={regionResults} scanning={scanning && tab === "region"} progress={tab === "region" ? progress : ""} salesTaxPercent={params.sales_tax_percent} showRegions />
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "contracts" ? "" : "hidden"}`}>
             {/* Contract-specific settings */}
@@ -463,10 +479,10 @@ function App() {
             <ContractResultsTable results={contractResults} scanning={scanning && tab === "contracts"} progress={tab === "contracts" ? progress : ""} filterHints={contractFilterHints} />
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "station" ? "" : "hidden"}`}>
-            <StationTrading params={params} onChange={setParams} isLoggedIn={authStatus.logged_in} />
+            <StationTrading params={params} onChange={setParams} isLoggedIn={authStatus.logged_in} loadedResults={stationLoadedResults} />
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "route" ? "" : "hidden"}`}>
-            <RouteBuilder params={params} />
+            <RouteBuilder params={params} loadedResults={routeLoadedResults} />
           </div>
           <div className={`flex-1 min-h-0 flex flex-col ${tab === "industry" ? "" : "hidden"}`}>
             <IndustryTab isLoggedIn={authStatus.logged_in} />
@@ -514,10 +530,25 @@ function App() {
             } else if (resultTab === "contracts") {
               setContractResults(results as ContractResult[]);
               setTab("contracts");
+            } else if (resultTab === "station") {
+              setStationLoadedResults(results as StationTrade[]);
+              setTab("station");
+            } else if (resultTab === "route") {
+              setRouteLoadedResults(results as RouteResult[]);
+              setTab("route");
             }
-            // Optionally restore params
-            if (loadedParams && Object.keys(loadedParams).length > 0) {
-              setParams((p) => ({ ...p, ...loadedParams as Partial<ScanParams> }));
+            // Restore only global ScanParams-compatible fields (avoid leaking tab-specific params)
+            if (loadedParams && (resultTab === "radius" || resultTab === "region" || resultTab === "contracts" || resultTab === "route")) {
+              const safeKeys = ["system_name", "cargo_capacity", "buy_radius", "sell_radius", "min_margin",
+                "sales_tax_percent", "broker_fee_percent", "max_results", "min_daily_volume",
+                "min_contract_price", "max_contract_margin", "min_priced_ratio", "require_history", "target_region"];
+              const filtered: Record<string, unknown> = {};
+              for (const k of safeKeys) {
+                if (k in loadedParams) filtered[k] = loadedParams[k];
+              }
+              if (Object.keys(filtered).length > 0) {
+                setParams((p) => ({ ...p, ...filtered as Partial<ScanParams> }));
+              }
             }
             // Close modal after loading
             setShowHistory(false);

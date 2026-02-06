@@ -16,6 +16,8 @@ import {
   SettingsSelect,
 } from "./TabSettingsPanel";
 import { SystemAutocomplete } from "./SystemAutocomplete";
+import { PresetPicker } from "./PresetPicker";
+import { STATION_BUILTIN_PRESETS, type StationTradingSettings } from "@/lib/presets";
 
 type SortKey = keyof StationTrade;
 type SortDir = "asc" | "desc";
@@ -25,6 +27,8 @@ interface Props {
   /** Called when system (or other global param) is changed in this tab; updates global filter */
   onChange?: (params: ScanParams) => void;
   isLoggedIn?: boolean;
+  /** Results loaded externally (e.g. from history); component will display them */
+  loadedResults?: StationTrade[] | null;
 }
 
 // Metric tooltip keys mapping
@@ -59,7 +63,7 @@ const columnDefs: { key: SortKey; labelKey: TranslationKey; width: string; numer
 // Sentinel value for "All stations"
 const ALL_STATIONS_ID = 0;
 
-export function StationTrading({ params, onChange, isLoggedIn = false }: Props) {
+export function StationTrading({ params, onChange, isLoggedIn = false, loadedResults }: Props) {
   const { t } = useI18n();
 
   const [stations, setStations] = useState<StationInfo[]>([]);
@@ -102,6 +106,13 @@ export function StationTrading({ params, onChange, isLoggedIn = false }: Props) 
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const [pinnedKeys, setPinnedKeys] = useState<Set<string>>(new Set());
 
+  // Accept externally loaded results (from history)
+  useEffect(() => {
+    if (loadedResults && loadedResults.length > 0) {
+      setResults(loadedResults);
+    }
+  }, [loadedResults]);
+
   // Watchlist
   const { addToast } = useGlobalToast();
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
@@ -109,6 +120,48 @@ export function StationTrading({ params, onChange, isLoggedIn = false }: Props) 
     getWatchlist().then(setWatchlist).catch(() => {});
   }, []);
   const watchlistIds = useMemo(() => new Set(watchlist.map((w) => w.type_id)), [watchlist]);
+
+  // Current settings object for preset system
+  const stationSettings = useMemo<StationTradingSettings>(
+    () => ({
+      brokerFee,
+      salesTaxPercent,
+      radius,
+      minDailyVolume,
+      minItemProfit,
+      minDemandPerDay,
+      avgPricePeriod,
+      minPeriodROI,
+      bvsRatioMin,
+      bvsRatioMax,
+      maxPVI,
+      maxSDS,
+      limitBuyToPriceLow,
+      flagExtremePrices,
+    }),
+    [brokerFee, salesTaxPercent, radius, minDailyVolume, minItemProfit, minDemandPerDay, avgPricePeriod, minPeriodROI, bvsRatioMin, bvsRatioMax, maxPVI, maxSDS, limitBuyToPriceLow, flagExtremePrices],
+  );
+
+  const handlePresetApply = useCallback(
+    (s: Record<string, any>) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+      const st = s as StationTradingSettings;
+      if (st.brokerFee !== undefined) setBrokerFee(st.brokerFee);
+      if (st.salesTaxPercent !== undefined) setSalesTaxPercent(st.salesTaxPercent);
+      if (st.radius !== undefined) setRadius(st.radius);
+      if (st.minDailyVolume !== undefined) setMinDailyVolume(st.minDailyVolume);
+      if (st.minItemProfit !== undefined) setMinItemProfit(st.minItemProfit);
+      if (st.minDemandPerDay !== undefined) setMinDemandPerDay(st.minDemandPerDay);
+      if (st.avgPricePeriod !== undefined) setAvgPricePeriod(st.avgPricePeriod);
+      if (st.minPeriodROI !== undefined) setMinPeriodROI(st.minPeriodROI);
+      if (st.bvsRatioMin !== undefined) setBvsRatioMin(st.bvsRatioMin);
+      if (st.bvsRatioMax !== undefined) setBvsRatioMax(st.bvsRatioMax);
+      if (st.maxPVI !== undefined) setMaxPVI(st.maxPVI);
+      if (st.maxSDS !== undefined) setMaxSDS(st.maxSDS);
+      if (st.limitBuyToPriceLow !== undefined) setLimitBuyToPriceLow(st.limitBuyToPriceLow);
+      if (st.flagExtremePrices !== undefined) setFlagExtremePrices(st.flagExtremePrices);
+    },
+    [],
+  );
 
   // Sync sales tax from global params when they change (e.g. from ParametersPanel on other tabs)
   useEffect(() => {
@@ -332,6 +385,15 @@ export function StationTrading({ params, onChange, isLoggedIn = false }: Props) 
           icon="🏪"
           defaultExpanded={true}
           help={{ stepKeys: ["helpStationStep1", "helpStationStep2", "helpStationStep3"], wikiSlug: "Station-Trading" }}
+          headerExtra={
+            <PresetPicker
+              params={stationSettings}
+              onApply={handlePresetApply}
+              tab="station"
+              builtinPresets={STATION_BUILTIN_PRESETS}
+              align="right"
+            />
+          }
         >
           {/* System (from global filter or geolocation) & Station */}
           <SettingsGrid cols={5}>
@@ -619,9 +681,20 @@ export function StationTrading({ params, onChange, isLoggedIn = false }: Props) 
               onClick={() => {
                 const row = contextMenu.row;
                 if (watchlistIds.has(row.TypeID)) {
-                  removeFromWatchlist(row.TypeID).then(setWatchlist).catch(() => {});
+                  removeFromWatchlist(row.TypeID)
+                    .then(setWatchlist)
+                    .then(() => addToast(t("watchlistRemoved" as any) || "Removed from watchlist", "success", 2000))
+                    .catch(() => addToast(t("watchlistError" as any) || "Operation failed", "error", 3000));
                 } else {
-                  addToWatchlist(row.TypeID, row.TypeName).then(setWatchlist).catch(() => {});
+                  addToWatchlist(row.TypeID, row.TypeName)
+                    .then((r) => {
+                      setWatchlist(r.items);
+                      addToast(r.inserted
+                        ? (t("watchlistItemAdded" as any) || "Added to watchlist")
+                        : (t("watchlistAlready" as any) || "Already in watchlist"),
+                        r.inserted ? "success" : "info", 2000);
+                    })
+                    .catch(() => addToast(t("watchlistError" as any) || "Operation failed", "error", 3000));
                 }
                 setContextMenu(null);
               }}

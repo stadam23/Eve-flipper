@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { getScanHistory, deleteScanHistory, clearScanHistory, getScanHistoryResults } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
-import { formatISK } from "@/lib/format";
+import { formatISK, formatMargin } from "@/lib/format";
 import { useConfirmDialog } from "./ConfirmDialog";
-import type { ScanRecord, FlipResult, ContractResult, StationTrade } from "@/lib/types";
+import { useGlobalToast } from "./Toast";
+import type { ScanRecord, FlipResult, ContractResult, StationTrade, RouteResult } from "@/lib/types";
 
 interface ScanHistoryProps {
   onLoadResults?: (tab: string, results: unknown[], params: Record<string, unknown>) => void;
@@ -12,12 +13,13 @@ interface ScanHistoryProps {
 export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
   const { t } = useI18n();
   const { confirm, prompt, DialogComponent } = useConfirmDialog();
+  const { addToast } = useGlobalToast();
   const [history, setHistory] = useState<ScanRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [viewingResults, setViewingResults] = useState<{
     scan: ScanRecord;
-    results: FlipResult[] | ContractResult[] | StationTrade[];
+    results: FlipResult[] | ContractResult[] | StationTrade[] | RouteResult[];
   } | null>(null);
   const [loadingResults, setLoadingResults] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -26,8 +28,8 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
     try {
       const data = await getScanHistory(100);
       setHistory(data);
-    } catch (e) {
-      console.error("Failed to load history:", e);
+    } catch {
+      addToast(t("historyLoadError"), "error");
     } finally {
       setLoading(false);
     }
@@ -35,7 +37,7 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
 
   useEffect(() => {
     loadHistory();
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDelete = async (id: number, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -52,8 +54,8 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
       setHistory((h) => h.filter((r) => r.id !== id));
       if (selectedId === id) setSelectedId(null);
       if (viewingResults?.scan.id === id) setViewingResults(null);
-    } catch (e) {
-      console.error("Delete failed:", e);
+    } catch {
+      addToast(t("historyDeleteError"), "error");
     }
   };
 
@@ -75,8 +77,8 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
       setStatusMessage(t("clearedScans", { count: result.deleted }));
       setTimeout(() => setStatusMessage(null), 3000);
       loadHistory();
-    } catch (e) {
-      console.error("Clear failed:", e);
+    } catch {
+      addToast(t("historyDeleteError"), "error");
     }
   };
 
@@ -86,11 +88,10 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
       const data = await getScanHistoryResults(record.id);
       setViewingResults({
         scan: data.scan,
-        results: data.results as FlipResult[] | ContractResult[] | StationTrade[],
+        results: data.results as FlipResult[] | ContractResult[] | StationTrade[] | RouteResult[],
       });
-    } catch (e) {
-      console.error("Failed to load results:", e);
-      alert(t("failedToLoadResults"));
+    } catch {
+      addToast(t("failedToLoadResults"), "error");
     } finally {
       setLoadingResults(false);
     }
@@ -99,6 +100,7 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
   const handleLoadToTab = () => {
     if (!viewingResults || !onLoadResults) return;
     onLoadResults(viewingResults.scan.tab, viewingResults.results, viewingResults.scan.params);
+    addToast(t("historyResultsLoaded"), "success");
     setViewingResults(null);
   };
 
@@ -108,7 +110,7 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
       case "region": return "🌍";
       case "contracts": return "📜";
       case "station": return "🏪";
-      case "routes": return "🛤️";
+      case "route": return "🛤️";
       default: return "📊";
     }
   };
@@ -119,7 +121,7 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
       case "region": return t("regionArbitrage");
       case "contracts": return t("historyContracts");
       case "station": return t("historyStationTrading");
-      case "routes": return t("historyRouteBuilder");
+      case "route": return t("historyRouteBuilder");
       default: return tab;
     }
   };
@@ -141,7 +143,7 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
     } else if (days === 1) {
       return t("yesterday") + " " + date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     } else if (days < 7) {
-      return `${days}d ago`;
+      return t("historyDaysAgo", { days });
     }
     return date.toLocaleDateString();
   };
@@ -156,12 +158,13 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
 
   // Results viewer modal
   if (viewingResults) {
+    const resultTab = viewingResults.scan.tab;
     return (
       <div className="flex flex-col h-full">
         <div className="flex items-center justify-between p-4 border-b border-eve-border">
           <div>
             <h2 className="text-lg font-medium text-eve-text">
-              {getTabIcon(viewingResults.scan.tab)} {getTabLabel(viewingResults.scan.tab)}
+              {getTabIcon(resultTab)} {getTabLabel(resultTab)}
             </h2>
             <p className="text-sm text-eve-dim">
               {viewingResults.scan.system} — {formatDate(viewingResults.scan.timestamp)}
@@ -217,44 +220,12 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
             </details>
           )}
 
-          {/* Results preview */}
+          {/* Tab-specific results preview */}
           <div className="text-sm text-eve-dim mb-2">
             {t("resultsPreview")} ({(viewingResults.results || []).length} {t("historyItems")})
           </div>
           <div className="overflow-auto max-h-96 border border-eve-border rounded">
-            <table className="w-full text-xs">
-              <thead className="bg-eve-panel sticky top-0">
-                <tr>
-                  <th className="text-left p-2 border-b border-eve-border">{t("colItemName")}</th>
-                  <th className="text-right p-2 border-b border-eve-border">{t("historyProfit")}</th>
-                  <th className="text-right p-2 border-b border-eve-border">{t("historyMargin")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(viewingResults.results || []).slice(0, 50).map((r, i) => {
-                  if (!r) return null;
-                  const name = (r as FlipResult).TypeName || (r as ContractResult).Title || (r as StationTrade).TypeName || "Unknown";
-                  const profit = (r as FlipResult).TotalProfit ?? (r as ContractResult).Profit ?? (r as StationTrade).TotalProfit ?? 0;
-                  const margin = (r as FlipResult).MarginPercent ?? (r as ContractResult).MarginPercent ?? (r as StationTrade).MarginPercent ?? 0;
-                  return (
-                    <tr key={i} className="hover:bg-eve-accent/5">
-                      <td className="p-2 border-b border-eve-border/30">{name}</td>
-                      <td className="p-2 border-b border-eve-border/30 text-right text-eve-success font-mono">
-                        {formatISK(profit)}
-                      </td>
-                      <td className="p-2 border-b border-eve-border/30 text-right font-mono">
-                        {margin.toFixed(1)}%
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {(viewingResults.results || []).length > 50 && (
-              <div className="p-2 text-center text-xs text-eve-dim bg-eve-panel">
-                ... {t("andMore", { count: (viewingResults.results || []).length - 50 })}
-              </div>
-            )}
+            {renderResultsTable(resultTab, viewingResults.results || [], t)}
           </div>
         </div>
       </div>
@@ -371,5 +342,157 @@ export function ScanHistory({ onLoadResults }: ScanHistoryProps) {
         </div>
       )}
     </div>
+  );
+}
+
+/* ---------- Tab-specific result preview tables ---------- */
+
+type TFn = (key: string, params?: Record<string, unknown>) => string;
+
+function renderResultsTable(
+  tab: string,
+  results: unknown[],
+  t: TFn,
+) {
+  const items = results.slice(0, 50);
+  const moreCount = results.length - 50;
+
+  switch (tab) {
+    case "station":
+      return <StationPreview items={items as StationTrade[]} more={moreCount} t={t} />;
+    case "route":
+      return <RoutePreview items={items as RouteResult[]} more={moreCount} t={t} />;
+    case "contracts":
+      return <ContractPreview items={items as ContractResult[]} more={moreCount} t={t} />;
+    default:
+      return <FlipPreview items={items as FlipResult[]} more={moreCount} t={t} />;
+  }
+}
+
+function FlipPreview({ items, more, t }: { items: FlipResult[]; more: number; t: TFn }) {
+  return (
+    <table className="w-full text-xs">
+      <thead className="bg-eve-panel sticky top-0">
+        <tr>
+          <th className="text-left p-2 border-b border-eve-border">{t("colItemName")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyProfit")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyMargin")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyJumps")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((r, i) => (
+          <tr key={i} className="hover:bg-eve-accent/5">
+            <td className="p-2 border-b border-eve-border/30">{r.TypeName || "Unknown"}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right text-eve-success font-mono">{formatISK(r.TotalProfit)}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right font-mono">{formatMargin(r.MarginPercent)}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right font-mono text-eve-dim">{r.TotalJumps ?? "—"}</td>
+          </tr>
+        ))}
+      </tbody>
+      {more > 0 && <MoreRow colSpan={4} count={more} t={t} />}
+    </table>
+  );
+}
+
+function StationPreview({ items, more, t }: { items: StationTrade[]; more: number; t: TFn }) {
+  return (
+    <table className="w-full text-xs">
+      <thead className="bg-eve-panel sticky top-0">
+        <tr>
+          <th className="text-left p-2 border-b border-eve-border">{t("colItemName")}</th>
+          <th className="text-left p-2 border-b border-eve-border">{t("historyStation")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyCTS")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyProfit")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyMargin")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historySDS")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((r, i) => (
+          <tr key={i} className="hover:bg-eve-accent/5">
+            <td className="p-2 border-b border-eve-border/30">{r.TypeName}</td>
+            <td className="p-2 border-b border-eve-border/30 text-eve-dim truncate max-w-[150px]">{r.StationName}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right font-mono text-eve-accent">{r.CTS?.toFixed(1) ?? "—"}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right text-eve-success font-mono">{formatISK(r.TotalProfit)}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right font-mono">{formatMargin(r.MarginPercent)}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right font-mono">{r.SDS ?? "—"}</td>
+          </tr>
+        ))}
+      </tbody>
+      {more > 0 && <MoreRow colSpan={6} count={more} t={t} />}
+    </table>
+  );
+}
+
+function ContractPreview({ items, more, t }: { items: ContractResult[]; more: number; t: TFn }) {
+  return (
+    <table className="w-full text-xs">
+      <thead className="bg-eve-panel sticky top-0">
+        <tr>
+          <th className="text-left p-2 border-b border-eve-border">{t("colItemName")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyProfit")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyMargin")}</th>
+          <th className="text-left p-2 border-b border-eve-border">{t("historyStation")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((r, i) => (
+          <tr key={i} className="hover:bg-eve-accent/5">
+            <td className="p-2 border-b border-eve-border/30">{r.Title || "Unknown"}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right text-eve-success font-mono">{formatISK(r.Profit)}</td>
+            <td className="p-2 border-b border-eve-border/30 text-right font-mono">{formatMargin(r.MarginPercent)}</td>
+            <td className="p-2 border-b border-eve-border/30 text-eve-dim truncate max-w-[150px]">{r.StationName}</td>
+          </tr>
+        ))}
+      </tbody>
+      {more > 0 && <MoreRow colSpan={4} count={more} t={t} />}
+    </table>
+  );
+}
+
+function RoutePreview({ items, more, t }: { items: RouteResult[]; more: number; t: TFn }) {
+  return (
+    <table className="w-full text-xs">
+      <thead className="bg-eve-panel sticky top-0">
+        <tr>
+          <th className="text-left p-2 border-b border-eve-border">{t("historyRoute")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyHops")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyJumps")}</th>
+          <th className="text-right p-2 border-b border-eve-border">{t("historyProfit")}</th>
+          <th className="text-right p-2 border-b border-eve-border">ISK/{t("historyJumps")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((r, i) => {
+          const label = r.Hops?.length > 0
+            ? `${r.Hops[0].SystemName} → ${r.Hops[r.Hops.length - 1].DestSystemName || r.Hops[r.Hops.length - 1].SystemName}`
+            : `Route #${i + 1}`;
+          return (
+            <tr key={i} className="hover:bg-eve-accent/5">
+              <td className="p-2 border-b border-eve-border/30">{label}</td>
+              <td className="p-2 border-b border-eve-border/30 text-right font-mono">{r.HopCount}</td>
+              <td className="p-2 border-b border-eve-border/30 text-right font-mono">{r.TotalJumps}</td>
+              <td className="p-2 border-b border-eve-border/30 text-right text-eve-success font-mono">{formatISK(r.TotalProfit)}</td>
+              <td className="p-2 border-b border-eve-border/30 text-right font-mono text-eve-dim">{formatISK(r.ProfitPerJump)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+      {more > 0 && <MoreRow colSpan={5} count={more} t={t} />}
+    </table>
+  );
+}
+
+function MoreRow({ colSpan, count, t }: { colSpan: number; count: number; t: TFn }) {
+  if (count <= 0) return null;
+  return (
+    <tfoot>
+      <tr>
+        <td colSpan={colSpan} className="p-2 text-center text-xs text-eve-dim bg-eve-panel">
+          ... {t("andMore", { count })}
+        </td>
+      </tr>
+    </tfoot>
   );
 }

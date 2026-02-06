@@ -1,7 +1,8 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import type { ContractResult } from "@/lib/types";
 import { formatISK, formatMargin } from "@/lib/format";
 import { useI18n, type TranslationKey } from "@/lib/i18n";
+import { useGlobalToast } from "./Toast";
 import { EmptyState, type EmptyReason } from "./EmptyState";
 
 type SortKey = keyof ContractResult;
@@ -23,6 +24,8 @@ const columnDefs: { key: SortKey; labelKey: TranslationKey; width: string; numer
   { key: "MarginPercent", labelKey: "colContractMargin", width: "min-w-[80px]", numeric: true },
   { key: "Volume", labelKey: "colVolume", width: "min-w-[80px]", numeric: true },
   { key: "StationName", labelKey: "colStation", width: "min-w-[180px]", numeric: false },
+  { key: "SystemName", labelKey: "colContractSystem", width: "min-w-[120px]", numeric: false },
+  { key: "RegionName", labelKey: "colContractRegion", width: "min-w-[120px]", numeric: false },
   { key: "ItemCount", labelKey: "colItems", width: "min-w-[70px]", numeric: true },
   { key: "ProfitPerJump", labelKey: "colContractPPJ", width: "min-w-[110px]", numeric: true },
   { key: "Jumps", labelKey: "colContractJumps", width: "min-w-[60px]", numeric: true },
@@ -34,6 +37,7 @@ function rowKey(row: ContractResult) {
 
 export function ContractResultsTable({ results, scanning, progress, filterHints }: Props) {
   const { t } = useI18n();
+  const { addToast } = useGlobalToast();
   const emptyReason: EmptyReason = (results.length === 0 && filterHints && filterHints.length > 0)
     ? "filters_too_strict"
     : "no_scan_yet";
@@ -42,6 +46,38 @@ export function ContractResultsTable({ results, scanning, progress, filterHints 
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [showFilters, setShowFilters] = useState(false);
+
+  // Context menu
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; row: ContractResult } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent, row: ContractResult) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, row });
+  }, []);
+
+  const copyText = (text: string) => {
+    navigator.clipboard.writeText(text);
+    addToast(t("copied"), "success", 2000);
+    setContextMenu(null);
+  };
+
+  // Adjust context menu position
+  useEffect(() => {
+    if (contextMenu && contextMenuRef.current) {
+      const menu = contextMenuRef.current;
+      const rect = menu.getBoundingClientRect();
+      const padding = 10;
+      let x = contextMenu.x;
+      let y = contextMenu.y;
+      if (x + rect.width > window.innerWidth - padding) x = window.innerWidth - rect.width - padding;
+      if (y + rect.height > window.innerHeight - padding) y = window.innerHeight - rect.height - padding;
+      x = Math.max(padding, x);
+      y = Math.max(padding, y);
+      menu.style.left = `${x}px`;
+      menu.style.top = `${y}px`;
+    }
+  }, [contextMenu]);
 
   const filtered = useMemo(() => {
     if (Object.values(filters).every((v) => !v)) return results;
@@ -237,6 +273,7 @@ export function ContractResultsTable({ results, scanning, progress, filterHints 
             {sorted.map((row, i) => (
               <tr
                 key={rowKey(row)}
+                onContextMenu={(e) => handleContextMenu(e, row)}
                 className={`border-b border-eve-border/50 hover:bg-eve-accent/5 transition-colors ${
                   i % 2 === 0 ? "bg-eve-panel" : "bg-[#161616]"
                 }`}
@@ -281,6 +318,38 @@ export function ContractResultsTable({ results, scanning, progress, filterHints 
           </span>
         </div>
       )}
+
+      {/* Context menu */}
+      {contextMenu && (
+        <>
+          <div className="fixed inset-0 z-50" onClick={() => setContextMenu(null)} />
+          <div
+            ref={contextMenuRef}
+            className="fixed z-50 bg-eve-panel border border-eve-border rounded-sm shadow-eve-glow-strong py-1 min-w-[200px]"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <ContextItem label={t("copyItem")} onClick={() => copyText(contextMenu.row.Title)} />
+            <ContextItem label={t("copyStation")} onClick={() => copyText(contextMenu.row.StationName)} />
+            <ContextItem label={t("copyContractID")} onClick={() => copyText(String(contextMenu.row.ContractID))} />
+            <div className="h-px bg-eve-border my-1" />
+            <ContextItem
+              label={t("openInEveref")}
+              onClick={() => { window.open(`https://everef.net/contract/${contextMenu.row.ContractID}`, "_blank"); setContextMenu(null); }}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ContextItem({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <div
+      onClick={onClick}
+      className="px-4 py-1.5 text-sm text-eve-text hover:bg-eve-accent/20 hover:text-eve-accent cursor-pointer transition-colors"
+    >
+      {label}
     </div>
   );
 }

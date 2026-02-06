@@ -1,18 +1,11 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { SystemAutocomplete } from "./SystemAutocomplete";
 import { RegionAutocomplete } from "./RegionAutocomplete";
 import { useI18n } from "@/lib/i18n";
-import { useGlobalToast } from "./Toast";
 import { TabHelp } from "./TabHelp";
+import { PresetPicker } from "./PresetPicker";
+import { getPresetsForTab } from "@/lib/presets";
 import type { ScanParams } from "@/lib/types";
-import {
-  BUILTIN_PRESETS,
-  loadCustomPresets,
-  saveCustomPreset,
-  applyPreset,
-  nextPresetId,
-  type SavedPreset,
-} from "@/lib/presets";
 
 type TabForParams = "radius" | "region" | "contracts" | "route";
 
@@ -37,8 +30,6 @@ const inputClass =
 
 export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "radius" }: Props) {
   const { t } = useI18n();
-  const { addToast } = useGlobalToast();
-  const [customPresets, setCustomPresets] = useState<SavedPreset[]>(() => loadCustomPresets());
   const [showAdvanced, setShowAdvanced] = useState(false);
   const help = HELP_STEPS[tab];
 
@@ -46,81 +37,11 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
     onChange({ ...params, [key]: value });
   };
 
-  const applyPresetParams = useCallback(
-    (presetParams: Partial<ScanParams>) => {
-      onChange(applyPreset(params, presetParams));
-    },
-    [params, onChange]
-  );
-
-  const handlePresetChange = (value: string) => {
-    if (value === "" || value === "save") return;
-    const builtin = BUILTIN_PRESETS.find((p) => p.id === value);
-    if (builtin) {
-      applyPresetParams(builtin.params);
-      return;
-    }
-    const custom = customPresets.find((p) => p.id === value);
-    if (custom) applyPresetParams(custom.params);
-  };
-
-  const handleSavePreset = () => {
-    const name = window.prompt(t("presetSave"), "My preset");
-    if (!name?.trim()) return;
-    const preset: SavedPreset = {
-      id: nextPresetId(),
-      name: name.trim(),
-      params: {
-        min_margin: params.min_margin,
-        min_contract_price: params.min_contract_price,
-        max_contract_margin: params.max_contract_margin,
-        min_priced_ratio: params.min_priced_ratio,
-        min_daily_volume: params.min_daily_volume,
-        max_results: params.max_results,
-        min_route_security: params.min_route_security,
-      },
-    };
-    saveCustomPreset(preset);
-    setCustomPresets(loadCustomPresets());
-    applyPresetParams(preset.params);
-    addToast(t("presetSaved"), "success", 2000);
-  };
-
   return (
-    <div className="bg-eve-panel border border-eve-border rounded-sm overflow-hidden">
-      {/* Header: preset + help */}
+    <div className="bg-eve-panel border border-eve-border rounded-sm overflow-visible">
+      {/* Header: preset picker + help */}
       <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-eve-border/60 bg-eve-panel/80">
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          <span className="text-[10px] uppercase tracking-wider text-eve-dim font-medium shrink-0">
-            {t("presetLabel")}
-          </span>
-          <select
-            value=""
-            onChange={(e) => handlePresetChange(e.target.value)}
-            className={`flex-1 min-w-0 max-w-[140px] ${inputClass} py-1`}
-          >
-            <option value="">—</option>
-            {BUILTIN_PRESETS.map((p) => (
-              <option key={p.id} value={p.id}>
-                {t(p.nameKey as "presetConservative")}
-              </option>
-            ))}
-            {customPresets.length > 0 &&
-              customPresets.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-          </select>
-          <button
-            type="button"
-            onClick={handleSavePreset}
-            className="shrink-0 w-7 h-7 flex items-center justify-center bg-eve-input border border-eve-border rounded text-eve-dim hover:text-eve-accent hover:border-eve-accent/50 text-sm"
-            title={t("presetSave")}
-          >
-            +
-          </button>
-        </div>
+        <PresetPicker params={params} onApply={onChange} tab={tab} builtinPresets={getPresetsForTab(tab)} />
         {help && <TabHelp stepKeys={help.steps} wikiSlug={help.wiki} />}
       </div>
 
@@ -164,14 +85,16 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
             />
           </Field>
           
-          <Field label={t("paramsSell")}>
-            <NumberInput
-              value={params.sell_radius}
-              onChange={(v) => set("sell_radius", v)}
-              min={1}
-              max={50}
-            />
-          </Field>
+          {!(tab === "region" && params.target_region) && (
+            <Field label={t("paramsSell")}>
+              <NumberInput
+                value={params.sell_radius}
+                onChange={(v) => set("sell_radius", v)}
+                min={1}
+                max={50}
+              />
+            </Field>
+          )}
 
           {/* Row 2 */}
           {tab === "region" && (
@@ -201,6 +124,16 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
               onChange={(v) => set("sales_tax_percent", v)}
               min={0}
               max={100}
+              step={0.1}
+            />
+          </Field>
+
+          <Field label={t("paramsBrokerFee")}>
+            <NumberInput
+              value={params.broker_fee_percent}
+              onChange={(v) => set("broker_fee_percent", v)}
+              min={0}
+              max={10}
               step={0.1}
             />
           </Field>

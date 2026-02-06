@@ -16,6 +16,7 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
   const [fromCache, setFromCache] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedRegion, setSelectedRegion] = useState<DemandRegion | null>(null);
+  const [refreshProgress, setRefreshProgress] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -35,11 +36,10 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
 
   const handleRefresh = async () => {
     setRefreshing(true);
+    setRefreshProgress(null);
     setError(null);
     try {
-      // Refresh is now synchronous - will wait for all regions to be fetched
-      await refreshDemandData();
-      // Reload data after successful refresh
+      await refreshDemandData((msg) => setRefreshProgress(msg));
       await loadData();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to refresh";
@@ -47,6 +47,7 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
       onError?.(msg);
     } finally {
       setRefreshing(false);
+      setRefreshProgress(null);
     }
   };
 
@@ -82,6 +83,11 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
               📦 {t("fromCache") || "From cache"}
             </span>
           )}
+          {refreshing && refreshProgress && (
+            <span className="text-xs text-eve-accent animate-pulse max-w-[200px] truncate">
+              {refreshProgress}
+            </span>
+          )}
           <button
             onClick={handleRefresh}
             disabled={refreshing || loading}
@@ -106,8 +112,8 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
         </div>
       )}
 
-      {/* Summary Stats */}
-      {loading && hotZones.length === 0 && (
+      {/* Loading (non-refresh) */}
+      {loading && !refreshing && hotZones.length === 0 && (
         <div className="flex-1 flex items-center justify-center">
           <div className="text-eve-dim text-sm animate-pulse">
             {t("loadingRegions") || "Loading region data..."}
@@ -210,8 +216,8 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
         />
       )}
 
-      {/* Empty state */}
-      {!loading && hotZones.length === 0 && !error && (
+      {/* Empty state — hidden while refreshing */}
+      {!loading && !refreshing && hotZones.length === 0 && !error && (
         <div className="flex-1 flex flex-col items-center justify-center text-eve-dim">
           <div className="text-4xl mb-4">🌌</div>
           <div className="text-sm">{t("noDataYet") || "No data yet"}</div>
@@ -221,6 +227,16 @@ export function WarTracker({ onError, onOpenRegionArbitrage }: WarTrackerProps) 
           >
             {t("loadRegionData") || "Load Region Data"}
           </button>
+        </div>
+      )}
+
+      {/* Refreshing state (when no data yet) */}
+      {refreshing && hotZones.length === 0 && (
+        <div className="flex-1 flex flex-col items-center justify-center text-eve-dim">
+          <div className="text-4xl mb-4 animate-pulse">🛰️</div>
+          <div className="text-sm animate-pulse">
+            {refreshProgress || t("refreshing") || "Refreshing..."}
+          </div>
         </div>
       )}
     </div>
@@ -452,7 +468,11 @@ function RegionDetailPopup({ region, onClose, onOpenArbitrage, formatISK }: Regi
                       <h3 className="text-sm font-semibold text-green-400 flex items-center gap-2">
                         💰 {t("dailyProfitPotential") || "Daily Profit Potential"}
                       </h3>
-                      <p className="text-xs text-eve-dim mt-1">{t("basedOnDestroyedShips") || "Based on destroyed ships and demand"}</p>
+                      <p className="text-xs text-eve-dim mt-1">
+                        {opportunities.ships?.[0]?.data_source === "killmail"
+                          ? (t("basedOnKillmailData") || "Based on real killmail fitting data")
+                          : (t("basedOnDestroyedShips") || "Based on destroyed ships and demand")}
+                      </p>
                     </div>
                     <div className="text-2xl font-bold text-green-400">
                       {formatISK(opportunities.total_potential)} ISK
@@ -599,6 +619,11 @@ function OpportunityCard({ opportunity, formatPrice, t }: OpportunityCardProps) 
             <span className="font-medium text-eve-text truncate" title={opportunity.type_name}>
               {opportunity.type_name || `Type #${opportunity.type_id}`}
             </span>
+            {opportunity.data_source === "killmail" && (
+              <span className="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 text-[10px] rounded-sm font-medium shrink-0">
+                LIVE
+              </span>
+            )}
             {noSupply && (
               <span className="px-1.5 py-0.5 bg-green-500/20 text-green-400 text-[10px] rounded-sm font-medium shrink-0">
                 {t("noCompetition") || "NO COMPETITION"}

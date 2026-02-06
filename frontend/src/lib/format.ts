@@ -9,15 +9,18 @@ function getLocaleString(locale?: Locale): string {
 }
 
 export function formatISK(value: number, locale?: Locale): string {
+  if (value == null || isNaN(value)) return "0";
   const localeStr = getLocaleString(locale);
-  if (value >= 1_000_000_000) {
-    return (value / 1_000_000_000).toLocaleString(localeStr, { maximumFractionDigits: 2 }) + " B";
+  const abs = Math.abs(value);
+  const sign = value < 0 ? "-" : "";
+  if (abs >= 1_000_000_000) {
+    return sign + (abs / 1_000_000_000).toLocaleString(localeStr, { maximumFractionDigits: 2 }) + " B";
   }
-  if (value >= 1_000_000) {
-    return (value / 1_000_000).toLocaleString(localeStr, { maximumFractionDigits: 2 }) + " M";
+  if (abs >= 1_000_000) {
+    return sign + (abs / 1_000_000).toLocaleString(localeStr, { maximumFractionDigits: 2 }) + " M";
   }
-  if (value >= 1_000) {
-    return (value / 1_000).toLocaleString(localeStr, { maximumFractionDigits: 1 }) + " K";
+  if (abs >= 1_000) {
+    return sign + (abs / 1_000).toLocaleString(localeStr, { maximumFractionDigits: 1 }) + " K";
   }
   return value.toLocaleString(localeStr, { maximumFractionDigits: 1 });
 }
