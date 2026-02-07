@@ -38,27 +38,29 @@ func TestCalcVWAP_EmptyAndZeroVolume(t *testing.T) {
 	}
 }
 
-// --- CalcPVI: stdDev of daily range % = (Highest-Lowest)/Average*100 ---
+// --- CalcDRVI: stdDev of daily range % = (Highest-Lowest)/Average*100 ---
+// (Renamed from CalcPVI to avoid confusion with classic Positive Volume Index)
 
-func TestCalcPVI_Exact(t *testing.T) {
+func TestCalcDRVI_Exact(t *testing.T) {
 	base := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
 	d1 := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-	// Day1: range% = (110-90)/100*100 = 20. Day2: (120-80)/100*100 = 40. Mean=30, variance = ((20-30)^2+(40-30)^2)/2 = 100, std = 10.
+	// Day1: range% = (110-90)/100*100 = 20. Day2: (120-80)/100*100 = 40.
+	// Mean=30, sample variance = ((20-30)^2+(40-30)^2)/(2-1) = 200, sample std = sqrt(200) ≈ 14.1421
 	history := []esi.HistoryEntry{
 		{Date: base, Average: 100, Highest: 110, Lowest: 90, Volume: 1000},
 		{Date: d1, Average: 100, Highest: 120, Lowest: 80, Volume: 1000},
 	}
-	got := CalcPVI(history, 30)
-	want := 10.0 // std of 20 and 40
+	got := CalcDRVI(history, 30)
+	want := math.Sqrt(200.0) // sample std of [20, 40] with Bessel's correction
 	if math.Abs(got-want) > 1e-6 {
-		t.Errorf("CalcPVI = %v, want %v", got, want)
+		t.Errorf("CalcDRVI = %v, want %v", got, want)
 	}
 }
 
-func TestCalcPVI_LessThanTwoDays(t *testing.T) {
+func TestCalcDRVI_LessThanTwoDays(t *testing.T) {
 	history := []esi.HistoryEntry{{Date: time.Now().Format("2006-01-02"), Average: 100, Highest: 105, Lowest: 95, Volume: 100}}
-	if got := CalcPVI(history, 7); got != 0 {
-		t.Errorf("CalcPVI(1 day) = %v, want 0", got)
+	if got := CalcDRVI(history, 7); got != 0 {
+		t.Errorf("CalcDRVI(1 day) = %v, want 0", got)
 	}
 }
 
