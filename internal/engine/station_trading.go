@@ -42,7 +42,7 @@ type StationTrade struct {
 
 	// Advanced risk metrics
 	VWAP float64 `json:"VWAP"` // Volume-Weighted Average Price (30 days)
-	PVI  float64 `json:"PVI"`  // Price Volatility Index (StdDev of daily range)
+	PVI  float64 `json:"PVI"`  // DRVI: Daily Range Volatility Index (StdDev of daily range %). JSON tag kept as "PVI" for backward compat.
 	OBDS float64 `json:"OBDS"` // Order Book Depth Score
 	SDS  int     `json:"SDS"`  // Scam Detection Score (0-100)
 	CI   int     `json:"CI"`   // Competition Index
@@ -165,12 +165,12 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 	progress(fmt.Sprintf("Analyzing %d items...", len(groups)))
 
 	taxMult := 1.0 - params.SalesTaxPercent/100
-	brokerMult := 1.0 - params.BrokerFee/100
+	brokerFeeRate := params.BrokerFee / 100 // fraction e.g. 0.03 for 3%
 	if taxMult < 0 {
 		taxMult = 0
 	}
-	if brokerMult < 0 {
-		brokerMult = 0
+	if brokerFeeRate > 1 {
+		brokerFeeRate = 1
 	}
 
 	var results []StationTrade
@@ -217,7 +217,7 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 			continue // no spread
 		}
 		effectiveBuy := costToBuy * (1 + params.BrokerFee/100)
-		effectiveSell := revenueFromSell * taxMult * brokerMult
+		effectiveSell := revenueFromSell * taxMult * (1 - brokerFeeRate)
 		profitPerUnit := effectiveSell - effectiveBuy
 
 		if profitPerUnit <= 0 {
@@ -338,7 +338,7 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 				if r.ExpectedBuyPrice > 0 && r.ExpectedSellPrice > 0 {
 					// Account for fees: buy side pays broker fee, sell side pays broker fee + sales tax
 					effectiveBuy := r.ExpectedBuyPrice * (1 + params.BrokerFee/100)
-					effectiveSell := r.ExpectedSellPrice * taxMult * brokerMult
+					effectiveSell := r.ExpectedSellPrice * taxMult * (1 - brokerFeeRate)
 					r.ExpectedProfit = effectiveSell - effectiveBuy // per unit, net of fees
 				}
 			}
@@ -493,7 +493,10 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 
 		// Basic history stats
 		results[idx].DailyVolume = r.stats.DailyVolume
-		results[idx].TotalProfit = sanitizeFloat(results[idx].ProfitPerUnit * float64(r.stats.DailyVolume))
+		// Estimate daily share using harmonic distribution (top-of-book fills faster).
+		competitors := results[idx].BuyOrderCount + results[idx].SellOrderCount
+		dailyShare := harmonicDailyShare(r.stats.DailyVolume, competitors)
+		results[idx].TotalProfit = sanitizeFloat(results[idx].ProfitPerUnit * float64(dailyShare))
 
 		if len(r.entries) == 0 {
 			continue
@@ -502,11 +505,11 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		// Calculate VWAP (30 days)
 		results[idx].VWAP = sanitizeFloat(CalcVWAP(r.entries, 30))
 
-		// Calculate PVI (30 days)
-		results[idx].PVI = sanitizeFloat(CalcPVI(r.entries, 30))
+		// Calculate DRVI (30 days)
+		results[idx].PVI = sanitizeFloat(CalcDRVI(r.entries, 30))
 
-		// Calculate Period ROI
-		results[idx].PeriodROI = sanitizeFloat(CalcPeriodROI(r.entries, avgPeriod))
+		// Calculate spread ROI (typical buy-sell spread over the period)
+		results[idx].PeriodROI = sanitizeFloat(CalcSpreadROI(r.entries, avgPeriod))
 
 		// Calculate price stats
 		avg, high, low := CalcAvgPriceStats(r.entries, avgPeriod)

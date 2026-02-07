@@ -45,8 +45,14 @@ func CalcVWAP(history []esi.HistoryEntry, days int) float64 {
 	return sumPriceVol / sumVol
 }
 
-// CalcPVI calculates Price Volatility Index (StdDev of daily range %).
-func CalcPVI(history []esi.HistoryEntry, days int) float64 {
+// CalcDRVI calculates the Daily Range Volatility Index (StdDev of daily range %).
+// This measures intraday price volatility as the standard deviation of
+// (Highest − Lowest) / Average across recent days.
+//
+// NOTE: Previously named CalcPVI. Renamed to avoid confusion with the classic
+// "Positive Volume Index" (Norman Fosback, 1976) which tracks price changes on
+// days when volume increases — an entirely different concept.
+func CalcDRVI(history []esi.HistoryEntry, days int) float64 {
 	entries := filterLastNDays(history, days)
 	if len(entries) < 2 {
 		return 0
@@ -67,7 +73,7 @@ func CalcPVI(history []esi.HistoryEntry, days int) float64 {
 	return stdDev(ranges)
 }
 
-// stdDev calculates standard deviation.
+// stdDev calculates sample standard deviation (Bessel's correction: N-1).
 func stdDev(values []float64) float64 {
 	if len(values) < 2 {
 		return 0
@@ -84,7 +90,7 @@ func stdDev(values []float64) float64 {
 		diff := v - mean
 		variance += diff * diff
 	}
-	variance /= float64(len(values))
+	variance /= float64(len(values) - 1) // Bessel's correction: unbiased sample variance
 
 	return math.Sqrt(variance)
 }
@@ -284,13 +290,26 @@ func countTightSpreadOrders(orders []esi.MarketOrder) int {
 	return count
 }
 
-// CalcCTS calculates Composite Trading Score (0-100).
-// Higher is better.
-func CalcCTS(periodROI, obds, pvi float64, ci, sds int, dailyVolume float64) float64 {
+// CalcCTS calculates Composite Trading Score (0-100). Higher is better.
+//
+// Weight rationale (sum = 1.0):
+//   - SpreadROI  (25%): Primary profit driver — a wide, stable spread is the core
+//     value proposition of station trading.
+//   - SDS        (20%): Scam/manipulation detection is critical in EVE; even a
+//     profitable-looking item is worthless if the book is manipulated.
+//   - OBDS       (15%): Order book depth ensures fills can actually happen at the
+//     quoted spread without excessive slippage.
+//   - DRVI       (15%): Lower daily range volatility means more predictable margins;
+//     high DRVI items can swing against the trader between order placement and fill.
+//   - Volume     (15%): Higher turnover means faster capital cycling and lower
+//     opportunity cost of locked-up ISK.
+//   - CI         (10%): Competition matters but is partially captured by spread
+//     compression already; kept at lower weight to avoid double-counting.
+func CalcCTS(spreadROI, obds, drvi float64, ci, sds int, dailyVolume float64) float64 {
 	// Normalize each component to 0-100 scale
-	roiScore := normalize(periodROI, 0, 100)              // Higher ROI = better
-	obdsScore := normalize(obds, 0, 2) * 100              // Higher depth = better
-	pviScore := 100 - normalize(pvi, 0, 50)*100           // Lower volatility = better
+	roiScore := normalize(spreadROI, 0, 100) * 100         // Higher spread ROI = better
+	obdsScore := normalize(obds, 0, 2) * 100               // Higher depth = better
+	pviScore := 100 - normalize(drvi, 0, 50)*100           // Lower volatility = better
 	ciScore := 100 - normalize(float64(ci), 0, 100)*100   // Lower competition = better
 	sdsScore := 100 - normalize(float64(sds), 0, 100)*100 // Lower scam score = better
 
@@ -301,7 +320,7 @@ func CalcCTS(periodROI, obds, pvi float64, ci, sds int, dailyVolume float64) flo
 		volScore = normalize(math.Log10(dailyVolume), 0, 4) * 100 // 0..10000 units/day mapped to 0..100
 	}
 
-	// Weighted sum (weights should sum to 1.0)
+	// Weighted sum (weights sum to 1.0)
 	return roiScore*0.25 +
 		obdsScore*0.15 +
 		pviScore*0.15 +
@@ -325,18 +344,16 @@ func normalize(value, minVal, maxVal float64) float64 {
 	return normalized
 }
 
-// CalcPeriodROI calculates ROI based on historical average prices.
-// Uses 10th/90th percentile of daily prices instead of absolute min/max
-// to avoid outlier distortion.
-func CalcPeriodROI(history []esi.HistoryEntry, days int) float64 {
+// CalcSpreadROI estimates the typical buy-sell spread as a percentage, using
+// 10th percentile of daily lows (typical buy entry) and 90th percentile of
+// daily highs (typical sell exit) over N days. This measures the realistic
+// trading spread available to a station trader, not buy-and-hold ROI.
+// Outlier spikes and crashes are filtered by the percentile approach.
+//
+// The result populates the JSON field "PeriodROI" for backward compatibility.
+func CalcSpreadROI(history []esi.HistoryEntry, days int) float64 {
 	entries := filterLastNDays(history, days)
 	if len(entries) < 2 {
-		return 0
-	}
-
-	// Use VWAP as average price
-	vwap := CalcVWAP(history, days)
-	if vwap <= 0 {
 		return 0
 	}
 
@@ -359,17 +376,15 @@ func CalcPeriodROI(history []esi.HistoryEntry, days int) float64 {
 	sort.Float64s(highs)
 
 	// Use 10th percentile of lows (typical buy) and 90th percentile of highs (typical sell)
-	// to filter out outlier spikes / crashes
-	p10Low := percentile(lows, 10)
-	p90High := percentile(highs, 90)
+	// to filter out outlier spikes / crashes.
+	// Using pure percentiles avoids VWAP-blending which compresses the spread
+	// and systematically underestimates ROI.
+	typicalBuy := percentile(lows, 10)
+	typicalSell := percentile(highs, 90)
 
-	if p10Low <= 0 {
+	if typicalBuy <= 0 {
 		return 0
 	}
-
-	// Period ROI: blend percentile with VWAP for stability
-	typicalBuy := (p10Low + vwap) / 2
-	typicalSell := (p90High + vwap) / 2
 
 	return (typicalSell - typicalBuy) / typicalBuy * 100
 }
@@ -392,22 +407,30 @@ func percentile(sorted []float64, p float64) float64 {
 	return sorted[lower]*(1-frac) + sorted[upper]*frac
 }
 
-// CalcAvgPriceStats returns average, high, and low prices over N days.
+// CalcAvgPriceStats returns average (VWAP), high, and low prices over N days.
+// Computes VWAP inline from the same filtered entries to avoid a redundant
+// filterLastNDays pass that CalcVWAP would perform.
 func CalcAvgPriceStats(history []esi.HistoryEntry, days int) (avg, high, low float64) {
 	entries := filterLastNDays(history, days)
 	if len(entries) == 0 {
 		return 0, 0, 0
 	}
 
-	avg = CalcVWAP(history, days)
+	// VWAP inline (avoids double filterLastNDays)
+	var sumPriceVol, sumVol float64
 	low = math.MaxFloat64
 	for _, h := range entries {
+		sumPriceVol += h.Average * float64(h.Volume)
+		sumVol += float64(h.Volume)
 		if h.Highest > high {
 			high = h.Highest
 		}
 		if h.Lowest < low && h.Lowest > 0 {
 			low = h.Lowest
 		}
+	}
+	if sumVol > 0 {
+		avg = sumPriceVol / sumVol
 	}
 	if low == math.MaxFloat64 {
 		low = 0
