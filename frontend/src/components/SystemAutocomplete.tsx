@@ -39,7 +39,11 @@ export function SystemAutocomplete({ value, onChange, showLocationButton = true,
     let cancelled = false;
     getStations(value)
       .then((resp) => {
-        if (!cancelled) setNoStations(resp.stations.length === 0);
+        if (!cancelled) {
+          // Only show warning if backend recognized the system (system_id > 0)
+          // and it genuinely has no stations
+          setNoStations(resp.system_id > 0 && resp.stations.length === 0);
+        }
       })
       .catch(() => {
         if (!cancelled) setNoStations(false);
