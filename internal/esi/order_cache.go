@@ -39,6 +39,26 @@ func NewOrderCache() *OrderCache {
 	}
 }
 
+// EvictExpired removes all cache entries whose Expires time has passed.
+// This prevents unbounded memory growth when scanning many different regions
+// over time — stale entries for regions no longer being scanned are freed.
+func (oc *OrderCache) EvictExpired() int {
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
+
+	now := time.Now()
+	evicted := 0
+	for key, entry := range oc.entries {
+		// Keep entries that expired recently (within 30 min) for ETag revalidation.
+		// Only evict entries that have been expired for a long time.
+		if now.Sub(entry.expires) > 30*time.Minute {
+			delete(oc.entries, key)
+			evicted++
+		}
+	}
+	return evicted
+}
+
 // Get returns cached orders if they exist and have not expired.
 // Returns (orders, etag, hit).
 func (oc *OrderCache) Get(regionID int32, orderType string) ([]MarketOrder, string, bool) {
@@ -57,9 +77,21 @@ func (oc *OrderCache) Get(regionID int32, orderType string) ([]MarketOrder, stri
 }
 
 // Put stores orders in the cache with the given etag and expiry.
+// Periodically evicts long-expired entries to bound memory usage.
 func (oc *OrderCache) Put(regionID int32, orderType string, orders []MarketOrder, etag string, expires time.Time) {
 	oc.mu.Lock()
 	defer oc.mu.Unlock()
+
+	// Periodic eviction: when cache grows beyond 50 region+type pairs,
+	// sweep out entries that expired >30 min ago.
+	if len(oc.entries) > 50 {
+		now := time.Now()
+		for key, entry := range oc.entries {
+			if now.Sub(entry.expires) > 30*time.Minute {
+				delete(oc.entries, key)
+			}
+		}
+	}
 
 	oc.entries[orderCacheKey{regionID, orderType}] = &orderCacheEntry{
 		orders:  orders,

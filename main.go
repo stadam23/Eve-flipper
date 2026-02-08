@@ -111,6 +111,9 @@ func main() {
 	// Migrate config.json → SQLite (if exists)
 	database.MigrateFromJSON()
 
+	// Cleanup old market history to prevent unbounded DB growth
+	database.CleanupOldHistory()
+
 	// Load config from SQLite
 	cfg := database.LoadConfig()
 

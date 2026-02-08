@@ -128,15 +128,34 @@ func (c *Client) FetchContractItems(contractID int32) ([]ContractItem, error) {
 	return items, err
 }
 
+// ContractItemsCacheMaxSize is the maximum number of contracts to cache.
+// Once exceeded, oldest entries are evicted to prevent unbounded memory growth.
+const ContractItemsCacheMaxSize = 10_000
+
 // ContractItemsCache caches fetched contract items (they never change once created).
+// Bounded to ContractItemsCacheMaxSize entries; oldest are evicted when full.
 type ContractItemsCache struct {
 	mu    sync.RWMutex
 	items map[int32][]ContractItem // contractID -> items (nil = fetched but empty/error)
+	order []int32                  // insertion order for FIFO eviction
 }
 
 // NewContractItemsCache creates a new contract items cache.
 func NewContractItemsCache() *ContractItemsCache {
-	return &ContractItemsCache{items: make(map[int32][]ContractItem)}
+	return &ContractItemsCache{
+		items: make(map[int32][]ContractItem),
+		order: make([]int32, 0, ContractItemsCacheMaxSize),
+	}
+}
+
+// evictOldest removes the oldest entries until the cache is within MaxSize.
+// Must be called with mu held.
+func (cc *ContractItemsCache) evictOldest() {
+	for len(cc.items) >= ContractItemsCacheMaxSize && len(cc.order) > 0 {
+		oldest := cc.order[0]
+		cc.order = cc.order[1:]
+		delete(cc.items, oldest)
+	}
 }
 
 // FetchContractItemsBatch fetches items for multiple contracts using a worker pool.
@@ -232,6 +251,10 @@ func (c *Client) FetchContractItemsBatch(contractIDs []int32, cache *ContractIte
 		// Cache the result (even nil for "no items" to avoid re-fetching)
 		if cache != nil {
 			cache.mu.Lock()
+			if _, exists := cache.items[r.id]; !exists {
+				cache.evictOldest()
+				cache.order = append(cache.order, r.id)
+			}
 			cache.items[r.id] = r.items
 			cache.mu.Unlock()
 		}
