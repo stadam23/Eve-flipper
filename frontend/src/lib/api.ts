@@ -1,6 +1,6 @@
 import type { AppConfig, AppStatus, AuthStatus, CharacterInfo, CharacterRoles, ContractResult, CorpDashboard, CorpIndustryJob, CorpJournalEntry, CorpMarketOrderDetail, CorpMember, CorpMiningEntry, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, OptimizerDiagnostic, PLEXDashboard, PortfolioPnL, PortfolioOptimization, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationsResponse, StationTrade, UndercutStatus, WatchlistItem } from "./types";
 
-const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:13370";
+const BASE = import.meta.env.VITE_API_URL || "";
 
 // Helper to handle HTTP errors consistently
 async function handleResponse<T>(res: Response): Promise<T> {
