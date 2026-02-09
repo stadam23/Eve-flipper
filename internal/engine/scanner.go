@@ -13,19 +13,12 @@ import (
 )
 
 const (
-	// DefaultMaxResults is the default number of results returned when not specified.
-	DefaultMaxResults = 100
+	// MaxUnlimitedResults caps the working set to prevent server overload
+	// (sorting, history enrichment, and JSON serialization of very large result sets).
+	MaxUnlimitedResults = 5000
 	// UnreachableJumps is the fallback jump count when no path exists.
 	UnreachableJumps = 999
 )
-
-// EffectiveMaxResults returns the max results limit, using DefaultMaxResults if v <= 0.
-func EffectiveMaxResults(v int, defaultVal int) int {
-	if v <= 0 {
-		return defaultVal
-	}
-	return v
-}
 
 // HistoryProvider is an interface for fetching and caching market history.
 type HistoryProvider interface {
@@ -172,10 +165,10 @@ type locKey struct {
 // scanIndex holds pre-built maps from the streaming fetch phase.
 // Built concurrently while orders are still arriving from ESI.
 type scanIndex struct {
-	cheapestSell map[int32]sellInfo
-	sellCounts   map[locKey]int
-	highestBuy   map[int32]buyInfo
-	buyCounts    map[locKey]int
+	sellByType map[int32][]sellInfo // all sell orders grouped by typeID
+	sellCounts map[locKey]int
+	buyByType  map[int32][]buyInfo // all buy orders grouped by typeID
+	buyCounts  map[locKey]int
 	// Raw orders kept for execution plan (indexed by location+type).
 	sellOrders []esi.MarketOrder
 	buyOrders  []esi.MarketOrder
@@ -262,56 +255,60 @@ func (s *Scanner) fetchAndIndex(
 	buyCh := s.fetchOrdersStream(sellRegions, "buy", sellSystems)
 
 	idx := &scanIndex{
-		cheapestSell: make(map[int32]sellInfo),
-		sellCounts:   make(map[locKey]int),
-		highestBuy:   make(map[int32]buyInfo),
-		buyCounts:    make(map[locKey]int),
+		sellByType: make(map[int32][]sellInfo),
+		sellCounts: make(map[locKey]int),
+		buyByType:  make(map[int32][]buyInfo),
+		buyCounts:  make(map[locKey]int),
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Consumer 1: build sell-side maps while orders stream in
+	// Consumer 1: collect all sell orders grouped by type
 	go func() {
 		defer wg.Done()
 		for batch := range sellCh {
 			idx.sellOrders = append(idx.sellOrders, batch...)
 			for _, o := range batch {
 				idx.sellCounts[locKey{o.TypeID, o.LocationID}]++
-				if cur, ok := idx.cheapestSell[o.TypeID]; !ok || o.Price < cur.Price {
-					idx.cheapestSell[o.TypeID] = sellInfo{o.Price, o.VolumeRemain, o.LocationID, o.SystemID, 0}
-				}
+				idx.sellByType[o.TypeID] = append(idx.sellByType[o.TypeID], sellInfo{
+					Price: o.Price, VolumeRemain: o.VolumeRemain,
+					LocationID: o.LocationID, SystemID: o.SystemID,
+				})
 			}
 		}
-		// Fill order counts for cheapest sell locations
-		for tid, info := range idx.cheapestSell {
-			info.OrderCount = idx.sellCounts[locKey{tid, info.LocationID}]
-			idx.cheapestSell[tid] = info
+		// Fill order counts per location
+		for tid, sells := range idx.sellByType {
+			for i := range sells {
+				sells[i].OrderCount = idx.sellCounts[locKey{tid, sells[i].LocationID}]
+			}
 		}
 	}()
 
-	// Consumer 2: build buy-side maps while orders stream in
+	// Consumer 2: collect all buy orders grouped by type
 	go func() {
 		defer wg.Done()
 		for batch := range buyCh {
 			idx.buyOrders = append(idx.buyOrders, batch...)
 			for _, o := range batch {
 				idx.buyCounts[locKey{o.TypeID, o.LocationID}]++
-				if cur, ok := idx.highestBuy[o.TypeID]; !ok || o.Price > cur.Price {
-					idx.highestBuy[o.TypeID] = buyInfo{o.Price, o.VolumeRemain, o.LocationID, o.SystemID, 0}
-				}
+				idx.buyByType[o.TypeID] = append(idx.buyByType[o.TypeID], buyInfo{
+					Price: o.Price, VolumeRemain: o.VolumeRemain,
+					LocationID: o.LocationID, SystemID: o.SystemID,
+				})
 			}
 		}
-		for tid, info := range idx.highestBuy {
-			info.OrderCount = idx.buyCounts[locKey{tid, info.LocationID}]
-			idx.highestBuy[tid] = info
+		for tid, buys := range idx.buyByType {
+			for i := range buys {
+				buys[i].OrderCount = idx.buyCounts[locKey{tid, buys[i].LocationID}]
+			}
 		}
 	}()
 
 	wg.Wait()
 
 	log.Printf("[DEBUG] fetchAndIndex: %d sell orders, %d buy orders", len(idx.sellOrders), len(idx.buyOrders))
-	log.Printf("[DEBUG] cheapestSell: %d types, highestBuy: %d types", len(idx.cheapestSell), len(idx.highestBuy))
+	log.Printf("[DEBUG] sellByType: %d types, buyByType: %d types", len(idx.sellByType), len(idx.buyByType))
 	return idx
 }
 
@@ -323,8 +320,6 @@ func (s *Scanner) calculateResults(
 	bfsDistances map[int32]int,
 	progress func(string),
 ) ([]FlipResult, error) {
-	cheapestSell := idx.cheapestSell
-	highestBuy := idx.highestBuy
 	sellOrders := idx.sellOrders
 	buyOrders := idx.buyOrders
 
@@ -335,24 +330,31 @@ func (s *Scanner) calculateResults(
 	}
 	brokerFeeRate := params.BrokerFeePercent / 100 // 0 for instant trades; fraction e.g. 0.03 for 3%
 
-	var results []FlipResult
+	// For each (typeID, sellLocationID, buyLocationID) keep only the best-profit pair.
+	// This deduplicates multiple orders at the same location while preserving
+	// different location combinations (e.g. Amarr→Rens AND Jita→Rens).
+	type pairKey struct {
+		typeID     int32
+		sellLocID  int64 // where we BUY (from sell orders)
+		buyLocID   int64 // where we SELL (to buy orders)
+	}
+	bestPairs := make(map[pairKey]*FlipResult)
 
-	for typeID, sell := range cheapestSell {
-		buy, ok := highestBuy[typeID]
-		if !ok || buy.Price <= sell.Price {
-			continue
-		}
+	minSec := params.MinRouteSecurity
 
-		// OPT: early margin check before item lookup
-		// Broker fee applies to both sides when placing limit orders (0 for instant trades)
-		effectiveBuyPrice := sell.Price * (1 + brokerFeeRate)
-		effectiveSellPrice := buy.Price * taxMult * (1 - brokerFeeRate)
-		profitPerUnit := effectiveSellPrice - effectiveBuyPrice
-		if profitPerUnit <= 0 {
-			continue
-		}
-		margin := profitPerUnit / effectiveBuyPrice * 100
-		if margin < params.MinMargin {
+	// Pre-filter: for each type, keep only the cheapest sell per location
+	// and the most expensive buy per location to reduce cross-join iterations.
+	// This collapses e.g. 500 sell orders at Jita into 1 best-price entry.
+	type sellLocBest struct {
+		sellInfo
+	}
+	type buyLocBest struct {
+		buyInfo
+	}
+
+	for typeID, sells := range idx.sellByType {
+		buys := idx.buyByType[typeID]
+		if len(buys) == 0 {
 			continue
 		}
 
@@ -361,93 +363,196 @@ func (s *Scanner) calculateResults(
 			continue
 		}
 
-		unitsF := math.Floor(params.CargoCapacity / itemType.Volume)
-		if unitsF > math.MaxInt32 {
-			unitsF = math.MaxInt32
+		maxUnitsF := math.Floor(params.CargoCapacity / itemType.Volume)
+		if maxUnitsF > math.MaxInt32 {
+			maxUnitsF = math.MaxInt32
 		}
-		units := int32(unitsF)
-		if units <= 0 {
+		maxUnits := int32(maxUnitsF)
+		if maxUnits <= 0 {
 			continue
 		}
-		if sell.VolumeRemain < units {
-			units = sell.VolumeRemain
-		}
-		if buy.VolumeRemain < units {
-			units = buy.VolumeRemain
-		}
 
-		// MaxInvestment filter
-		investment := sell.Price * float64(units)
-		if params.MaxInvestment > 0 && investment > params.MaxInvestment {
-			units = int32(params.MaxInvestment / sell.Price)
-			if units <= 0 {
-				continue
+		// Deduplicate sells: keep cheapest per location (with total volume)
+		bestSellByLoc := make(map[int64]*sellLocBest)
+		for _, sell := range sells {
+			if existing, ok := bestSellByLoc[sell.LocationID]; ok {
+				// Accumulate volume, keep cheapest price
+				existing.VolumeRemain += sell.VolumeRemain
+				if sell.Price < existing.Price {
+					existing.Price = sell.Price
+					existing.SystemID = sell.SystemID
+					existing.OrderCount = sell.OrderCount
+				}
+			} else {
+				cp := sell
+				bestSellByLoc[sell.LocationID] = &sellLocBest{cp}
 			}
 		}
 
-		totalProfit := profitPerUnit * float64(units)
-
-		// OPT: use pre-computed BFS distances when available, fallback to on-demand BFS (with optional route security filter)
-		minSec := params.MinRouteSecurity
-		buyJumps := s.jumpsBetweenWithBFS(params.CurrentSystemID, sell.SystemID, bfsDistances, minSec)
-		sellJumps := s.jumpsBetweenWithSecurity(sell.SystemID, buy.SystemID, minSec)
-		totalJumps := buyJumps + sellJumps
-
-		var profitPerJump float64
-		if totalJumps > 0 {
-			profitPerJump = totalProfit / float64(totalJumps)
+		// Deduplicate buys: keep most expensive per location (with total volume)
+		bestBuyByLoc := make(map[int64]*buyLocBest)
+		for _, buy := range buys {
+			if existing, ok := bestBuyByLoc[buy.LocationID]; ok {
+				// Accumulate volume, keep highest price
+				existing.VolumeRemain += buy.VolumeRemain
+				if buy.Price > existing.Price {
+					existing.Price = buy.Price
+					existing.SystemID = buy.SystemID
+					existing.OrderCount = buy.OrderCount
+				}
+			} else {
+				cp := buy
+				bestBuyByLoc[buy.LocationID] = &buyLocBest{cp}
+			}
 		}
 
-		buyRegionID := int32(0)
-		if sys, ok := s.SDE.Systems[sell.SystemID]; ok {
-			buyRegionID = sys.RegionID
+		// Quick check: can the best possible pair for this type be profitable?
+		cheapestSell := math.MaxFloat64
+		for _, sell := range bestSellByLoc {
+			if sell.Price < cheapestSell {
+				cheapestSell = sell.Price
+			}
 		}
-		sellRegionID := int32(0)
-		if sys, ok := s.SDE.Systems[buy.SystemID]; ok {
-			sellRegionID = sys.RegionID
+		expensiveBuy := 0.0
+		for _, buy := range bestBuyByLoc {
+			if buy.Price > expensiveBuy {
+				expensiveBuy = buy.Price
+			}
 		}
-		results = append(results, FlipResult{
-			TypeID:          typeID,
-			TypeName:        itemType.Name,
-			Volume:          itemType.Volume,
-			BuyPrice:        sell.Price,
-			BuyStation:      "",
-			BuySystemName:   s.systemName(sell.SystemID),
-			BuySystemID:     sell.SystemID,
-			BuyRegionID:     buyRegionID,
-			BuyRegionName:   s.regionName(buyRegionID),
-			BuyLocationID:   sell.LocationID,
-			SellPrice:       buy.Price,
-			SellStation:     "",
-			SellSystemName:  s.systemName(buy.SystemID),
-			SellSystemID:    buy.SystemID,
-			SellRegionID:    sellRegionID,
-			SellRegionName:  s.regionName(sellRegionID),
-			SellLocationID:  buy.LocationID,
-			ProfitPerUnit:   profitPerUnit,
-			MarginPercent:   margin,
-			UnitsToBuy:      units,
-			BuyOrderRemain:  buy.VolumeRemain,
-			SellOrderRemain: sell.VolumeRemain,
-			TotalProfit:     totalProfit,
-			ProfitPerJump:   sanitizeFloat(profitPerJump),
-			BuyJumps:        buyJumps,
-			SellJumps:       sellJumps,
-			TotalJumps:      totalJumps,
-			BuyCompetitors:  sell.OrderCount, // sell orders at buy station (we compete to buy)
-			SellCompetitors: buy.OrderCount,  // buy orders at sell station (we compete to sell)
-		})
+		bestEffBuy := cheapestSell * (1 + brokerFeeRate)
+		bestEffSell := expensiveBuy * taxMult * (1 - brokerFeeRate)
+		if bestEffSell <= bestEffBuy {
+			continue
+		}
+		bestMargin := (bestEffSell - bestEffBuy) / bestEffBuy * 100
+		if bestMargin < params.MinMargin {
+			continue
+		}
+
+		// Cross-join deduplicated locations (much smaller than raw order count)
+		for sellLocID, sell := range bestSellByLoc {
+			for buyLocID, buy := range bestBuyByLoc {
+				if buy.Price <= sell.Price {
+					continue
+				}
+				if sellLocID == buyLocID {
+					continue
+				}
+
+				effectiveBuyPrice := sell.Price * (1 + brokerFeeRate)
+				effectiveSellPrice := buy.Price * taxMult * (1 - brokerFeeRate)
+				profitPerUnit := effectiveSellPrice - effectiveBuyPrice
+				if profitPerUnit <= 0 {
+					continue
+				}
+				margin := profitPerUnit / effectiveBuyPrice * 100
+				if margin < params.MinMargin {
+					continue
+				}
+
+				units := maxUnits
+				if sell.VolumeRemain < units {
+					units = sell.VolumeRemain
+				}
+				if buy.VolumeRemain < units {
+					units = buy.VolumeRemain
+				}
+
+				// MaxInvestment filter
+				if params.MaxInvestment > 0 {
+					maxAfford := int32(params.MaxInvestment / sell.Price)
+					if maxAfford <= 0 {
+						continue
+					}
+					if units > maxAfford {
+						units = maxAfford
+					}
+				}
+
+				totalProfit := profitPerUnit * float64(units)
+
+				// Dedup: keep only the best profit for this location pair + type
+				pk := pairKey{typeID, sellLocID, buyLocID}
+				if existing, ok := bestPairs[pk]; ok {
+					if totalProfit <= existing.TotalProfit {
+						continue
+					}
+				}
+
+				// Route check (BFS)
+				buyJumps := s.jumpsBetweenWithBFS(params.CurrentSystemID, sell.SystemID, bfsDistances, minSec)
+				sellJumps := s.jumpsBetweenWithSecurity(sell.SystemID, buy.SystemID, minSec)
+				if buyJumps >= UnreachableJumps || sellJumps >= UnreachableJumps {
+					continue
+				}
+
+				totalJumps := buyJumps + sellJumps
+				var profitPerJump float64
+				if totalJumps > 0 {
+					profitPerJump = totalProfit / float64(totalJumps)
+				}
+
+				buyRegionID := int32(0)
+				if sys, ok := s.SDE.Systems[sell.SystemID]; ok {
+					buyRegionID = sys.RegionID
+				}
+				sellRegionID := int32(0)
+				if sys, ok := s.SDE.Systems[buy.SystemID]; ok {
+					sellRegionID = sys.RegionID
+				}
+
+				result := FlipResult{
+					TypeID:          typeID,
+					TypeName:        itemType.Name,
+					Volume:          itemType.Volume,
+					BuyPrice:        sell.Price,
+					BuyStation:      "",
+					BuySystemName:   s.systemName(sell.SystemID),
+					BuySystemID:     sell.SystemID,
+					BuyRegionID:     buyRegionID,
+					BuyRegionName:   s.regionName(buyRegionID),
+					BuyLocationID:   sellLocID,
+					SellPrice:       buy.Price,
+					SellStation:     "",
+					SellSystemName:  s.systemName(buy.SystemID),
+					SellSystemID:    buy.SystemID,
+					SellRegionID:    sellRegionID,
+					SellRegionName:  s.regionName(sellRegionID),
+					SellLocationID:  buyLocID,
+					ProfitPerUnit:   profitPerUnit,
+					MarginPercent:   margin,
+					UnitsToBuy:      units,
+					BuyOrderRemain:  buy.VolumeRemain,
+					SellOrderRemain: sell.VolumeRemain,
+					TotalProfit:     totalProfit,
+					ProfitPerJump:   sanitizeFloat(profitPerJump),
+					BuyJumps:        buyJumps,
+					SellJumps:       sellJumps,
+					TotalJumps:      totalJumps,
+					BuyCompetitors:  sell.OrderCount,
+					SellCompetitors: buy.OrderCount,
+				}
+				bestPairs[pk] = &result
+			}
+		}
 	}
 
+	// Flatten deduped results
+	results := make([]FlipResult, 0, len(bestPairs))
+	for _, r := range bestPairs {
+		results = append(results, *r)
+	}
 	log.Printf("[DEBUG] found %d results before sort/trim", len(results))
 
-	// Sort by profit, keep top 100
+	// Sort by profit descending
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].TotalProfit > results[j].TotalProfit
 	})
-	limit := EffectiveMaxResults(params.MaxResults, DefaultMaxResults)
-	if len(results) > limit {
-		results = results[:limit]
+
+	// Cap internal working set for history enrichment to prevent server overload
+	// on extremely large result sets (e.g. multi-region with 200k+ results).
+	if len(results) > MaxUnlimitedResults {
+		results = results[:MaxUnlimitedResults]
 	}
 
 	// Enrich with execution-plan expected prices (same order book, no extra ESI).
@@ -535,7 +640,7 @@ func (s *Scanner) calculateResults(
 
 	// Post-filter: min daily volume
 	if params.MinDailyVolume > 0 {
-		filtered := results[:0]
+		filtered := make([]FlipResult, 0, len(results))
 		for _, r := range results {
 			if r.DailyVolume >= params.MinDailyVolume {
 				filtered = append(filtered, r)

@@ -184,7 +184,59 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 
 // isPlayerStructure returns true if the location ID is a player-owned structure (not NPC station).
 func isPlayerStructure(id int64) bool {
-	return id >= 100000000 && !(id >= 60000000 && id < 64000000)
+	// NPC stations: 60,000,000 – 64,000,000 range.
+	// Player-owned Upwell structures: > 1,000,000,000,000 (1 trillion).
+	// The old check (id >= 100M && not in 60M-64M) had false positives
+	// for IDs in the 100M–1T range. Use the definitive threshold instead.
+	return id > 1_000_000_000_000
+}
+
+func filterFlipResultsExcludeStructures(results []engine.FlipResult) []engine.FlipResult {
+	if len(results) == 0 {
+		return results
+	}
+	filtered := results[:0]
+	for _, r := range results {
+		if isPlayerStructure(r.BuyLocationID) || isPlayerStructure(r.SellLocationID) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
+}
+
+func filterRouteResultsExcludeStructures(results []engine.RouteResult) []engine.RouteResult {
+	if len(results) == 0 {
+		return results
+	}
+	filtered := results[:0]
+	for _, route := range results {
+		skip := false
+		for _, hop := range route.Hops {
+			if isPlayerStructure(hop.LocationID) || isPlayerStructure(hop.DestLocationID) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, route)
+		}
+	}
+	return filtered
+}
+
+func filterStationTradesExcludeStructures(results []engine.StationTrade) []engine.StationTrade {
+	if len(results) == 0 {
+		return results
+	}
+	filtered := results[:0]
+	for _, r := range results {
+		if isPlayerStructure(r.StationID) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
 }
 
 // enrichStructureNames resolves player-structure names in FlipResult slice
@@ -589,6 +641,8 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
 		results = s.enrichStructureNames(results)
+	} else {
+		results = filterFlipResultsExcludeStructures(results)
 	}
 
 	topProfit := 0.0
@@ -663,6 +717,8 @@ func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
 		results = s.enrichStructureNames(results)
+	} else {
+		results = filterFlipResultsExcludeStructures(results)
 	}
 
 	topProfit := 0.0
@@ -835,6 +891,8 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
 		results = s.enrichRouteStructureNames(results)
+	} else {
+		results = filterRouteResultsExcludeStructures(results)
 	}
 
 	var topProfit, totalProfit float64
@@ -955,8 +1013,6 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 		MaxSDS             int     `json:"max_sds"`
 		LimitBuyToPriceLow bool    `json:"limit_buy_to_price_low"`
 		FlagExtremePrices  bool    `json:"flag_extreme_prices"`
-		// Relist fee estimation
-		RelistsPerDay float64 `json:"relists_per_day"` // 0 = auto-estimate from CI
 		// Player structures
 		IncludeStructures bool    `json:"include_structures"`
 		StructureIDs      []int64 `json:"structure_ids"`
@@ -1060,7 +1116,6 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 			MaxSDS:             req.MaxSDS,
 			LimitBuyToPriceLow: req.LimitBuyToPriceLow,
 			FlagExtremePrices:  req.FlagExtremePrices,
-			RelistsPerDay:     req.RelistsPerDay,
 		}
 		// For "all stations in region" mode, pass nil StationIDs
 		if req.StationID == 0 && req.Radius == 0 {
@@ -1082,21 +1137,25 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API] ScanStation complete: %d results in %dms", len(allResults), durationMs)
 
 	// Resolve structure names if user is authenticated
-	if token, err := s.sessions.EnsureValidToken(s.sso); err == nil {
-		structureIDs := make(map[int64]bool)
-		for _, r := range allResults {
-			if r.StationID >= 100000000 && !(r.StationID >= 60000000 && r.StationID < 64000000) {
-				structureIDs[r.StationID] = true
+	if req.IncludeStructures {
+		if token, err := s.sessions.EnsureValidToken(s.sso); err == nil {
+			structureIDs := make(map[int64]bool)
+			for _, r := range allResults {
+				if r.StationID >= 100000000 && !(r.StationID >= 60000000 && r.StationID < 64000000) {
+					structureIDs[r.StationID] = true
+				}
 			}
-		}
-		if len(structureIDs) > 0 {
-			s.esi.PrefetchStructureNames(structureIDs, token)
-			for i := range allResults {
-				if structureIDs[allResults[i].StationID] {
-					allResults[i].StationName = s.esi.StationName(allResults[i].StationID)
+			if len(structureIDs) > 0 {
+				s.esi.PrefetchStructureNames(structureIDs, token)
+				for i := range allResults {
+					if structureIDs[allResults[i].StationID] {
+						allResults[i].StationName = s.esi.StationName(allResults[i].StationID)
+					}
 				}
 			}
 		}
+	} else {
+		allResults = filterStationTradesExcludeStructures(allResults)
 	}
 
 	// Calculate totals
