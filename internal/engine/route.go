@@ -231,7 +231,6 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 	// Scale beam search parameters based on requested depth
 	beamWidth := 50    // keep top N partial routes per level
 	branchFactor := 10 // explore top N trades per system
-	defaultMaxRoutes := 100
 
 	type partialRoute struct {
 		hops        []RouteHop
@@ -355,9 +354,9 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 	}
 	completedRoutes = unique
 
-	routeLimit := EffectiveMaxResults(params.MaxResults, defaultMaxRoutes)
-	if len(completedRoutes) > routeLimit {
-		completedRoutes = completedRoutes[:routeLimit]
+	// Cap to prevent server overload on route results
+	if len(completedRoutes) > MaxUnlimitedResults {
+		completedRoutes = completedRoutes[:MaxUnlimitedResults]
 	}
 
 	// Prefetch station names for all hops (buy and sell stations)

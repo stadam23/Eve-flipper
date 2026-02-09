@@ -224,7 +224,6 @@ export interface ScanParams {
   broker_fee_percent: number;
   min_daily_volume?: number;
   max_investment?: number;
-  max_results?: number;
   /** Route security: 0 = all space, 0.45 = highsec only, 0.7 = min 0.7 */
   min_route_security?: number;
   /** Target region name for regional arbitrage (empty = search all by radius) */

@@ -46,7 +46,6 @@ export const en = {
     paramsMargin: "Margin %",
     paramsTax: "Tax %",
     paramsBrokerFee: "Broker %",
-    paramsResults: "Results",
     paramsSecurity: "Security",
     routeSecurity: "Route security",
     routeSecurityHint: "Route only through systems with at least this security (0 = all space)",

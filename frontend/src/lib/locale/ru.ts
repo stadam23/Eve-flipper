@@ -38,7 +38,6 @@ export const ru = {
     paramsMargin: "Маржа %",
     paramsTax: "Налог %",
     paramsBrokerFee: "Брокер %",
-    paramsResults: "Результаты",
     paramsSecurity: "Безопасность",
     routeSecurity: "Безопасность маршрута",
     routeSecurityHint: "Маршрут только через системы с указанным минимумом security (0 = все пространство)",

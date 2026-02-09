@@ -51,7 +51,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       min_daily_volume: 10,
       sales_tax_percent: 8,
       broker_fee_percent: 3,
-      max_results: 50,
     },
   },
   {
@@ -65,7 +64,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       min_daily_volume: 0,
       sales_tax_percent: 8,
       broker_fee_percent: 3,
-      max_results: 100,
     },
   },
   {
@@ -79,7 +77,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       min_daily_volume: 0,
       sales_tax_percent: 8,
       broker_fee_percent: 3,
-      max_results: 250,
     },
   },
 
@@ -94,7 +91,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       cargo_capacity: 5000,
       sales_tax_percent: 8,
       broker_fee_percent: 3,
-      max_results: 50,
     },
   },
   {
@@ -107,7 +103,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       cargo_capacity: 60000,
       sales_tax_percent: 8,
       broker_fee_percent: 3,
-      max_results: 250,
     },
   },
 
@@ -155,7 +150,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       min_route_security: 0.45,
       min_margin: 5,
       cargo_capacity: 5000,
-      max_results: 50,
     },
   },
   {
@@ -166,7 +160,6 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
       min_route_security: 0,
       min_margin: 2,
       cargo_capacity: 60000,
-      max_results: 100,
     },
   },
 ];

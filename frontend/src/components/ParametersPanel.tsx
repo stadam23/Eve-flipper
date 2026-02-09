@@ -166,19 +166,6 @@ export function ParametersPanel({ params, onChange, isLoggedIn = false, tab = "r
             />
           </Field>
           
-          <Field label={t("paramsResults")}>
-            <select
-              value={params.max_results ?? 100}
-              onChange={(e) => set("max_results", parseInt(e.target.value))}
-              className={inputClass}
-            >
-              <option value={50}>50</option>
-              <option value={100}>100</option>
-              <option value={250}>250</option>
-              <option value={500}>500</option>
-              <option value={1000}>1000</option>
-            </select>
-          </Field>
         </div>
 
         {/* Advanced filters toggle */}

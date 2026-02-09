@@ -160,7 +160,6 @@ export async function findRoutes(
       broker_fee_percent: params.broker_fee_percent,
       min_hops: minHops,
       max_hops: maxHops,
-      max_results: params.max_results,
       min_route_security: params.min_route_security,
       include_structures: params.include_structures,
     },
@@ -251,7 +250,6 @@ export async function scanStation(
     sales_tax_percent: number;
     broker_fee: number;
     min_daily_volume?: number;
-    max_results?: number;
     // EVE Guru Profit Filters
     min_item_profit?: number;
     min_demand_per_day?: number;
