@@ -603,7 +603,9 @@ export function StationTrading({
                     ? t("noNpcStationsLoginHint")
                     : stations.length === 0 && isLoggedIn && !includeStructures
                       ? t("noNpcStationsToggleHint")
-                      : t("noStations")}
+                      : includeStructures
+                        ? t("noStationsOrInaccessible")
+                        : t("noStations")}
                 </div>
               ) : (
                 <SettingsSelect

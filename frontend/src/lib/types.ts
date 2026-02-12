@@ -371,6 +371,7 @@ export interface IndustryParams {
   me: number; // Material Efficiency 0-10
   te: number; // Time Efficiency 0-20
   system_name: string;
+  station_id?: number; // Optional station/structure ID for price lookup
   facility_tax: number;
   structure_bonus: number;
   broker_fee?: number;

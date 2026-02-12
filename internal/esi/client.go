@@ -277,9 +277,9 @@ func (c *Client) StructureName(structureID int64, accessToken string) string {
 		}
 		return eveName
 	}
-	// Fallback — only cache in L1 (not L2), so re-login can resolve later
+	// Fallback — DON'T cache placeholder so retries can resolve it later
+	// (e.g., when token is refreshed or structure becomes accessible)
 	name := fmt.Sprintf("Structure %d", structureID)
-	c.stationCache.Store(structureID, name)
 	return name
 }
 

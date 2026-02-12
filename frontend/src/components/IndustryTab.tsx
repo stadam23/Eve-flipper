@@ -1,13 +1,15 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import { useI18n } from "@/lib/i18n";
-import { analyzeIndustry, searchBuildableItems } from "@/lib/api";
-import type { IndustryAnalysis, IndustryParams, MaterialNode, FlatMaterial, BuildableItem } from "@/lib/types";
+import { analyzeIndustry, searchBuildableItems, getStations, getStructures } from "@/lib/api";
+import type { IndustryAnalysis, IndustryParams, MaterialNode, FlatMaterial, BuildableItem, StationInfo } from "@/lib/types";
 import { formatISK } from "@/lib/format";
 import {
   TabSettingsPanel,
   SettingsField,
   SettingsNumberInput,
   SettingsGrid,
+  SettingsCheckbox,
+  SettingsSelect,
 } from "./TabSettingsPanel";
 import { SystemAutocomplete } from "./SystemAutocomplete";
 import { EmptyState } from "./EmptyState";
@@ -95,6 +97,16 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const [blueprintCost, setBlueprintCost] = useState(0);
   const [blueprintIsBPO, setBlueprintIsBPO] = useState(true);
 
+  // Station/Structure selection
+  const [stations, setStations] = useState<StationInfo[]>([]);
+  const [selectedStationId, setSelectedStationId] = useState<number>(0);
+  const [loadingStations, setLoadingStations] = useState(false);
+  const [systemRegionId, setSystemRegionId] = useState<number>(0);
+  const [systemId, setSystemId] = useState<number>(0);
+  const [includeStructures, setIncludeStructures] = useState(false);
+  const [structureStations, setStructureStations] = useState<StationInfo[]>([]);
+  const [loadingStructures, setLoadingStructures] = useState(false);
+
   // Analysis state
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState("");
@@ -106,6 +118,47 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
 
   // Execution plan popup (from shopping list)
   const [execPlanMaterial, setExecPlanMaterial] = useState<FlatMaterial | null>(null);
+
+  // Load stations when system changes
+  useEffect(() => {
+    if (!systemName) return;
+    setLoadingStations(true);
+    getStations(systemName)
+      .then((resp) => {
+        setStations(resp.stations);
+        setSystemRegionId(resp.region_id);
+        setSystemId(resp.system_id);
+        setSelectedStationId(0);
+        setStructureStations([]);
+      })
+      .catch(() => {
+        setStations([]);
+        setSystemRegionId(0);
+        setSystemId(0);
+      })
+      .finally(() => setLoadingStations(false));
+  }, [systemName]);
+
+  // Fetch structures when toggle is enabled
+  useEffect(() => {
+    if (!includeStructures || !systemId || !systemRegionId) {
+      setStructureStations([]);
+      return;
+    }
+    setLoadingStructures(true);
+    getStructures(systemId, systemRegionId)
+      .then(setStructureStations)
+      .catch(() => setStructureStations([]))
+      .finally(() => setLoadingStructures(false));
+  }, [includeStructures, systemId, systemRegionId]);
+
+  // Combined stations (NPC + structures when toggle is on)
+  const allStations = useMemo(() => {
+    if (includeStructures && structureStations.length > 0) {
+      return [...stations, ...structureStations];
+    }
+    return stations;
+  }, [stations, structureStations, includeStructures]);
 
   // Search handler with debounce
   const handleSearch = useCallback((query: string) => {
@@ -200,6 +253,7 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
       me,
       te,
       system_name: systemName,
+      station_id: selectedStationId > 0 ? selectedStationId : undefined,
       facility_tax: facilityTax,
       structure_bonus: structureBonus,
       broker_fee: brokerFee,
@@ -222,7 +276,7 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
     } finally {
       setAnalyzing(false);
     }
-  }, [analyzing, selectedItem, runs, me, te, systemName, facilityTax, structureBonus, brokerFee, salesTaxPercent, t, onError]);
+  }, [analyzing, selectedItem, runs, me, te, systemName, selectedStationId, facilityTax, structureBonus, brokerFee, salesTaxPercent, ownBlueprint, blueprintCost, blueprintIsBPO, t, onError]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -289,24 +343,69 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
             </SettingsField>
           </div>
 
-          {/* Parameters Grid */}
-          <SettingsGrid cols={5}>
-            <SettingsField label={t("industryRuns")}>
-              <SettingsNumberInput value={runs} onChange={setRuns} min={1} max={10000} />
-            </SettingsField>
-            <SettingsField label={t("industryME")}>
-              <SettingsNumberInput value={me} onChange={setME} min={0} max={10} />
-            </SettingsField>
-            <SettingsField label={t("industryTE")}>
-              <SettingsNumberInput value={te} onChange={setTE} min={0} max={20} />
-            </SettingsField>
-            <SettingsField label={t("system")}>
-              <SystemAutocomplete value={systemName} onChange={setSystemName} isLoggedIn={isLoggedIn} />
-            </SettingsField>
-            <SettingsField label={t("industryFacilityTax")}>
-              <SettingsNumberInput value={facilityTax} onChange={setFacilityTax} min={0} max={50} step={0.1} />
-            </SettingsField>
-          </SettingsGrid>
+          {/* Location settings (System, Station, Include Structures) */}
+          <div className="mb-3">
+            <SettingsGrid cols={3}>
+              <SettingsField label={t("system")}>
+                <SystemAutocomplete value={systemName} onChange={setSystemName} isLoggedIn={isLoggedIn} />
+              </SettingsField>
+              <SettingsField label={t("stationSelect")}>
+                {loadingStations || loadingStructures ? (
+                  <div className="h-[34px] flex items-center text-xs text-eve-dim">
+                    {loadingStructures ? t("loadingStructures") : t("loadingStations")}
+                  </div>
+                ) : allStations.length === 0 ? (
+                  <div className="h-[34px] flex items-center text-xs text-eve-dim">
+                    {stations.length === 0 && !isLoggedIn
+                      ? t("noNpcStationsLoginHint")
+                      : stations.length === 0 && isLoggedIn && !includeStructures
+                        ? t("noNpcStationsToggleHint")
+                        : includeStructures
+                          ? t("noStationsOrInaccessible")
+                          : t("noStations")}
+                  </div>
+                ) : (
+                  <SettingsSelect
+                    value={selectedStationId}
+                    onChange={(v) => setSelectedStationId(Number(v))}
+                    options={[
+                      { value: 0, label: t("allStations") },
+                      ...allStations.map(st => ({
+                        value: st.id,
+                        label: st.is_structure ? `🏗️ ${st.name}` : st.name
+                      }))
+                    ]}
+                  />
+                )}
+              </SettingsField>
+              {isLoggedIn && (
+                <SettingsField label={t("includeStructures")}>
+                  <SettingsCheckbox
+                    checked={includeStructures}
+                    onChange={setIncludeStructures}
+                  />
+                </SettingsField>
+              )}
+            </SettingsGrid>
+          </div>
+
+          {/* Production parameters (Runs, ME, TE, Facility Tax) */}
+          <div className="mb-3">
+            <SettingsGrid cols={4}>
+              <SettingsField label={t("industryRuns")}>
+                <SettingsNumberInput value={runs} onChange={setRuns} min={1} max={10000} />
+              </SettingsField>
+              <SettingsField label={t("industryME")}>
+                <SettingsNumberInput value={me} onChange={setME} min={0} max={10} />
+              </SettingsField>
+              <SettingsField label={t("industryTE")}>
+                <SettingsNumberInput value={te} onChange={setTE} min={0} max={20} />
+              </SettingsField>
+              <SettingsField label={t("industryFacilityTax")}>
+                <SettingsNumberInput value={facilityTax} onChange={setFacilityTax} min={0} max={50} step={0.1} />
+              </SettingsField>
+            </SettingsGrid>
+          </div>
 
           {/* After broker: broker fee and sales tax */}
           <div className="mt-3 pt-3 border-t border-eve-border/30">

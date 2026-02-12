@@ -17,6 +17,7 @@ type IndustryParams struct {
 	MaterialEfficiency  int32   // Blueprint ME (0-10)
 	TimeEfficiency      int32   // Blueprint TE (0-20)
 	SystemID            int32   // Manufacturing system
+	StationID           int64   // Optional: specific station/structure for price lookup (0 = region-wide)
 	FacilityTax         float64 // Facility tax % (default 0)
 	StructureBonus      float64 // Structure material bonus % (e.g., 1% for Raitaru)
 	BrokerFee           float64 // Broker fee % when buying materials / product (default 0)

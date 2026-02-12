@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strings"
 
 	"eve-flipper/internal/esi"
 )
@@ -122,6 +123,8 @@ type StationTradeParams struct {
 	LimitBuyToPriceLow bool // Don't buy above P.Low + 10%
 	FlagExtremePrices  bool // Flag anomalous prices
 
+	// --- Authentication ---
+	AccessToken string // For resolving player structure names (optional)
 }
 
 // ScanStationTrades finds profitable same-station trading opportunities.
@@ -353,16 +356,50 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 		}
 	}
 
-	// Fill station names (prefetch all unique station IDs)
+	// Fill station names (prefetch NPC stations and player structures separately)
 	if len(results) > 0 {
 		progress("Fetching station names...")
-		stationIDs := make(map[int64]bool)
+		npcStationIDs := make(map[int64]bool)
+		structureIDs := make(map[int64]bool)
+
+		// Separate NPC stations from player structures
 		for _, r := range results {
-			stationIDs[r.StationID] = true
+			if isPlayerStructureID(r.StationID) {
+				structureIDs[r.StationID] = true
+			} else {
+				npcStationIDs[r.StationID] = true
+			}
 		}
-		s.ESI.PrefetchStationNames(stationIDs)
+
+		// Prefetch NPC station names
+		if len(npcStationIDs) > 0 {
+			s.ESI.PrefetchStationNames(npcStationIDs)
+		}
+
+		// Prefetch player structure names (requires auth token)
+		if len(structureIDs) > 0 && params.AccessToken != "" {
+			s.ESI.PrefetchStructureNames(structureIDs, params.AccessToken)
+		}
+
+		// Resolve all station names and filter out inaccessible structures
+		filtered := make([]StationTrade, 0, len(results))
+		skippedCount := 0
 		for i := range results {
 			results[i].StationName = s.ESI.StationName(results[i].StationID)
+			// Skip player structures that couldn't be resolved (no access + not in EVERef)
+			if isPlayerStructureID(results[i].StationID) &&
+				(results[i].StationName == "" ||
+				 strings.HasPrefix(results[i].StationName, "Structure ") ||
+				 strings.HasPrefix(results[i].StationName, "Location ")) {
+				skippedCount++
+				continue
+			}
+			filtered = append(filtered, results[i])
+		}
+		results = filtered
+		if skippedCount > 0 {
+			log.Printf("[DEBUG] Skipped %d inaccessible player structures", skippedCount)
+			progress(fmt.Sprintf("⚠️ Skipped %d private/inaccessible structures", skippedCount))
 		}
 	}
 

@@ -1081,6 +1081,16 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 		// All stations in region
 		regionIDs[req.RegionID] = true
 		historyLabel = fmt.Sprintf("Region %d (all)", req.RegionID)
+
+		// If including structures, populate stationIDs with all NPC stations in region
+		// so the engine processes both NPC stations AND structures
+		if req.IncludeStructures && len(req.StructureIDs) > 0 {
+			for _, st := range sdeData.Stations {
+				if sys, ok := sdeData.Systems[st.SystemID]; ok && sys.RegionID == req.RegionID {
+					stationIDs[st.ID] = true
+				}
+			}
+		}
 	}
 
 	// Merge player structure IDs if requested
@@ -1092,6 +1102,14 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[API] ScanStation starting: stations=%d, regions=%d, margin=%.1f, tax=%.1f, broker=%.1f",
 		len(stationIDs), len(regionIDs), req.MinMargin, req.SalesTaxPercent, req.BrokerFee)
+
+	// Get auth token if available (for structure name resolution)
+	accessToken := ""
+	if req.IncludeStructures {
+		if token, err := s.sessions.EnsureValidToken(s.sso); err == nil {
+			accessToken = token
+		}
+	}
 
 	startTime := time.Now()
 
@@ -1116,9 +1134,11 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 			MaxSDS:             req.MaxSDS,
 			LimitBuyToPriceLow: req.LimitBuyToPriceLow,
 			FlagExtremePrices:  req.FlagExtremePrices,
+			AccessToken:        accessToken,
 		}
-		// For "all stations in region" mode, pass nil StationIDs
-		if req.StationID == 0 && req.Radius == 0 {
+		// For "all stations in region" mode WITHOUT structures, pass nil StationIDs
+		// (when structures are included, stationIDs contains both NPC stations and structures)
+		if req.StationID == 0 && req.Radius == 0 && !req.IncludeStructures {
 			params.StationIDs = nil
 		}
 
@@ -1136,25 +1156,9 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	durationMs := time.Since(startTime).Milliseconds()
 	log.Printf("[API] ScanStation complete: %d results in %dms", len(allResults), durationMs)
 
-	// Resolve structure names if user is authenticated
-	if req.IncludeStructures {
-		if token, err := s.sessions.EnsureValidToken(s.sso); err == nil {
-			structureIDs := make(map[int64]bool)
-			for _, r := range allResults {
-				if r.StationID >= 100000000 && !(r.StationID >= 60000000 && r.StationID < 64000000) {
-					structureIDs[r.StationID] = true
-				}
-			}
-			if len(structureIDs) > 0 {
-				s.esi.PrefetchStructureNames(structureIDs, token)
-				for i := range allResults {
-					if structureIDs[allResults[i].StationID] {
-						allResults[i].StationName = s.esi.StationName(allResults[i].StationID)
-					}
-				}
-			}
-		}
-	} else {
+	// Filter out player structures if toggle is OFF
+	// (structure names are already resolved inside ScanStationTrades)
+	if !req.IncludeStructures {
 		allResults = filterStationTradesExcludeStructures(allResults)
 	}
 
@@ -1292,7 +1296,13 @@ func (s *Server) handleAuthStructures(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := make([]stationInfo, 0, len(structures))
+	skipped := 0
 	for _, st := range structures {
+		// Skip structures with placeholder names (no access or not in EVERef)
+		if st.Name == "" || strings.HasPrefix(st.Name, "Structure ") || strings.HasPrefix(st.Name, "Location ") {
+			skipped++
+			continue
+		}
 		result = append(result, stationInfo{
 			ID:          st.ID,
 			Name:        st.Name,
@@ -1300,6 +1310,9 @@ func (s *Server) handleAuthStructures(w http.ResponseWriter, r *http.Request) {
 			RegionID:    st.RegionID,
 			IsStructure: true,
 		})
+	}
+	if skipped > 0 {
+		log.Printf("[API] Filtered out %d inaccessible structures from dropdown", skipped)
 	}
 	writeJSON(w, result)
 }
@@ -2014,6 +2027,7 @@ func (s *Server) handleIndustryAnalyze(w http.ResponseWriter, r *http.Request) {
 		MaterialEfficiency int32   `json:"me"`
 		TimeEfficiency     int32   `json:"te"`
 		SystemName         string  `json:"system_name"`
+		StationID          int64   `json:"station_id"` // Optional: specific station/structure for price lookup
 		FacilityTax        float64 `json:"facility_tax"`
 		StructureBonus     float64 `json:"structure_bonus"`
 		BrokerFee          float64 `json:"broker_fee"`
@@ -2053,6 +2067,7 @@ func (s *Server) handleIndustryAnalyze(w http.ResponseWriter, r *http.Request) {
 		MaterialEfficiency: req.MaterialEfficiency,
 		TimeEfficiency:     req.TimeEfficiency,
 		SystemID:           systemID,
+		StationID:          req.StationID,
 		FacilityTax:        req.FacilityTax,
 		StructureBonus:     req.StructureBonus,
 		BrokerFee:          req.BrokerFee,

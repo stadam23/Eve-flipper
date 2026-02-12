@@ -1061,6 +1061,7 @@ export const ru = {
 
     // Player structures
     includeStructures: "Включить структуры игроков",
+    noStationsOrInaccessible: "Нет станций в системе или недоступны",
     noNpcStationsLoginHint: "В этой системе нет NPC станций. Авторизуйтесь через EVE SSO для поиска структур игроков (Цитадель/Фортизар/Кипстар).",
     noNpcStationsToggleHint: "Нет NPC станций. Нажмите иконку структуры для поиска структур игроков.",
     loadingStructures: "Загрузка структур...",
