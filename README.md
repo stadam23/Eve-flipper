@@ -3,6 +3,14 @@
 EVE Flipper is a local-first market analysis platform for EVE Online traders.  
 It combines real-time ESI data, historical market behavior, and execution-aware math to surface actionable opportunities across station trading, regional arbitrage, contracts, routes, industry, and PLEX.
 
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/ilyaux/Eve-flipper)](https://github.com/ilyaux/Eve-flipper/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/ilyaux/Eve-flipper/total)](https://github.com/ilyaux/Eve-flipper/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/ilyaux/Eve-flipper)](https://github.com/ilyaux/Eve-flipper/commits/master)
+
 ## Core Capabilities
 
 ### Trading Scanners
@@ -28,6 +36,12 @@ It combines real-time ESI data, historical market behavior, and execution-aware 
 - EVE SSO integration for wallet/orders/transactions/structures.
 - Portfolio analytics and optimization modules.
 - Undercut monitoring and station-level context.
+
+## Screenshots
+
+| Station Trading | Route Trading | Radius Scan |
+|---|---|---|
+| ![Station Trading](assets/screenshot-station.png) | ![Route Trading](assets/screenshot-routes.png) | ![Radius Scan](assets/screenshot-radius.png) |
 
 ## Architecture
 
