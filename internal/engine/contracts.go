@@ -223,6 +223,17 @@ func fillProbabilityWithinDays(fillDays, horizonDays float64) float64 {
 	return p
 }
 
+func contractCarryDays(holdDays int, estLiqDays float64) float64 {
+	if holdDays <= 0 {
+		return 0
+	}
+	carryDays := float64(holdDays)
+	if estLiqDays > 0 && estLiqDays < carryDays {
+		carryDays = estLiqDays
+	}
+	return carryDays
+}
+
 // itemPriceData holds market data for an item type.
 type itemPriceData struct {
 	MinSellPrice float64 // Cheapest sell order price
@@ -710,7 +721,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			estLiqDays = maxFillDays
 			conservativeGross := expectedGrossByFill * (1.0 - ContractConservativePriceHaircut)
 			conservativeValue = conservativeGross * sellValueMult
-			carryCost = totalCost * ContractDailyCarryRate * float64(holdDays)
+			carryCost = totalCost * ContractDailyCarryRate * contractCarryDays(holdDays, estLiqDays)
 			expectedProfit = conservativeValue - totalCost - carryCost
 			if expectedProfit <= 0 {
 				continue

@@ -194,6 +194,21 @@ func TestFillProbabilityWithinDays_MonotoneAndBounded(t *testing.T) {
 	}
 }
 
+func TestContractCarryDays(t *testing.T) {
+	if got := contractCarryDays(7, 0); got != 7 {
+		t.Fatalf("contractCarryDays(7,0) = %f, want 7", got)
+	}
+	if got := contractCarryDays(7, 3.5); got != 3.5 {
+		t.Fatalf("contractCarryDays(7,3.5) = %f, want 3.5", got)
+	}
+	if got := contractCarryDays(7, 20); got != 7 {
+		t.Fatalf("contractCarryDays(7,20) = %f, want 7", got)
+	}
+	if got := contractCarryDays(0, 3); got != 0 {
+		t.Fatalf("contractCarryDays(0,3) = %f, want 0", got)
+	}
+}
+
 func TestIsRig(t *testing.T) {
 	tests := []struct {
 		name    string
