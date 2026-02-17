@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"testing"
 )
 
@@ -154,6 +155,42 @@ func TestEstimateFillDaysAndProbability(t *testing.T) {
 	// No volume => impossible fill in model.
 	if p0 := fillProbabilityWithinDays(estimateFillDays(10, 0), 7); p0 != 0 {
 		t.Errorf("fillProbabilityWithinDays(no volume) = %v, want 0", p0)
+	}
+}
+
+func TestEstimateFillDays_Monotone(t *testing.T) {
+	fastMarket := estimateFillDays(100, 1_000)
+	slowMarket := estimateFillDays(100, 100)
+	if !(fastMarket < slowMarket) {
+		t.Fatalf("fill days should decrease with higher daily volume: fast=%f slow=%f", fastMarket, slowMarket)
+	}
+
+	smallOrder := estimateFillDays(100, 500)
+	largeOrder := estimateFillDays(500, 500)
+	if !(smallOrder < largeOrder) {
+		t.Fatalf("fill days should increase with quantity: small=%f large=%f", smallOrder, largeOrder)
+	}
+}
+
+func TestFillProbabilityWithinDays_MonotoneAndBounded(t *testing.T) {
+	for _, fillDays := range []float64{1, 3, 7, 30, math.Inf(1)} {
+		prev := -1.0
+		for _, horizon := range []float64{1, 3, 7, 14, 30} {
+			p := fillProbabilityWithinDays(fillDays, horizon)
+			if p < 0 || p > 1 {
+				t.Fatalf("probability out of bounds: fillDays=%f horizon=%f p=%f", fillDays, horizon, p)
+			}
+			if prev > p {
+				t.Fatalf("probability should be non-decreasing with horizon: prev=%f cur=%f", prev, p)
+			}
+			prev = p
+		}
+	}
+
+	short := fillProbabilityWithinDays(5, 7)
+	long := fillProbabilityWithinDays(20, 7)
+	if !(short > long) {
+		t.Fatalf("probability should decrease with slower fill: short=%f long=%f", short, long)
 	}
 }
 

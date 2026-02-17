@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"eve-flipper/internal/esi"
+	"eve-flipper/internal/graph"
+	"eve-flipper/internal/sde"
 )
 
 // buildOrderIndex: cheapest sell per (system, type), highest buy per (system, type).
@@ -125,5 +127,83 @@ func TestSelectClosestRouteRegions(t *testing.T) {
 	}
 	if got[20] || got[40] {
 		t.Fatalf("unexpected farther regions selected: %+v", got)
+	}
+}
+
+func TestSelectClosestRouteRegions_TieBreakByRegionID(t *testing.T) {
+	systemRegion := map[int32]int32{
+		1: 20,
+		2: 10,
+	}
+	systems := map[int32]int{
+		1: 3,
+		2: 3,
+	}
+
+	got := selectClosestRouteRegions(systemRegion, systems, 1)
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1", len(got))
+	}
+	if !got[10] {
+		t.Fatalf("expected lower regionID 10 to win tie-break, got %+v", got)
+	}
+}
+
+func TestFindBestTrades_MathInvariants(t *testing.T) {
+	u := graph.NewUniverse()
+	u.AddGate(1, 2)
+	u.AddGate(2, 1)
+	u.SetRegion(1, 100)
+	u.SetRegion(2, 200)
+	u.SetSecurity(1, 1.0)
+	u.SetSecurity(2, 1.0)
+
+	s := &Scanner{
+		SDE: &sde.Data{
+			Universe: u,
+			Types: map[int32]*sde.ItemType{
+				34: {ID: 34, Name: "Tritanium", Volume: 1},
+				35: {ID: 35, Name: "Pyerite", Volume: 1},
+			},
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Alpha", RegionID: 100, Security: 1.0},
+				2: {ID: 2, Name: "Beta", RegionID: 200, Security: 1.0},
+			},
+		},
+	}
+
+	sellOrders := []esi.MarketOrder{
+		{SystemID: 1, TypeID: 34, Price: 10, VolumeRemain: 100, LocationID: 1001},
+		{SystemID: 1, TypeID: 35, Price: 10, VolumeRemain: 100, LocationID: 1002},
+	}
+	buyOrders := []esi.MarketOrder{
+		{SystemID: 2, TypeID: 34, Price: 15, VolumeRemain: 40, LocationID: 2001},
+		{SystemID: 2, TypeID: 35, Price: 9, VolumeRemain: 100, LocationID: 2002}, // not profitable
+	}
+	idx := buildOrderIndex(sellOrders, buyOrders)
+
+	params := RouteParams{
+		CargoCapacity:    30, // 30 units for volume=1
+		MinMargin:        0,
+		SalesTaxPercent:  0,
+		BrokerFeePercent: 0,
+	}
+
+	hops := s.findBestTrades(idx, 1, params, 10)
+	if len(hops) != 1 {
+		t.Fatalf("len(hops) = %d, want 1", len(hops))
+	}
+	h := hops[0]
+	if h.Profit <= 0 {
+		t.Fatalf("hop profit = %f, want > 0", h.Profit)
+	}
+	if h.Jumps <= 0 || h.Jumps > MaxTradeJumps {
+		t.Fatalf("hop jumps = %d, want in [1,%d]", h.Jumps, MaxTradeJumps)
+	}
+	if h.Units != 30 {
+		t.Fatalf("hop units = %d, want 30", h.Units)
+	}
+	if h.Profit != 150 {
+		t.Fatalf("hop profit = %f, want 150", h.Profit)
 	}
 }

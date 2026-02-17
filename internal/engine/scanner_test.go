@@ -237,3 +237,71 @@ func TestFindSafeExecutionQuantity_NoProfitableQty(t *testing.T) {
 		t.Fatalf("expected profit = %f, want 0", expected)
 	}
 }
+
+func TestHarmonicDailyShare_MonotoneAndBounded(t *testing.T) {
+	const daily = int64(10_000)
+	if got := harmonicDailyShare(0, 5); got != 0 {
+		t.Fatalf("harmonicDailyShare(0, 5) = %d, want 0", got)
+	}
+
+	prev := harmonicDailyShare(daily, 0)
+	if prev != daily {
+		t.Fatalf("harmonicDailyShare(%d,0) = %d, want %d", daily, prev, daily)
+	}
+	for competitors := 1; competitors <= 200; competitors++ {
+		got := harmonicDailyShare(daily, competitors)
+		if got <= 0 || got > daily {
+			t.Fatalf("competitors=%d: share=%d out of bounds [1,%d]", competitors, got, daily)
+		}
+		if got > prev {
+			t.Fatalf("non-monotone share: competitors=%d share=%d > previous=%d", competitors, got, prev)
+		}
+		prev = got
+	}
+}
+
+func TestEstimateSideFlowsPerDay_MonotoneByBuyDepth(t *testing.T) {
+	const (
+		total    = 1_000.0
+		sellBook = int64(1_000)
+		eps      = 1e-9
+	)
+	prevS2B := -1.0
+	prevBfS := total + 1
+
+	for buyDepth := int64(0); buyDepth <= 5_000; buyDepth += 100 {
+		s2b, bfs := estimateSideFlowsPerDay(total, buyDepth, sellBook)
+		if math.Abs((s2b+bfs)-total) > eps {
+			t.Fatalf("mass-balance broken for buyDepth=%d: s2b+bfs=%f, want %f", buyDepth, s2b+bfs, total)
+		}
+		if s2b < prevS2B-eps {
+			t.Fatalf("S2B decreased with higher buy depth: prev=%f, cur=%f", prevS2B, s2b)
+		}
+		if bfs > prevBfS+eps {
+			t.Fatalf("BfS increased with higher buy depth: prev=%f, cur=%f", prevBfS, bfs)
+		}
+		prevS2B = s2b
+		prevBfS = bfs
+	}
+}
+
+func TestExpectedProfitForPlans_LinearAndFeeSensitive(t *testing.T) {
+	planBuy := ExecutionPlanResult{ExpectedPrice: 100}
+	planSell := ExecutionPlanResult{ExpectedPrice: 120}
+
+	p10 := expectedProfitForPlans(planBuy, planSell, 10, 1.01, 0.98)
+	p20 := expectedProfitForPlans(planBuy, planSell, 20, 1.01, 0.98)
+	if math.Abs(p20-2*p10) > 1e-9 {
+		t.Fatalf("linearity broken: p20=%f, want %f", p20, 2*p10)
+	}
+
+	base := expectedProfitForPlans(planBuy, planSell, 10, 1.0, 1.0)
+	higherBuyFees := expectedProfitForPlans(planBuy, planSell, 10, 1.05, 1.0)
+	lowerSellRevenue := expectedProfitForPlans(planBuy, planSell, 10, 1.0, 0.95)
+	if higherBuyFees >= base {
+		t.Fatalf("profit should decrease with higher buy fees: base=%f highBuyFee=%f", base, higherBuyFees)
+	}
+	if lowerSellRevenue >= base {
+		t.Fatalf("profit should decrease with lower sell revenue: base=%f lowSellRev=%f", base, lowerSellRevenue)
+	}
+}
