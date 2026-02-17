@@ -169,3 +169,37 @@ func TestCalcCTS_Bounds(t *testing.T) {
 		t.Errorf("CalcCTS should be in [0,100] range, got %v", got)
 	}
 }
+
+func TestCalcCTS_MonotoneCoreFactors(t *testing.T) {
+	base := CalcCTS(20, 0.5, 20, 20, 20, 100)
+	higherROI := CalcCTS(60, 0.5, 20, 20, 20, 100)
+	if higherROI <= base {
+		t.Errorf("CTS should increase with spread ROI: base=%v higherROI=%v", base, higherROI)
+	}
+
+	lowerRisk := CalcCTS(20, 0.5, 20, 20, 10, 100)
+	if lowerRisk <= base {
+		t.Errorf("CTS should increase when SDS decreases: base=%v lowerRisk=%v", base, lowerRisk)
+	}
+
+	higherVolume := CalcCTS(20, 0.5, 20, 20, 20, 2000)
+	if higherVolume <= base {
+		t.Errorf("CTS should increase with daily volume: base=%v higherVolume=%v", base, higherVolume)
+	}
+}
+
+func TestAvgDailyVolume_UsesWindow(t *testing.T) {
+	old := time.Now().AddDate(0, 0, -20).Format("2006-01-02")
+	d1 := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
+	d2 := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	history := []esi.HistoryEntry{
+		{Date: old, Volume: 10_000},
+		{Date: d1, Volume: 100},
+		{Date: d2, Volume: 300},
+	}
+	got := avgDailyVolume(history, 7)
+	want := (100.0 + 300.0) / 2.0
+	if math.Abs(got-want) > 1e-9 {
+		t.Errorf("avgDailyVolume(7d) = %v, want %v", got, want)
+	}
+}

@@ -10,6 +10,12 @@ import (
 	"eve-flipper/internal/esi"
 )
 
+const (
+	stationFlowWindowDays       = 7
+	stationVWAPWindowDays       = 30
+	stationVolatilityWindowDays = 30
+)
+
 // StationTrade represents a same-station flip opportunity (buy via buy order, sell via sell order).
 type StationTrade struct {
 	TypeID         int32   `json:"TypeID"`
@@ -160,6 +166,10 @@ func stationExecutionDesiredQtyFromDailyShare(dailyShare int64, buyVolume, sellV
 		return 0
 	}
 	return stationExecutionDesiredQty(dailyShare, buyVolume, sellVolume)
+}
+
+func stationFlowPerDay(entries []esi.HistoryEntry) float64 {
+	return avgDailyVolume(entries, stationFlowWindowDays)
 }
 
 // StationTradeParams holds input parameters for station trading scan.
@@ -350,7 +360,8 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 		// OBDS denominator should reflect actionable cycle capital, not full
 		// long-tail book not touched by this strategy.
 		tradableUnits := minInt32(totalBuyVol, totalSellVol)
-		obdsCapital := effectiveBuy * float64(tradableUnits)
+		// Keep OBDS denominator in raw order-book ISK units (same unit as depth).
+		obdsCapital := costToBuy * float64(tradableUnits)
 		if obdsCapital <= 0 {
 			obdsCapital = capitalRequired
 		}
@@ -672,13 +683,21 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		r := <-ch
 		idx := r.idx
 
-		// Basic history stats
-		results[idx].DailyVolume = r.stats.DailyVolume
 		results[idx].HistoryAvailable = r.historyAvailable
+		if len(r.entries) == 0 {
+			results[idx].DailyVolume = 0
+			results[idx].DailyProfit = 0
+			results[idx].TotalProfit = 0
+			continue
+		}
+
+		// Use one consistent flow window for all throughput-dependent metrics.
+		flowPerDay := stationFlowPerDay(r.entries)
+		results[idx].DailyVolume = int64(math.Round(flowPerDay))
 		// Estimate cycle-constrained daily share from both sides:
 		// buy-order fills from S2B flow and sell-order fills from BfS flow.
 		s2bForShare, bfsForShare := estimateSideFlowsPerDay(
-			float64(r.stats.DailyVolume),
+			flowPerDay,
 			int64(results[idx].BuyVolume),
 			int64(results[idx].SellVolume),
 		)
@@ -728,15 +747,11 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 			}
 		}
 
-		if len(r.entries) == 0 {
-			continue
-		}
-
 		// Calculate VWAP (30 days)
-		results[idx].VWAP = sanitizeFloat(CalcVWAP(r.entries, 30))
+		results[idx].VWAP = sanitizeFloat(CalcVWAP(r.entries, stationVWAPWindowDays))
 
 		// Calculate DRVI (30 days)
-		results[idx].PVI = sanitizeFloat(CalcDRVI(r.entries, 30))
+		results[idx].PVI = sanitizeFloat(CalcDRVI(r.entries, stationVolatilityWindowDays))
 
 		// Calculate spread ROI (typical buy-sell spread over the period)
 		results[idx].PeriodROI = sanitizeFloat(CalcSpreadROI(r.entries, avgPeriod))
@@ -748,12 +763,11 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		results[idx].PriceLow = sanitizeFloat(low)
 
 		// Calculate Buy/Sell Units per Day from market history
-		dailyVol := avgDailyVolume(r.entries, 7)
-		results[idx].BuyUnitsPerDay = dailyVol
+		results[idx].BuyUnitsPerDay = flowPerDay
 
 		// SellUnitsPerDay is derived symmetrically from book imbalance.
 		results[idx].SellUnitsPerDay = estimateSellUnitsPerDay(
-			dailyVol,
+			flowPerDay,
 			results[idx].BuyVolume,
 			results[idx].SellVolume,
 		)
@@ -764,7 +778,7 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		}
 		// A4E-style aliases with mass-balance: S2B + BfS = traded flow.
 		s2b, bfs := estimateSideFlowsPerDay(
-			dailyVol,
+			flowPerDay,
 			int64(results[idx].BuyVolume),
 			int64(results[idx].SellVolume),
 		)
@@ -798,7 +812,7 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 			results[idx].PVI,
 			results[idx].CI,
 			results[idx].SDS,
-			results[idx].BuyUnitsPerDay,
+			flowPerDay,
 		))
 
 	}
