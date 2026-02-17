@@ -169,6 +169,10 @@ type scanIndex struct {
 	sellCounts map[locKey]int
 	buyByType  map[int32][]buyInfo // all buy orders grouped by typeID
 	buyCounts  map[locKey]int
+	// Sell-side market depth (the market where we liquidate and where history is read).
+	// Used for S2B/BfS split so both sides come from the same market context.
+	sellSideBuyDepthByType  map[int32]int64
+	sellSideSellDepthByType map[int32]int64
 	// Raw orders kept for execution plan (indexed by location+type).
 	sellOrders []esi.MarketOrder
 	buyOrders  []esi.MarketOrder
@@ -253,16 +257,20 @@ func (s *Scanner) fetchAndIndex(
 ) *scanIndex {
 	sellCh := s.fetchOrdersStream(buyRegions, "sell", buySystems)
 	buyCh := s.fetchOrdersStream(sellRegions, "buy", sellSystems)
+	// Additional sell-side sell-book stream for mathematically consistent S2B/BfS split.
+	sellSideSellCh := s.fetchOrdersStream(sellRegions, "sell", sellSystems)
 
 	idx := &scanIndex{
-		sellByType: make(map[int32][]sellInfo),
-		sellCounts: make(map[locKey]int),
-		buyByType:  make(map[int32][]buyInfo),
-		buyCounts:  make(map[locKey]int),
+		sellByType:              make(map[int32][]sellInfo),
+		sellCounts:              make(map[locKey]int),
+		buyByType:               make(map[int32][]buyInfo),
+		buyCounts:               make(map[locKey]int),
+		sellSideBuyDepthByType:  make(map[int32]int64),
+		sellSideSellDepthByType: make(map[int32]int64),
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
 	// Consumer 1: collect all sell orders grouped by type
 	go func() {
@@ -292,6 +300,7 @@ func (s *Scanner) fetchAndIndex(
 			idx.buyOrders = append(idx.buyOrders, batch...)
 			for _, o := range batch {
 				idx.buyCounts[locKey{o.TypeID, o.LocationID}]++
+				idx.sellSideBuyDepthByType[o.TypeID] += int64(o.VolumeRemain)
 				idx.buyByType[o.TypeID] = append(idx.buyByType[o.TypeID], buyInfo{
 					Price: o.Price, VolumeRemain: o.VolumeRemain,
 					LocationID: o.LocationID, SystemID: o.SystemID,
@@ -301,6 +310,16 @@ func (s *Scanner) fetchAndIndex(
 		for tid, buys := range idx.buyByType {
 			for i := range buys {
 				buys[i].OrderCount = idx.buyCounts[locKey{tid, buys[i].LocationID}]
+			}
+		}
+	}()
+
+	// Consumer 3: collect sell-side sell-book depth by type (for side-flow split only).
+	go func() {
+		defer wg.Done()
+		for batch := range sellSideSellCh {
+			for _, o := range batch {
+				idx.sellSideSellDepthByType[o.TypeID] += int64(o.VolumeRemain)
 			}
 		}
 	}()
@@ -593,9 +612,30 @@ func (s *Scanner) calculateResults(
 			if safeQty <= 0 {
 				continue
 			}
+			effectiveBuyPerUnit := planBuy.ExpectedPrice * buyCostMult
+			if effectiveBuyPerUnit <= 0 {
+				continue
+			}
+			execProfitPerUnit := expectedProfit / float64(safeQty)
+			if execProfitPerUnit <= 0 {
+				continue
+			}
+			realMarginPct := sanitizeFloat(execProfitPerUnit / effectiveBuyPerUnit * 100)
+			// Enforce user margin threshold on execution-aware economics, not top-book fantasy.
+			if realMarginPct < params.MinMargin {
+				continue
+			}
+			// Slippage can move actual required buy-side capital above pre-filter estimate.
+			if params.MaxInvestment > 0 {
+				execBuyCost := planBuy.TotalCost * buyCostMult
+				if execBuyCost > params.MaxInvestment {
+					continue
+				}
+			}
 
 			r.FilledQty = safeQty
 			r.CanFill = safeQty >= requestedQty
+			r.RealMarginPercent = realMarginPct
 
 			if safeQty != requestedQty {
 				r.UnitsToBuy = safeQty
@@ -660,12 +700,12 @@ func (s *Scanner) calculateResults(
 	s.enrichWithHistory(results, progress)
 
 	// Derive A4E-style tradability proxies from daily traded flow and current
-	// book imbalance for this specific buy->sell pair.
+	// sell-side market imbalance (same market context as history).
 	for i := range results {
 		s2b, bfs := estimateSideFlowsPerDay(
 			float64(results[i].DailyVolume),
-			results[i].BuyOrderRemain,
-			results[i].SellOrderRemain,
+			idx.sellSideBuyDepthByType[results[i].TypeID],
+			idx.sellSideSellDepthByType[results[i].TypeID],
 		)
 		results[i].S2BPerDay = sanitizeFloat(s2b)
 		results[i].BfSPerDay = sanitizeFloat(bfs)
@@ -685,13 +725,27 @@ func (s *Scanner) calculateResults(
 			}
 		}
 		profitPerUnit := results[i].ProfitPerUnit
-		if results[i].FilledQty > 0 && results[i].RealProfit > 0 {
+		if results[i].FilledQty > 0 {
 			profitPerUnit = results[i].RealProfit / float64(results[i].FilledQty)
 		}
 		results[i].DailyProfit = profitPerUnit * float64(sellablePerDay)
 	}
 
 	// Post-filter: min daily volume
+	needsHistory := params.MinDailyVolume > 0 ||
+		params.MinS2BPerDay > 0 ||
+		params.MinBfSPerDay > 0 ||
+		params.MinS2BBfSRatio > 0 ||
+		params.MaxS2BBfSRatio > 0
+	if needsHistory {
+		filtered := make([]FlipResult, 0, len(results))
+		for _, r := range results {
+			if r.HistoryAvailable {
+				filtered = append(filtered, r)
+			}
+		}
+		results = filtered
+	}
 	if params.MinDailyVolume > 0 {
 		filtered := make([]FlipResult, 0, len(results))
 		for _, r := range results {
@@ -814,7 +868,7 @@ func harmonicDailyShare(dailyVolume int64, competitors int) int64 {
 // estimateSideFlowsPerDay splits total traded daily flow into S2B and BfS parts
 // using current book imbalance as a proxy for aggressor-side pressure.
 // It preserves mass-balance: S2B + BfS = totalPerDay.
-func estimateSideFlowsPerDay(totalPerDay float64, buyDepth, sellDepth int32) (float64, float64) {
+func estimateSideFlowsPerDay(totalPerDay float64, buyDepth, sellDepth int64) (float64, float64) {
 	if totalPerDay <= 0 {
 		return 0, 0
 	}
@@ -981,8 +1035,9 @@ func (s *Scanner) enrichWithHistory(results []FlipResult, progress func(string))
 
 	// Fetch history concurrently (limited)
 	type histResult struct {
-		idx   int
-		stats esi.MarketStats
+		idx              int
+		stats            esi.MarketStats
+		historyAvailable bool
 	}
 	ch := make(chan histResult, totalNeeds)
 	sem := make(chan struct{}, 10) // limit concurrent history requests
@@ -999,16 +1054,21 @@ func (s *Scanner) enrichWithHistory(results []FlipResult, progress func(string))
 				entries, err = s.ESI.FetchMarketHistory(k.regionID, k.typeID)
 				if err != nil {
 					for _, n := range ns {
-						ch <- histResult{n.idx, esi.MarketStats{}}
+						ch <- histResult{idx: n.idx}
 					}
 					return
 				}
 				s.History.SetMarketHistory(k.regionID, k.typeID, entries)
 			}
+			historyAvailable := len(entries) > 0
 
 			for _, n := range ns {
 				stats := esi.ComputeMarketStats(entries, n.totalListed)
-				ch <- histResult{n.idx, stats}
+				ch <- histResult{
+					idx:              n.idx,
+					stats:            stats,
+					historyAvailable: historyAvailable,
+				}
 			}
 		}(key, needs)
 	}
@@ -1018,5 +1078,6 @@ func (s *Scanner) enrichWithHistory(results []FlipResult, progress func(string))
 		results[r.idx].DailyVolume = r.stats.DailyVolume
 		results[r.idx].Velocity = sanitizeFloat(r.stats.Velocity)
 		results[r.idx].PriceTrend = sanitizeFloat(r.stats.PriceTrend)
+		results[r.idx].HistoryAvailable = r.historyAvailable
 	}
 }

@@ -67,7 +67,13 @@ func TestDB_FlipResultsRoundTrip(t *testing.T) {
 			BuyPrice: 90, SellPrice: 100,
 			ProfitPerUnit: 10, MarginPercent: 11.11,
 			UnitsToBuy: 50, TotalProfit: 500,
-			BuyStation: "A", SellStation: "B",
+			DailyVolume: 1000, S2BPerDay: 520, BfSPerDay: 480, S2BBfSRatio: 1.0833,
+			DailyProfit: 120, RealProfit: 110, RealMarginPercent: 9.9,
+			FilledQty: 11, CanFill: true,
+			ExpectedProfit: 110, ExpectedBuyPrice: 91, ExpectedSellPrice: 101,
+			SlippageBuyPct: 0.15, SlippageSellPct: 0.12,
+			HistoryAvailable: true,
+			BuyStation:       "A", SellStation: "B",
 			BuySystemName: "Sys1", SellSystemName: "Sys2",
 			BuySystemID: 1, SellSystemID: 2,
 			BuyOrderRemain: 100, SellOrderRemain: 200,
@@ -92,6 +98,12 @@ func TestDB_FlipResultsRoundTrip(t *testing.T) {
 	}
 	if r.UnitsToBuy != 50 {
 		t.Errorf("UnitsToBuy = %d", r.UnitsToBuy)
+	}
+	if !r.HistoryAvailable || !r.CanFill {
+		t.Errorf("HistoryAvailable/CanFill = %v/%v, want true/true", r.HistoryAvailable, r.CanFill)
+	}
+	if r.S2BPerDay <= 0 || r.BfSPerDay <= 0 || r.S2BBfSRatio <= 0 {
+		t.Errorf("S2B/BfS fields = %v/%v/%v, want >0", r.S2BPerDay, r.BfSPerDay, r.S2BBfSRatio)
 	}
 }
 
@@ -186,6 +198,7 @@ func TestDB_Migrate_StationResultsHasExecutionColumns(t *testing.T) {
 	wantCols := []string{
 		"daily_profit",
 		"real_profit",
+		"real_margin_percent",
 		"filled_qty",
 		"can_fill",
 		"expected_profit",
@@ -193,10 +206,62 @@ func TestDB_Migrate_StationResultsHasExecutionColumns(t *testing.T) {
 		"expected_sell_price",
 		"slippage_buy_pct",
 		"slippage_sell_pct",
+		"s2b_per_day",
+		"bfs_per_day",
+		"s2b_bfs_ratio",
+		"history_available",
 	}
 	for _, col := range wantCols {
 		if !have[col] {
 			t.Errorf("station_results missing column %q", col)
+		}
+	}
+}
+
+func TestDB_Migrate_FlipResultsHasLiquidityAndExecutionColumns(t *testing.T) {
+	d := openTestDB(t)
+	defer d.Close()
+
+	rows, err := d.sql.Query("PRAGMA table_info(flip_results)")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(flip_results): %v", err)
+	}
+	defer rows.Close()
+
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan pragma row: %v", err)
+		}
+		have[name] = true
+	}
+
+	wantCols := []string{
+		"daily_volume",
+		"velocity",
+		"price_trend",
+		"s2b_per_day",
+		"bfs_per_day",
+		"s2b_bfs_ratio",
+		"daily_profit",
+		"real_profit",
+		"real_margin_percent",
+		"filled_qty",
+		"can_fill",
+		"expected_profit",
+		"expected_buy_price",
+		"expected_sell_price",
+		"slippage_buy_pct",
+		"slippage_sell_pct",
+		"history_available",
+	}
+	for _, col := range wantCols {
+		if !have[col] {
+			t.Errorf("flip_results missing column %q", col)
 		}
 	}
 }

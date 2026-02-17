@@ -650,7 +650,85 @@ func (d *DB) migrate() error {
 		logger.Info("DB", "Applied migration v16 (user-scoped auth/config/watchlist/alerts)")
 	}
 
+	if version < 17 {
+		flipCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "daily_volume", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "velocity", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "price_trend", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "s2b_per_day", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "bfs_per_day", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "s2b_bfs_ratio", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "daily_profit", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "real_profit", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "real_margin_percent", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "filled_qty", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "can_fill", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "expected_profit", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "expected_buy_price", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "expected_sell_price", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "slippage_buy_pct", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "slippage_sell_pct", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "history_available", def: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		flipResultsExists, err := d.tableExists("flip_results")
+		if err != nil {
+			return fmt.Errorf("migration v17 check flip_results exists: %w", err)
+		}
+		if flipResultsExists {
+			for _, c := range flipCols {
+				if err := d.ensureTableColumn("flip_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v17 add flip_results.%s: %w", c.name, err)
+				}
+			}
+		}
+
+		stationCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "s2b_per_day", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "bfs_per_day", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "s2b_bfs_ratio", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "real_margin_percent", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "history_available", def: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		stationResultsExists, err := d.tableExists("station_results")
+		if err != nil {
+			return fmt.Errorf("migration v17 check station_results exists: %w", err)
+		}
+		if stationResultsExists {
+			for _, c := range stationCols {
+				if err := d.ensureTableColumn("station_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v17 add station_results.%s: %w", c.name, err)
+				}
+			}
+		}
+
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (17);`); err != nil {
+			return fmt.Errorf("migration v17: %w", err)
+		}
+		logger.Info("DB", "Applied migration v17 (scan history liquidity + execution fields)")
+	}
+
 	return nil
+}
+
+func (d *DB) tableExists(tableName string) (bool, error) {
+	var name string
+	err := d.sql.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`,
+		tableName,
+	).Scan(&name)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (d *DB) ensureTableColumn(tableName, columnName, columnDef string) error {

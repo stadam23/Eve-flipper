@@ -33,6 +33,8 @@ export interface FlipResult {
   S2BPerDay?: number;
   BfSPerDay?: number;
   S2BBfSRatio?: number;
+  RealMarginPercent?: number;
+  HistoryAvailable?: boolean;
   BuyCompetitors: number;
   SellCompetitors: number;
   DailyProfit: number;
@@ -190,6 +192,8 @@ export interface StationTrade {
   S2BPerDay?: number;
   BfSPerDay?: number;
   S2BBfSRatio?: number;
+  RealMarginPercent?: number;
+  HistoryAvailable?: boolean;
   DOS: number;
   VWAP: number;
   PVI: number;

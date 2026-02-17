@@ -48,3 +48,63 @@ func TestStationExecutionDesiredQty(t *testing.T) {
 		t.Fatalf("zero depth desired qty = %d, want 0", got)
 	}
 }
+
+func TestEstimateSideFlowsPerDay_MassBalance(t *testing.T) {
+	total := 100.0
+	s2b, bfs := estimateSideFlowsPerDay(total, 600, 400)
+	if s2b <= 0 || bfs <= 0 {
+		t.Fatalf("flows should be positive, got s2b=%v bfs=%v", s2b, bfs)
+	}
+	gotTotal := s2b + bfs
+	if gotTotal != total {
+		t.Fatalf("mass-balance violated: s2b+bfs=%v, want %v", gotTotal, total)
+	}
+
+	halfS2B, halfBfS := estimateSideFlowsPerDay(total, 0, 0)
+	if halfS2B != 50 || halfBfS != 50 {
+		t.Fatalf("zero-depth split = %v/%v, want 50/50", halfS2B, halfBfS)
+	}
+}
+
+func TestApplyStationTradeFilters_UsesExecutionAwareMarginsAndHistory(t *testing.T) {
+	rows := []StationTrade{
+		{
+			TypeID:            1,
+			MarginPercent:     20,
+			RealMarginPercent: 2,
+			ProfitPerUnit:     10_000,
+			RealProfit:        1000,
+			FilledQty:         1000,
+			DailyVolume:       200,
+			S2BPerDay:         100,
+			BfSPerDay:         100,
+			S2BBfSRatio:       1,
+			HistoryAvailable:  true,
+		},
+	}
+	params := StationTradeParams{
+		MinMargin:      5,
+		MinDailyVolume: 10,
+	}
+	out := applyStationTradeFilters(rows, params)
+	if len(out) != 0 {
+		t.Fatalf("expected row to be dropped by RealMarginPercent, got %d rows", len(out))
+	}
+
+	rows[0].RealMarginPercent = 8
+	rows[0].HistoryAvailable = false
+	out = applyStationTradeFilters(rows, params)
+	if len(out) != 0 {
+		t.Fatalf("expected row to be dropped by missing history, got %d rows", len(out))
+	}
+
+	rows[0].HistoryAvailable = true
+	rows[0].RealMarginPercent = -1
+	rows[0].FilledQty = 100
+	rows[0].RealProfit = -500
+	params.MinItemProfit = 1
+	out = applyStationTradeFilters(rows, params)
+	if len(out) != 0 {
+		t.Fatalf("expected row to be dropped by execution-aware negative margin/profit, got %d rows", len(out))
+	}
+}

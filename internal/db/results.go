@@ -23,8 +23,13 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 		sell_price, sell_station, sell_system_name, sell_system_id,
 		profit_per_unit, margin_percent, units_to_buy,
 		buy_order_remain, sell_order_remain,
-		total_profit, profit_per_jump, buy_jumps, sell_jumps, total_jumps
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		total_profit, profit_per_jump, buy_jumps, sell_jumps, total_jumps,
+		daily_volume, velocity, price_trend,
+		s2b_per_day, bfs_per_day, s2b_bfs_ratio,
+		daily_profit, real_profit, real_margin_percent, filled_qty, can_fill,
+		expected_profit, expected_buy_price, expected_sell_price,
+		slippage_buy_pct, slippage_sell_pct, history_available
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("[DB] InsertFlipResults prepare: %v", err)
@@ -33,6 +38,14 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 	defer stmt.Close()
 
 	for _, r := range results {
+		canFill := 0
+		if r.CanFill {
+			canFill = 1
+		}
+		historyAvailable := 0
+		if r.HistoryAvailable {
+			historyAvailable = 1
+		}
 		stmt.Exec(
 			scanID, r.TypeID, r.TypeName, r.Volume,
 			r.BuyPrice, r.BuyStation, r.BuySystemName, r.BuySystemID,
@@ -40,6 +53,11 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 			r.ProfitPerUnit, r.MarginPercent, r.UnitsToBuy,
 			r.BuyOrderRemain, r.SellOrderRemain,
 			r.TotalProfit, r.ProfitPerJump, r.BuyJumps, r.SellJumps, r.TotalJumps,
+			r.DailyVolume, r.Velocity, r.PriceTrend,
+			r.S2BPerDay, r.BfSPerDay, r.S2BBfSRatio,
+			r.DailyProfit, r.RealProfit, r.RealMarginPercent, r.FilledQty, canFill,
+			r.ExpectedProfit, r.ExpectedBuyPrice, r.ExpectedSellPrice,
+			r.SlippageBuyPct, r.SlippageSellPct, historyAvailable,
 		)
 	}
 
@@ -56,7 +74,12 @@ func (d *DB) GetFlipResults(scanID int64) []engine.FlipResult {
 			sell_price, sell_station, sell_system_name, sell_system_id,
 			profit_per_unit, margin_percent, units_to_buy,
 			buy_order_remain, sell_order_remain,
-			total_profit, profit_per_jump, buy_jumps, sell_jumps, total_jumps
+			total_profit, profit_per_jump, buy_jumps, sell_jumps, total_jumps,
+			daily_volume, velocity, price_trend,
+			s2b_per_day, bfs_per_day, s2b_bfs_ratio,
+			daily_profit, real_profit, real_margin_percent, filled_qty, can_fill,
+			expected_profit, expected_buy_price, expected_sell_price,
+			slippage_buy_pct, slippage_sell_pct, history_available
 		FROM flip_results WHERE scan_id = ?
 	`, scanID)
 	if err != nil {
@@ -67,6 +90,8 @@ func (d *DB) GetFlipResults(scanID int64) []engine.FlipResult {
 	var results []engine.FlipResult
 	for rows.Next() {
 		var r engine.FlipResult
+		var canFill int
+		var historyAvailable int
 		rows.Scan(
 			&r.TypeID, &r.TypeName, &r.Volume,
 			&r.BuyPrice, &r.BuyStation, &r.BuySystemName, &r.BuySystemID,
@@ -74,7 +99,14 @@ func (d *DB) GetFlipResults(scanID int64) []engine.FlipResult {
 			&r.ProfitPerUnit, &r.MarginPercent, &r.UnitsToBuy,
 			&r.BuyOrderRemain, &r.SellOrderRemain,
 			&r.TotalProfit, &r.ProfitPerJump, &r.BuyJumps, &r.SellJumps, &r.TotalJumps,
+			&r.DailyVolume, &r.Velocity, &r.PriceTrend,
+			&r.S2BPerDay, &r.BfSPerDay, &r.S2BBfSRatio,
+			&r.DailyProfit, &r.RealProfit, &r.RealMarginPercent, &r.FilledQty, &canFill,
+			&r.ExpectedProfit, &r.ExpectedBuyPrice, &r.ExpectedSellPrice,
+			&r.SlippageBuyPct, &r.SlippageSellPct, &historyAvailable,
 		)
+		r.CanFill = canFill != 0
+		r.HistoryAvailable = historyAvailable != 0
 		results = append(results, r)
 	}
 	return results
@@ -168,10 +200,11 @@ func (d *DB) InsertStationResults(scanID int64, results []engine.StationTrade) {
 		margin, margin_pct, volume, buy_volume, sell_volume,
 		station_id, station_name, cts, sds, period_roi,
 		vwap, pvi, obds, bvs_ratio, dos,
+		s2b_per_day, bfs_per_day, s2b_bfs_ratio, real_margin_percent, history_available,
 		daily_profit, real_profit, filled_qty, can_fill,
 		expected_profit, expected_buy_price, expected_sell_price,
 		slippage_buy_pct, slippage_sell_pct
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("[DB] InsertStationResults prepare: %v", err)
@@ -184,11 +217,16 @@ func (d *DB) InsertStationResults(scanID int64, results []engine.StationTrade) {
 		if r.CanFill {
 			canFill = 1
 		}
+		historyAvailable := 0
+		if r.HistoryAvailable {
+			historyAvailable = 1
+		}
 		stmt.Exec(
 			scanID, r.TypeID, r.TypeName, r.BuyPrice, r.SellPrice,
 			r.Spread, r.MarginPercent, r.DailyVolume, r.BuyVolume, r.SellVolume,
 			r.StationID, r.StationName, r.CTS, r.SDS, r.PeriodROI,
 			r.VWAP, r.PVI, r.OBDS, r.BvSRatio, r.DOS,
+			r.S2BPerDay, r.BfSPerDay, r.S2BBfSRatio, r.RealMarginPercent, historyAvailable,
 			r.DailyProfit, r.RealProfit, r.FilledQty, canFill,
 			r.ExpectedProfit, r.ExpectedBuyPrice, r.ExpectedSellPrice,
 			r.SlippageBuyPct, r.SlippageSellPct,
@@ -207,6 +245,7 @@ func (d *DB) GetStationResults(scanID int64) []engine.StationTrade {
 			margin, margin_pct, volume, buy_volume, sell_volume,
 			station_id, station_name, cts, sds, period_roi,
 			vwap, pvi, obds, bvs_ratio, dos,
+			s2b_per_day, bfs_per_day, s2b_bfs_ratio, real_margin_percent, history_available,
 			daily_profit, real_profit, filled_qty, can_fill,
 			expected_profit, expected_buy_price, expected_sell_price,
 			slippage_buy_pct, slippage_sell_pct
@@ -221,16 +260,19 @@ func (d *DB) GetStationResults(scanID int64) []engine.StationTrade {
 	for rows.Next() {
 		var r engine.StationTrade
 		var canFill int
+		var historyAvailable int
 		rows.Scan(
 			&r.TypeID, &r.TypeName, &r.BuyPrice, &r.SellPrice,
 			&r.Spread, &r.MarginPercent, &r.DailyVolume, &r.BuyVolume, &r.SellVolume,
 			&r.StationID, &r.StationName, &r.CTS, &r.SDS, &r.PeriodROI,
 			&r.VWAP, &r.PVI, &r.OBDS, &r.BvSRatio, &r.DOS,
+			&r.S2BPerDay, &r.BfSPerDay, &r.S2BBfSRatio, &r.RealMarginPercent, &historyAvailable,
 			&r.DailyProfit, &r.RealProfit, &r.FilledQty, &canFill,
 			&r.ExpectedProfit, &r.ExpectedBuyPrice, &r.ExpectedSellPrice,
 			&r.SlippageBuyPct, &r.SlippageSellPct,
 		)
 		r.CanFill = canFill != 0
+		r.HistoryAvailable = historyAvailable != 0
 		results = append(results, r)
 	}
 	return results

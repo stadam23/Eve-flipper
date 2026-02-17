@@ -27,9 +27,13 @@ type StationTrade struct {
 	SellVolume     int32   `json:"SellVolume"` // total volume of sell orders
 	TotalProfit    float64 `json:"TotalProfit"`
 	DailyProfit    float64 `json:"DailyProfit"` // estimated executable daily profit
-	ROI            float64 `json:"ROI"`         // profit / investment * 100
-	StationName    string  `json:"StationName"`
-	StationID      int64   `json:"StationID"`
+	// Execution-aware effective margin after slippage and fees.
+	RealMarginPercent float64 `json:"RealMarginPercent,omitempty"`
+	// True when market history for this type/region was fetched successfully.
+	HistoryAvailable bool    `json:"HistoryAvailable"`
+	ROI              float64 `json:"ROI"` // profit / investment * 100
+	StationName      string  `json:"StationName"`
+	StationID        int64   `json:"StationID"`
 
 	// --- EVE Guru style metrics ---
 	CapitalRequired float64 `json:"CapitalRequired"` // Sum of all buy orders ISK
@@ -105,6 +109,13 @@ type orderGroup struct {
 }
 
 func minInt32(a, b int32) int32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func minInt64(a, b int64) int64 {
 	if a < b {
 		return a
 	}
@@ -481,11 +492,44 @@ func applyStationTradeFilters(results []StationTrade, params StationTradeParams)
 	if params.MinDemandPerDay > minS2B {
 		minS2B = params.MinDemandPerDay
 	}
+	needsHistory := params.MinDailyVolume > 0 ||
+		minS2B > 0 ||
+		params.MinBfSPerDay > 0 ||
+		params.MinPeriodROI > 0 ||
+		params.BvSRatioMin > 0 ||
+		params.BvSRatioMax > 0 ||
+		params.MaxPVI > 0 ||
+		params.MaxSDS > 0 ||
+		params.LimitBuyToPriceLow
 
 	// Debug counters
-	var dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice int
+	var dropHistory, dropMargin, dropItemProfit, dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice int
 
 	for _, r := range results {
+		if needsHistory && !r.HistoryAvailable {
+			dropHistory++
+			continue
+		}
+		// Enforce execution-aware margin threshold.
+		effectiveMargin := r.MarginPercent
+		if r.FilledQty > 0 {
+			effectiveMargin = r.RealMarginPercent
+		}
+		if params.MinMargin > 0 && effectiveMargin < params.MinMargin {
+			dropMargin++
+			continue
+		}
+		// Re-validate min item profit on execution-aware economics.
+		if params.MinItemProfit > 0 {
+			profitPerUnit := r.ProfitPerUnit
+			if r.FilledQty > 0 {
+				profitPerUnit = r.RealProfit / float64(r.FilledQty)
+			}
+			if profitPerUnit < params.MinItemProfit {
+				dropItemProfit++
+				continue
+			}
+		}
 		// Min daily volume
 		if params.MinDailyVolume > 0 && r.DailyVolume < params.MinDailyVolume {
 			dropVol++
@@ -537,8 +581,8 @@ func applyStationTradeFilters(results []StationTrade, params StationTradeParams)
 	}
 
 	if len(results) != len(filtered) {
-		log.Printf("[DEBUG] StationFilter drops: vol=%d s2b=%d bfs=%d roi=%d bvs=%d pvi=%d sds=%d price=%d",
-			dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice)
+		log.Printf("[DEBUG] StationFilter drops: history=%d margin=%d item_profit=%d vol=%d s2b=%d bfs=%d roi=%d bvs=%d pvi=%d sds=%d price=%d",
+			dropHistory, dropMargin, dropItemProfit, dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice)
 	}
 
 	return filtered
@@ -568,9 +612,10 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 	})
 
 	type histResult struct {
-		idx     int
-		entries []esi.HistoryEntry
-		stats   esi.MarketStats
+		idx              int
+		entries          []esi.HistoryEntry
+		stats            esi.MarketStats
+		historyAvailable bool
 	}
 	ch := make(chan histResult, len(results))
 	sem := make(chan struct{}, 20)
@@ -585,7 +630,7 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 				var err error
 				entries, err = s.ESI.FetchMarketHistory(regionID, results[idx].TypeID)
 				if err != nil {
-					ch <- histResult{idx, nil, esi.MarketStats{}}
+					ch <- histResult{idx: idx}
 					return
 				}
 				s.History.SetMarketHistory(regionID, results[idx].TypeID, entries)
@@ -593,7 +638,12 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 
 			totalListed := results[idx].BuyVolume + results[idx].SellVolume
 			stats := esi.ComputeMarketStats(entries, totalListed)
-			ch <- histResult{idx, entries, stats}
+			ch <- histResult{
+				idx:              idx,
+				entries:          entries,
+				stats:            stats,
+				historyAvailable: len(entries) > 0,
+			}
 		}(i)
 	}
 
@@ -605,9 +655,17 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 
 		// Basic history stats
 		results[idx].DailyVolume = r.stats.DailyVolume
-		// Estimate daily share using harmonic distribution (top-of-book fills faster).
-		competitors := results[idx].BuyOrderCount + results[idx].SellOrderCount
-		dailyShare := harmonicDailyShare(r.stats.DailyVolume, competitors)
+		results[idx].HistoryAvailable = r.historyAvailable
+		// Estimate cycle-constrained daily share from both sides:
+		// buy-order fills from S2B flow and sell-order fills from BfS flow.
+		s2bForShare, bfsForShare := estimateSideFlowsPerDay(
+			float64(r.stats.DailyVolume),
+			int64(results[idx].BuyVolume),
+			int64(results[idx].SellVolume),
+		)
+		buySideShare := harmonicDailyShare(int64(math.Round(s2bForShare)), results[idx].BuyOrderCount)
+		sellSideShare := harmonicDailyShare(int64(math.Round(bfsForShare)), results[idx].SellOrderCount)
+		dailyShare := minInt64(buySideShare, sellSideShare)
 		baselineDailyProfit := sanitizeFloat(results[idx].ProfitPerUnit * float64(dailyShare))
 		results[idx].DailyProfit = baselineDailyProfit
 		results[idx].TotalProfit = baselineDailyProfit
@@ -636,6 +694,12 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 					results[idx].DailyProfit = sanitizeFloat(expectedProfit)
 					results[idx].TotalProfit = results[idx].DailyProfit // compatibility
 					results[idx].ExpectedProfit = sanitizeFloat(expectedProfit / float64(safeQty))
+					effectiveBuyPerUnit := planBuy.ExpectedPrice * buyCostMult
+					if effectiveBuyPerUnit > 0 {
+						results[idx].RealMarginPercent = sanitizeFloat(
+							(results[idx].ExpectedProfit / effectiveBuyPerUnit) * 100,
+						)
+					}
 				}
 			}
 		}
@@ -677,8 +741,8 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		// A4E-style aliases with mass-balance: S2B + BfS = traded flow.
 		s2b, bfs := estimateSideFlowsPerDay(
 			dailyVol,
-			results[idx].BuyVolume,
-			results[idx].SellVolume,
+			int64(results[idx].BuyVolume),
+			int64(results[idx].SellVolume),
 		)
 		results[idx].S2BPerDay = sanitizeFloat(s2b)
 		results[idx].BfSPerDay = sanitizeFloat(bfs)

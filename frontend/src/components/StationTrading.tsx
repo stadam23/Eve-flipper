@@ -160,6 +160,7 @@ function normalizeStationResults(rows: StationTrade[]): StationTrade[] {
         ? (r.S2BPerDay ?? r.BuyUnitsPerDay ?? 0) /
           (r.BfSPerDay ?? r.SellUnitsPerDay ?? 0)
         : 0),
+    HistoryAvailable: r.HistoryAvailable ?? false,
   }));
 }
 

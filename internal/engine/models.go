@@ -38,6 +38,10 @@ type FlipResult struct {
 	BuyCompetitors  int     `json:"BuyCompetitors"`
 	SellCompetitors int     `json:"SellCompetitors"`
 	DailyProfit     float64 `json:"DailyProfit"` // ProfitPerUnit * min(UnitsToBuy, DailyVolume)
+	// Execution-aware effective margin after slippage and fees.
+	RealMarginPercent float64 `json:"RealMarginPercent,omitempty"`
+	// True when market history for this type/region was fetched successfully.
+	HistoryAvailable bool `json:"HistoryAvailable"`
 	// Execution-plan derived (expected fill prices from order book depth)
 	ExpectedBuyPrice  float64 `json:"ExpectedBuyPrice,omitempty"`
 	ExpectedSellPrice float64 `json:"ExpectedSellPrice,omitempty"`
