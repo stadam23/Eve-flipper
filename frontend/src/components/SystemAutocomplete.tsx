@@ -32,22 +32,35 @@ export function SystemAutocomplete({ value, onChange, showLocationButton = true,
 
   // Check if selected system has NPC stations
   useEffect(() => {
-    if (!value || value.length < 2) {
+    const systemName = value.trim();
+    if (!systemName || systemName.length < 2) {
       setNoStations(false);
       return;
     }
     let cancelled = false;
-    getStations(value)
-      .then((resp) => {
-        if (!cancelled) {
-          // Only show warning if backend recognized the system (system_id > 0)
-          // and it genuinely has no stations
-          setNoStations(resp.system_id > 0 && resp.stations.length === 0);
+
+    const run = async () => {
+      try {
+        const resp = await getStations(systemName);
+        if (cancelled) return;
+
+        const firstCheckNoStations = resp.system_id > 0 && resp.stations.length === 0;
+        if (!firstCheckNoStations) {
+          setNoStations(false);
+          return;
         }
-      })
-      .catch(() => {
+
+        // Rare backend race can return transient empty list for systems that have NPC stations.
+        // Retry once before showing the warning.
+        const retryResp = await getStations(systemName);
+        if (cancelled) return;
+        setNoStations(retryResp.system_id > 0 && retryResp.stations.length === 0);
+      } catch {
         if (!cancelled) setNoStations(false);
-      });
+      }
+    };
+
+    void run();
     return () => { cancelled = true; };
   }, [value]);
 

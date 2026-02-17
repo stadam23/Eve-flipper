@@ -23,6 +23,13 @@ type AlertHistoryEntry struct {
 
 // SaveAlertHistory records a sent alert to the history table.
 func (d *DB) SaveAlertHistory(entry AlertHistoryEntry) error {
+	return d.SaveAlertHistoryForUser(DefaultUserID, entry)
+}
+
+// SaveAlertHistoryForUser records a sent alert for a specific user.
+func (d *DB) SaveAlertHistoryForUser(userID string, entry AlertHistoryEntry) error {
+	userID = normalizeUserID(userID)
+
 	channelsSentJSON, _ := json.Marshal(entry.ChannelsSent)
 	var channelsFailedJSON []byte
 	if len(entry.ChannelsFailed) > 0 {
@@ -35,9 +42,10 @@ func (d *DB) SaveAlertHistory(entry AlertHistoryEntry) error {
 
 	_, err := d.sql.Exec(`
 		INSERT INTO alert_history (
-			watchlist_type_id, type_name, alert_metric, alert_threshold,
+			user_id, watchlist_type_id, type_name, alert_metric, alert_threshold,
 			current_value, message, channels_sent, channels_failed, sent_at, scan_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID,
 		entry.WatchlistTypeID,
 		entry.TypeName,
 		entry.AlertMetric,
@@ -55,12 +63,26 @@ func (d *DB) SaveAlertHistory(entry AlertHistoryEntry) error {
 // GetAlertHistory returns alert history with optional filters.
 // If typeID is 0, returns all alerts. Limit controls max results (0 = unlimited).
 func (d *DB) GetAlertHistory(typeID int32, limit int) ([]AlertHistoryEntry, error) {
-	return d.GetAlertHistoryPage(typeID, limit, 0)
+	return d.GetAlertHistoryForUser(DefaultUserID, typeID, limit)
+}
+
+// GetAlertHistoryForUser returns alert history with optional filters for a specific user.
+// If typeID is 0, returns all alerts. Limit controls max results (0 = unlimited).
+func (d *DB) GetAlertHistoryForUser(userID string, typeID int32, limit int) ([]AlertHistoryEntry, error) {
+	return d.GetAlertHistoryPageForUser(userID, typeID, limit, 0)
 }
 
 // GetAlertHistoryPage returns alert history with optional limit/offset pagination.
 // If typeID is 0, returns all alerts. Limit 0 means unlimited.
 func (d *DB) GetAlertHistoryPage(typeID int32, limit int, offset int) ([]AlertHistoryEntry, error) {
+	return d.GetAlertHistoryPageForUser(DefaultUserID, typeID, limit, offset)
+}
+
+// GetAlertHistoryPageForUser returns alert history for a specific user with optional limit/offset pagination.
+// If typeID is 0, returns all alerts. Limit 0 means unlimited.
+func (d *DB) GetAlertHistoryPageForUser(userID string, typeID int32, limit int, offset int) ([]AlertHistoryEntry, error) {
+	userID = normalizeUserID(userID)
+
 	if limit < 0 {
 		limit = 0
 	}
@@ -72,10 +94,11 @@ func (d *DB) GetAlertHistoryPage(typeID int32, limit int, offset int) ([]AlertHi
 		SELECT id, watchlist_type_id, type_name, alert_metric, alert_threshold,
 		       current_value, message, channels_sent, channels_failed, sent_at, scan_id
 		  FROM alert_history
+		 WHERE user_id = ?
 	`
-	args := []interface{}{}
+	args := []interface{}{userID}
 	if typeID > 0 {
-		query += " WHERE watchlist_type_id = ?"
+		query += " AND watchlist_type_id = ?"
 		args = append(args, typeID)
 	}
 	query += " ORDER BY sent_at DESC"
@@ -142,13 +165,21 @@ func (d *DB) GetAlertHistoryPage(typeID int32, limit int, offset int) ([]AlertHi
 // GetLastAlertTime returns the timestamp of the last alert sent for a given watchlist item and metric.
 // Returns zero time if no alert found.
 func (d *DB) GetLastAlertTime(typeID int32, metric string, threshold float64) (time.Time, error) {
+	return d.GetLastAlertTimeForUser(DefaultUserID, typeID, metric, threshold)
+}
+
+// GetLastAlertTimeForUser returns the timestamp of the last alert sent for a given watchlist item and metric for a specific user.
+// Returns zero time if no alert found.
+func (d *DB) GetLastAlertTimeForUser(userID string, typeID int32, metric string, threshold float64) (time.Time, error) {
+	userID = normalizeUserID(userID)
+
 	var sentAt string
 	err := d.sql.QueryRow(`
 		SELECT sent_at FROM alert_history
-		 WHERE watchlist_type_id = ? AND alert_metric = ? AND alert_threshold = ?
+		 WHERE user_id = ? AND watchlist_type_id = ? AND alert_metric = ? AND alert_threshold = ?
 		 ORDER BY sent_at DESC
 		 LIMIT 1
-	`, typeID, metric, threshold).Scan(&sentAt)
+	`, userID, typeID, metric, threshold).Scan(&sentAt)
 
 	if err == sql.ErrNoRows {
 		return time.Time{}, nil
@@ -168,7 +199,13 @@ func (d *DB) GetLastAlertTime(typeID int32, metric string, threshold float64) (t
 // This is called automatically via ON DELETE CASCADE when watchlist item is deleted,
 // but this method can be used for manual cleanup.
 func (d *DB) DeleteAlertHistory(typeID int32) error {
-	_, err := d.sql.Exec("DELETE FROM alert_history WHERE watchlist_type_id = ?", typeID)
+	return d.DeleteAlertHistoryForUser(DefaultUserID, typeID)
+}
+
+// DeleteAlertHistoryForUser removes alert history for a specific watchlist item for a specific user.
+func (d *DB) DeleteAlertHistoryForUser(userID string, typeID int32) error {
+	userID = normalizeUserID(userID)
+	_, err := d.sql.Exec("DELETE FROM alert_history WHERE user_id = ? AND watchlist_type_id = ?", userID, typeID)
 	return err
 }
 

@@ -2,6 +2,7 @@ export interface FlipResult {
   TypeID: number;
   TypeName: string;
   Volume: number;
+  IskPerM3?: number;
   BuyPrice: number;
   BuyStation: string;
   BuySystemName: string;
@@ -338,10 +339,18 @@ export type NdjsonMessage =
   | { type: "result"; data: FlipResult[]; count: number }
   | { type: "error"; message: string };
 
+export interface AuthCharacter {
+  character_id: number;
+  character_name: string;
+  active: boolean;
+}
+
 export interface AuthStatus {
   logged_in: boolean;
   character_id?: number;
   character_name?: string;
+  characters?: AuthCharacter[];
+  auth_revision?: number;
 }
 
 export interface CharacterInfo {

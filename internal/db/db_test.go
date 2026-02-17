@@ -468,3 +468,192 @@ func TestDB_WatchlistAlertSettingsRoundTrip(t *testing.T) {
 		t.Fatalf("watchlist row mismatch after update: %+v", items[0])
 	}
 }
+
+func TestDB_UserScopedDataIsolation(t *testing.T) {
+	d := openTestDB(t)
+	defer d.Close()
+
+	cfgA := config.Default()
+	cfgA.SystemName = "Jita"
+	cfgA.AlertTelegramToken = "tg-a"
+	if err := d.SaveConfigForUser("user-a", cfgA); err != nil {
+		t.Fatalf("SaveConfigForUser(user-a): %v", err)
+	}
+
+	cfgB := config.Default()
+	cfgB.SystemName = "Amarr"
+	cfgB.AlertTelegramToken = "tg-b"
+	if err := d.SaveConfigForUser("user-b", cfgB); err != nil {
+		t.Fatalf("SaveConfigForUser(user-b): %v", err)
+	}
+
+	gotA := d.LoadConfigForUser("user-a")
+	gotB := d.LoadConfigForUser("user-b")
+	if gotA.SystemName != "Jita" || gotA.AlertTelegramToken != "tg-a" {
+		t.Fatalf("LoadConfigForUser(user-a) = %+v", gotA)
+	}
+	if gotB.SystemName != "Amarr" || gotB.AlertTelegramToken != "tg-b" {
+		t.Fatalf("LoadConfigForUser(user-b) = %+v", gotB)
+	}
+	if gotDefault := d.LoadConfig(); gotDefault.SystemName == "Jita" || gotDefault.SystemName == "Amarr" {
+		t.Fatalf("default config scope should not leak user config: %+v", gotDefault)
+	}
+
+	itemA := config.WatchlistItem{
+		TypeID:         34,
+		TypeName:       "Tritanium",
+		AddedAt:        "2026-02-16T00:00:00Z",
+		AlertEnabled:   true,
+		AlertMetric:    "margin_percent",
+		AlertThreshold: 5,
+	}
+	itemB := config.WatchlistItem{
+		TypeID:         34,
+		TypeName:       "Tritanium",
+		AddedAt:        "2026-02-16T00:00:00Z",
+		AlertEnabled:   true,
+		AlertMetric:    "daily_volume",
+		AlertThreshold: 1000,
+	}
+	if !d.AddWatchlistItemForUser("user-a", itemA) {
+		t.Fatal("AddWatchlistItemForUser(user-a) returned false")
+	}
+	if !d.AddWatchlistItemForUser("user-b", itemB) {
+		t.Fatal("AddWatchlistItemForUser(user-b) returned false")
+	}
+
+	wA := d.GetWatchlistForUser("user-a")
+	wB := d.GetWatchlistForUser("user-b")
+	if len(wA) != 1 || wA[0].AlertMetric != "margin_percent" {
+		t.Fatalf("GetWatchlistForUser(user-a) = %+v", wA)
+	}
+	if len(wB) != 1 || wB[0].AlertMetric != "daily_volume" {
+		t.Fatalf("GetWatchlistForUser(user-b) = %+v", wB)
+	}
+	if len(d.GetWatchlist()) != 0 {
+		t.Fatalf("default watchlist scope should be empty")
+	}
+
+	if err := d.SaveAlertHistoryForUser("user-a", AlertHistoryEntry{
+		WatchlistTypeID: 34,
+		TypeName:        "Tritanium",
+		AlertMetric:     "margin_percent",
+		AlertThreshold:  5,
+		CurrentValue:    7,
+		Message:         "A",
+		ChannelsSent:    []string{"telegram"},
+		SentAt:          "2026-02-16T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveAlertHistoryForUser(user-a): %v", err)
+	}
+
+	hA, err := d.GetAlertHistoryForUser("user-a", 34, 0)
+	if err != nil {
+		t.Fatalf("GetAlertHistoryForUser(user-a): %v", err)
+	}
+	hB, err := d.GetAlertHistoryForUser("user-b", 34, 0)
+	if err != nil {
+		t.Fatalf("GetAlertHistoryForUser(user-b): %v", err)
+	}
+	if len(hA) != 1 || hA[0].Message != "A" {
+		t.Fatalf("history user-a = %+v", hA)
+	}
+	if len(hB) != 0 {
+		t.Fatalf("history user-b should be empty, got %+v", hB)
+	}
+}
+
+func TestDB_MigrateV16_PreservesLegacyAlertHistory(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("open in-memory db: %v", err)
+	}
+	defer sqlDB.Close()
+
+	_, err = sqlDB.Exec(`
+		CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+		INSERT INTO schema_version(version) VALUES (15);
+
+		CREATE TABLE config (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+		INSERT INTO config(key, value) VALUES ('system_name', 'Jita');
+
+		CREATE TABLE watchlist (
+			type_id          INTEGER PRIMARY KEY,
+			type_name        TEXT NOT NULL,
+			added_at         TEXT NOT NULL,
+			alert_min_margin REAL NOT NULL DEFAULT 0,
+			alert_enabled    INTEGER NOT NULL DEFAULT 0,
+			alert_metric     TEXT NOT NULL DEFAULT 'margin_percent',
+			alert_threshold  REAL NOT NULL DEFAULT 0
+		);
+		INSERT INTO watchlist(type_id, type_name, added_at, alert_min_margin, alert_enabled, alert_metric, alert_threshold)
+		VALUES (34, 'Tritanium', '2026-02-01T00:00:00Z', 0, 1, 'margin_percent', 5);
+
+		CREATE TABLE alert_history (
+			id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+			watchlist_type_id   INTEGER NOT NULL,
+			type_name           TEXT NOT NULL,
+			alert_metric        TEXT NOT NULL,
+			alert_threshold     REAL NOT NULL,
+			current_value       REAL NOT NULL,
+			message             TEXT NOT NULL,
+			channels_sent       TEXT NOT NULL,
+			channels_failed     TEXT,
+			sent_at             TEXT NOT NULL,
+			scan_id             INTEGER,
+			FOREIGN KEY (watchlist_type_id) REFERENCES watchlist(type_id) ON DELETE CASCADE
+		);
+		INSERT INTO alert_history(
+			watchlist_type_id, type_name, alert_metric, alert_threshold, current_value,
+			message, channels_sent, channels_failed, sent_at, scan_id
+		) VALUES (
+			34, 'Tritanium', 'margin_percent', 5, 7,
+			'legacy alert', '["telegram"]', NULL, '2026-02-01T00:10:00Z', 123
+		);
+
+		CREATE TABLE auth_session (
+			character_id    INTEGER PRIMARY KEY,
+			character_name  TEXT NOT NULL,
+			access_token    TEXT NOT NULL,
+			refresh_token   TEXT NOT NULL,
+			expires_at      INTEGER NOT NULL,
+			is_active       INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO auth_session(character_id, character_name, access_token, refresh_token, expires_at, is_active)
+		VALUES (9001, 'Legacy Pilot', 'at', 'rt', 1893456000, 1);
+	`)
+	if err != nil {
+		t.Fatalf("seed legacy v15 schema: %v", err)
+	}
+
+	d := &DB{sql: sqlDB}
+	if err := d.migrate(); err != nil {
+		t.Fatalf("migrate from v15 to latest: %v", err)
+	}
+
+	var count int
+	if err := d.sql.QueryRow(`
+		SELECT COUNT(*) FROM alert_history
+		 WHERE user_id = ? AND watchlist_type_id = ?
+	`, DefaultUserID, 34).Scan(&count); err != nil {
+		t.Fatalf("query migrated alert history count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("migrated alert_history row count = %d, want 1", count)
+	}
+
+	var message string
+	if err := d.sql.QueryRow(`
+		SELECT message FROM alert_history
+		 WHERE user_id = ? AND watchlist_type_id = ?
+		 LIMIT 1
+	`, DefaultUserID, 34).Scan(&message); err != nil {
+		t.Fatalf("query migrated alert history message: %v", err)
+	}
+	if message != "legacy alert" {
+		t.Fatalf("migrated alert_history message = %q, want %q", message, "legacy alert")
+	}
+}

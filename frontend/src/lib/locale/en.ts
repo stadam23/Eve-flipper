@@ -87,6 +87,7 @@ export const en = {
     colSellStation: "Sell Station",
     colSellRegion: "Sell Region",
     colMargin: "Margin %",
+    colIskPerM3: "ISK/m³",
     colUnitsToBuy: "Buy Qty",
     colFilledQty: "Fillable Qty",
     colCanFill: "Can Fill",
@@ -604,6 +605,11 @@ export const en = {
 
     // Character
     charViewInfo: "Character info",
+    charSelectCharacter: "Character scope",
+    charAllCharacters: "All characters",
+    charAddCharacter: "Add character",
+    charRemoveCharacter: "Remove character",
+    charActive: "active",
     logout: "Logout",
 
     // Theme switcher

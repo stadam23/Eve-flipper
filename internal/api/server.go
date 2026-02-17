@@ -2,6 +2,12 @@ package api
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,17 +66,31 @@ type Server struct {
 
 	// Corporation demo provider (initialized on SDE load).
 	demoCorpProvider *corp.DemoCorpProvider
+
+	userIDCookieSecret []byte
+
+	authRevisionMu sync.Mutex
+	authRevision   map[string]int64
 }
 
 // ssoStateEntry holds metadata for a pending SSO login flow.
 type ssoStateEntry struct {
 	ExpiresAt time.Time
 	Desktop   bool
+	UserID    string
 }
 
 const walletTxnCacheTTL = 2 * time.Minute
 const plexCacheTTL = 5 * time.Minute
 const plexStaleCacheTTL = 30 * time.Minute
+const userIDCookieName = "eveflipper_uid"
+const userIDCookieMaxAge = 365 * 24 * 60 * 60
+const userIDCookieSignatureBytes = 16
+const userIDCookieSecretMetaKey = "user_cookie_secret_v1"
+
+type contextKey string
+
+const userIDContextKey contextKey = "user_id"
 
 func (s *Server) getWalletTxnCache(characterID int64) ([]esi.WalletTransaction, bool) {
 	s.txnCacheMu.RLock()
@@ -133,16 +153,249 @@ func (s *Server) setPLEXCache(cacheKey string, dashboard engine.PLEXDashboard) {
 	s.plexCacheMu.Unlock()
 }
 
+func cloneConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return config.Default()
+	}
+	copied := *cfg
+	return &copied
+}
+
+func secureCookieFromRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		return true
+	}
+	return false
+}
+
+func generateUserID() string {
+	var raw [18]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return db.DefaultUserID
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:])
+}
+
+func generateUserCookieSecret() []byte {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return []byte("eveflipper-user-cookie-secret-fallback")
+	}
+	return secret
+}
+
+func loadOrCreateUserCookieSecret(database *db.DB) []byte {
+	secret := generateUserCookieSecret()
+	if database == nil || database.SqlDB() == nil {
+		return secret
+	}
+
+	sqlDB := database.SqlDB()
+	if _, err := sqlDB.Exec(`
+		CREATE TABLE IF NOT EXISTS app_meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		log.Printf("[API] Failed to ensure app_meta table for user cookie secret: %v", err)
+		return secret
+	}
+
+	var encoded string
+	err := sqlDB.QueryRow("SELECT value FROM app_meta WHERE key = ? LIMIT 1", userIDCookieSecretMetaKey).Scan(&encoded)
+	switch {
+	case err == nil:
+		decoded, decodeErr := base64.RawURLEncoding.DecodeString(strings.TrimSpace(encoded))
+		if decodeErr == nil && len(decoded) >= 32 {
+			return decoded
+		}
+	case err != sql.ErrNoRows:
+		log.Printf("[API] Failed to load user cookie secret from app_meta: %v", err)
+		return secret
+	}
+
+	encoded = base64.RawURLEncoding.EncodeToString(secret)
+	if _, err := sqlDB.Exec(`
+		INSERT INTO app_meta (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, userIDCookieSecretMetaKey, encoded); err != nil {
+		log.Printf("[API] Failed to persist user cookie secret to app_meta: %v", err)
+	}
+
+	return secret
+}
+
+func isValidUserID(userID string) bool {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || len(userID) > 128 {
+		return false
+	}
+	for _, ch := range userID {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Server) userIDCookieSignature(userID string) []byte {
+	secret := s.userIDCookieSecret
+	if len(secret) == 0 {
+		secret = []byte("eveflipper-user-cookie-secret-fallback")
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(userID))
+	sum := mac.Sum(nil)
+	return sum[:userIDCookieSignatureBytes]
+}
+
+func (s *Server) signedUserIDCookieValue(userID string) string {
+	signature := base64.RawURLEncoding.EncodeToString(s.userIDCookieSignature(userID))
+	return userID + "." + signature
+}
+
+func (s *Server) parseSignedUserIDCookieValue(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	sep := strings.LastIndexByte(value, '.')
+	if sep <= 0 || sep >= len(value)-1 {
+		return "", false
+	}
+
+	userID := strings.TrimSpace(value[:sep])
+	signatureValue := strings.TrimSpace(value[sep+1:])
+	if !isValidUserID(userID) || signatureValue == "" {
+		return "", false
+	}
+
+	gotSignature, err := base64.RawURLEncoding.DecodeString(signatureValue)
+	if err != nil {
+		return "", false
+	}
+	wantSignature := s.userIDCookieSignature(userID)
+	if len(gotSignature) != len(wantSignature) {
+		return "", false
+	}
+	if !hmac.Equal(gotSignature, wantSignature) {
+		return "", false
+	}
+	return userID, true
+}
+
+func (s *Server) setUserIDCookie(w http.ResponseWriter, r *http.Request, userID string) string {
+	userID = strings.TrimSpace(userID)
+	if !isValidUserID(userID) {
+		userID = generateUserID()
+		if !isValidUserID(userID) {
+			userID = db.DefaultUserID
+		}
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     userIDCookieName,
+		Value:    s.signedUserIDCookieValue(userID),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secureCookieFromRequest(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   userIDCookieMaxAge,
+		Expires:  time.Now().Add(365 * 24 * time.Hour),
+	})
+	return userID
+}
+
+func (s *Server) ensureRequestUserID(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie(userIDCookieName); err == nil {
+		if userID, ok := s.parseSignedUserIDCookieValue(c.Value); ok {
+			return userID
+		}
+	}
+
+	return s.setUserIDCookie(w, r, generateUserID())
+}
+
+func userIDFromRequest(r *http.Request) string {
+	if r == nil {
+		return db.DefaultUserID
+	}
+	if v := r.Context().Value(userIDContextKey); v != nil {
+		if userID, ok := v.(string); ok {
+			userID = strings.TrimSpace(userID)
+			if isValidUserID(userID) {
+				return userID
+			}
+		}
+	}
+	return db.DefaultUserID
+}
+
+func (s *Server) userScopeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID := s.ensureRequestUserID(w, r)
+		ctx := context.WithValue(r.Context(), userIDContextKey, userID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func normalizeAuthRevisionUserID(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return db.DefaultUserID
+	}
+	return userID
+}
+
+func (s *Server) authRevisionForUser(userID string) int64 {
+	userID = normalizeAuthRevisionUserID(userID)
+	s.authRevisionMu.Lock()
+	defer s.authRevisionMu.Unlock()
+	if s.authRevision == nil {
+		return 0
+	}
+	return s.authRevision[userID]
+}
+
+func (s *Server) bumpAuthRevision(userID string) int64 {
+	userID = normalizeAuthRevisionUserID(userID)
+	s.authRevisionMu.Lock()
+	defer s.authRevisionMu.Unlock()
+	if s.authRevision == nil {
+		s.authRevision = make(map[string]int64)
+	}
+	s.authRevision[userID]++
+	return s.authRevision[userID]
+}
+
+func (s *Server) loadConfigForUser(userID string) *config.Config {
+	if s.db != nil {
+		return s.db.LoadConfigForUser(userID)
+	}
+	return cloneConfig(s.cfg)
+}
+
+func (s *Server) saveConfigForUser(userID string, cfg *config.Config) error {
+	if s.db != nil {
+		return s.db.SaveConfigForUser(userID, cfg)
+	}
+	s.cfg = cloneConfig(cfg)
+	return nil
+}
+
 // NewServer creates a Server with the given config, ESI client, and database.
 func NewServer(cfg *config.Config, esiClient *esi.Client, database *db.DB, ssoConfig *auth.SSOConfig, sessions *auth.SessionStore) *Server {
 	return &Server{
-		cfg:          cfg,
-		esi:          esiClient,
-		db:           database,
-		sso:          ssoConfig,
-		sessions:     sessions,
-		ssoStates:    make(map[string]ssoStateEntry),
-		plexBuildSem: make(chan struct{}, 1),
+		cfg:                cfg,
+		esi:                esiClient,
+		db:                 database,
+		sso:                ssoConfig,
+		sessions:           sessions,
+		ssoStates:          make(map[string]ssoStateEntry),
+		plexBuildSem:       make(chan struct{}, 1),
+		userIDCookieSecret: loadOrCreateUserCookieSecret(database),
+		authRevision:       make(map[string]int64),
 	}
 }
 
@@ -201,6 +454,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("POST /api/auth/character/select", s.handleAuthCharacterSelect)
+	mux.HandleFunc("DELETE /api/auth/characters/{characterID}", s.handleAuthCharacterDelete)
 	mux.HandleFunc("GET /api/auth/character", s.handleAuthCharacter)
 	mux.HandleFunc("GET /api/auth/location", s.handleAuthLocation)
 	mux.HandleFunc("GET /api/auth/undercuts", s.handleAuthUndercuts)
@@ -238,7 +493,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/corp/orders", s.handleCorpOrders)
 	mux.HandleFunc("GET /api/corp/industry", s.handleCorpIndustry)
 	mux.HandleFunc("GET /api/corp/mining", s.handleCorpMining)
-	return corsMiddleware(mux)
+	return corsMiddleware(s.userScopeMiddleware(mux))
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -397,8 +652,11 @@ func filterStationTradesExcludeStructures(results []engine.StationTrade) []engin
 // enrichStructureNames resolves player-structure names in FlipResult slice
 // if the user is authenticated. Results with unresolved structure names are
 // filtered out (user can't find unnamed structures in-game).
-func (s *Server) enrichStructureNames(results []engine.FlipResult) []engine.FlipResult {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+func (s *Server) enrichStructureNames(userID string, results []engine.FlipResult) []engine.FlipResult {
+	if s.sessions == nil {
+		return results
+	}
+	token, err := s.sessions.EnsureValidTokenForUser(s.sso, userID)
 	if err != nil {
 		return results // not authenticated, skip
 	}
@@ -450,8 +708,11 @@ func (s *Server) enrichStructureNames(results []engine.FlipResult) []engine.Flip
 
 // enrichRouteStructureNames resolves player-structure names in RouteResult slice.
 // Routes containing hops with unresolved structure names are filtered out.
-func (s *Server) enrichRouteStructureNames(results []engine.RouteResult) []engine.RouteResult {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+func (s *Server) enrichRouteStructureNames(userID string, results []engine.RouteResult) []engine.RouteResult {
+	if s.sessions == nil {
+		return results
+	}
+	token, err := s.sessions.EnsureValidTokenForUser(s.sso, userID)
 	if err != nil {
 		return results
 	}
@@ -540,10 +801,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.cfg)
+	userID := userIDFromRequest(r)
+	cfg := s.loadConfigForUser(userID)
+	writeJSON(w, cfg)
 }
 
 func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	cfg := s.loadConfigForUser(userID)
+
 	var patch map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		writeError(w, 400, "invalid json")
@@ -551,124 +817,127 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if v, ok := patch["system_name"]; ok {
-		json.Unmarshal(v, &s.cfg.SystemName)
+		json.Unmarshal(v, &cfg.SystemName)
 	}
 	if v, ok := patch["cargo_capacity"]; ok {
-		json.Unmarshal(v, &s.cfg.CargoCapacity)
+		json.Unmarshal(v, &cfg.CargoCapacity)
 	}
 	if v, ok := patch["buy_radius"]; ok {
-		json.Unmarshal(v, &s.cfg.BuyRadius)
+		json.Unmarshal(v, &cfg.BuyRadius)
 	}
 	if v, ok := patch["sell_radius"]; ok {
-		json.Unmarshal(v, &s.cfg.SellRadius)
+		json.Unmarshal(v, &cfg.SellRadius)
 	}
 	if v, ok := patch["min_margin"]; ok {
-		json.Unmarshal(v, &s.cfg.MinMargin)
+		json.Unmarshal(v, &cfg.MinMargin)
 	}
 	if v, ok := patch["sales_tax_percent"]; ok {
-		json.Unmarshal(v, &s.cfg.SalesTaxPercent)
+		json.Unmarshal(v, &cfg.SalesTaxPercent)
 	}
 	if v, ok := patch["broker_fee_percent"]; ok {
-		json.Unmarshal(v, &s.cfg.BrokerFeePercent)
+		json.Unmarshal(v, &cfg.BrokerFeePercent)
 	}
 	if v, ok := patch["split_trade_fees"]; ok {
-		json.Unmarshal(v, &s.cfg.SplitTradeFees)
+		json.Unmarshal(v, &cfg.SplitTradeFees)
 	}
 	if v, ok := patch["buy_broker_fee_percent"]; ok {
-		json.Unmarshal(v, &s.cfg.BuyBrokerFeePercent)
+		json.Unmarshal(v, &cfg.BuyBrokerFeePercent)
 	}
 	if v, ok := patch["sell_broker_fee_percent"]; ok {
-		json.Unmarshal(v, &s.cfg.SellBrokerFeePercent)
+		json.Unmarshal(v, &cfg.SellBrokerFeePercent)
 	}
 	if v, ok := patch["buy_sales_tax_percent"]; ok {
-		json.Unmarshal(v, &s.cfg.BuySalesTaxPercent)
+		json.Unmarshal(v, &cfg.BuySalesTaxPercent)
 	}
 	if v, ok := patch["sell_sales_tax_percent"]; ok {
-		json.Unmarshal(v, &s.cfg.SellSalesTaxPercent)
+		json.Unmarshal(v, &cfg.SellSalesTaxPercent)
 	}
 	if v, ok := patch["alert_telegram"]; ok {
-		json.Unmarshal(v, &s.cfg.AlertTelegram)
+		json.Unmarshal(v, &cfg.AlertTelegram)
 	}
 	if v, ok := patch["alert_discord"]; ok {
-		json.Unmarshal(v, &s.cfg.AlertDiscord)
+		json.Unmarshal(v, &cfg.AlertDiscord)
 	}
 	if v, ok := patch["alert_desktop"]; ok {
-		json.Unmarshal(v, &s.cfg.AlertDesktop)
+		json.Unmarshal(v, &cfg.AlertDesktop)
 	}
 	if v, ok := patch["alert_telegram_token"]; ok {
-		json.Unmarshal(v, &s.cfg.AlertTelegramToken)
+		json.Unmarshal(v, &cfg.AlertTelegramToken)
 	}
 	if v, ok := patch["alert_telegram_chat_id"]; ok {
-		json.Unmarshal(v, &s.cfg.AlertTelegramChatID)
+		json.Unmarshal(v, &cfg.AlertTelegramChatID)
 	}
 	if v, ok := patch["alert_discord_webhook"]; ok {
-		json.Unmarshal(v, &s.cfg.AlertDiscordWebhook)
+		json.Unmarshal(v, &cfg.AlertDiscordWebhook)
 	}
 	if v, ok := patch["opacity"]; ok {
-		json.Unmarshal(v, &s.cfg.Opacity)
+		json.Unmarshal(v, &cfg.Opacity)
 	}
 
 	// Validate bounds
-	if s.cfg.CargoCapacity < 0 {
-		s.cfg.CargoCapacity = 0
+	if cfg.CargoCapacity < 0 {
+		cfg.CargoCapacity = 0
 	}
-	if s.cfg.BuyRadius < 0 {
-		s.cfg.BuyRadius = 0
-	} else if s.cfg.BuyRadius > 50 {
-		s.cfg.BuyRadius = 50
+	if cfg.BuyRadius < 0 {
+		cfg.BuyRadius = 0
+	} else if cfg.BuyRadius > 50 {
+		cfg.BuyRadius = 50
 	}
-	if s.cfg.SellRadius < 0 {
-		s.cfg.SellRadius = 0
-	} else if s.cfg.SellRadius > 50 {
-		s.cfg.SellRadius = 50
+	if cfg.SellRadius < 0 {
+		cfg.SellRadius = 0
+	} else if cfg.SellRadius > 50 {
+		cfg.SellRadius = 50
 	}
-	if s.cfg.MinMargin < 0 {
-		s.cfg.MinMargin = 0
-	} else if s.cfg.MinMargin > 100 {
-		s.cfg.MinMargin = 100
+	if cfg.MinMargin < 0 {
+		cfg.MinMargin = 0
+	} else if cfg.MinMargin > 100 {
+		cfg.MinMargin = 100
 	}
-	if s.cfg.SalesTaxPercent < 0 {
-		s.cfg.SalesTaxPercent = 0
-	} else if s.cfg.SalesTaxPercent > 100 {
-		s.cfg.SalesTaxPercent = 100
+	if cfg.SalesTaxPercent < 0 {
+		cfg.SalesTaxPercent = 0
+	} else if cfg.SalesTaxPercent > 100 {
+		cfg.SalesTaxPercent = 100
 	}
-	if s.cfg.BrokerFeePercent < 0 {
-		s.cfg.BrokerFeePercent = 0
-	} else if s.cfg.BrokerFeePercent > 100 {
-		s.cfg.BrokerFeePercent = 100
+	if cfg.BrokerFeePercent < 0 {
+		cfg.BrokerFeePercent = 0
+	} else if cfg.BrokerFeePercent > 100 {
+		cfg.BrokerFeePercent = 100
 	}
-	if s.cfg.BuyBrokerFeePercent < 0 {
-		s.cfg.BuyBrokerFeePercent = 0
-	} else if s.cfg.BuyBrokerFeePercent > 100 {
-		s.cfg.BuyBrokerFeePercent = 100
+	if cfg.BuyBrokerFeePercent < 0 {
+		cfg.BuyBrokerFeePercent = 0
+	} else if cfg.BuyBrokerFeePercent > 100 {
+		cfg.BuyBrokerFeePercent = 100
 	}
-	if s.cfg.SellBrokerFeePercent < 0 {
-		s.cfg.SellBrokerFeePercent = 0
-	} else if s.cfg.SellBrokerFeePercent > 100 {
-		s.cfg.SellBrokerFeePercent = 100
+	if cfg.SellBrokerFeePercent < 0 {
+		cfg.SellBrokerFeePercent = 0
+	} else if cfg.SellBrokerFeePercent > 100 {
+		cfg.SellBrokerFeePercent = 100
 	}
-	if s.cfg.BuySalesTaxPercent < 0 {
-		s.cfg.BuySalesTaxPercent = 0
-	} else if s.cfg.BuySalesTaxPercent > 100 {
-		s.cfg.BuySalesTaxPercent = 100
+	if cfg.BuySalesTaxPercent < 0 {
+		cfg.BuySalesTaxPercent = 0
+	} else if cfg.BuySalesTaxPercent > 100 {
+		cfg.BuySalesTaxPercent = 100
 	}
-	if s.cfg.SellSalesTaxPercent < 0 {
-		s.cfg.SellSalesTaxPercent = 0
-	} else if s.cfg.SellSalesTaxPercent > 100 {
-		s.cfg.SellSalesTaxPercent = 100
+	if cfg.SellSalesTaxPercent < 0 {
+		cfg.SellSalesTaxPercent = 0
+	} else if cfg.SellSalesTaxPercent > 100 {
+		cfg.SellSalesTaxPercent = 100
 	}
-	if s.cfg.Opacity < 0 {
-		s.cfg.Opacity = 0
-	} else if s.cfg.Opacity > 100 {
-		s.cfg.Opacity = 100
+	if cfg.Opacity < 0 {
+		cfg.Opacity = 0
+	} else if cfg.Opacity > 100 {
+		cfg.Opacity = 100
 	}
 	// Keep at least one alert channel enabled.
-	if !s.cfg.AlertTelegram && !s.cfg.AlertDiscord && !s.cfg.AlertDesktop {
-		s.cfg.AlertDesktop = true
+	if !cfg.AlertTelegram && !cfg.AlertDiscord && !cfg.AlertDesktop {
+		cfg.AlertDesktop = true
 	}
 
-	s.db.SaveConfig(s.cfg)
-	writeJSON(w, s.cfg)
+	if err := s.saveConfigForUser(userID, cfg); err != nil {
+		writeError(w, 500, "failed to save config")
+		return
+	}
+	writeJSON(w, cfg)
 }
 
 type alertSendResult struct {
@@ -677,6 +946,9 @@ type alertSendResult struct {
 }
 
 func (s *Server) handleAlertsTest(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	cfg := s.loadConfigForUser(userID)
+
 	var req struct {
 		Message string `json:"message"`
 	}
@@ -692,33 +964,33 @@ func (s *Server) handleAlertsTest(w http.ResponseWriter, r *http.Request) {
 		msg = msg[:500]
 	}
 
-	res := s.sendConfiguredExternalAlerts(msg)
+	res := s.sendConfiguredExternalAlerts(cfg, msg)
 	writeJSON(w, res)
 }
 
-func (s *Server) sendConfiguredExternalAlerts(message string) alertSendResult {
+func (s *Server) sendConfiguredExternalAlerts(cfg *config.Config, message string) alertSendResult {
 	out := alertSendResult{
 		Sent:   []string{},
 		Failed: map[string]string{},
 	}
-	if s.cfg == nil {
+	if cfg == nil {
 		out.Failed["config"] = "config is not loaded"
 		return out
 	}
 
-	if s.cfg.AlertTelegram {
-		if strings.TrimSpace(s.cfg.AlertTelegramToken) == "" || strings.TrimSpace(s.cfg.AlertTelegramChatID) == "" {
+	if cfg.AlertTelegram {
+		if strings.TrimSpace(cfg.AlertTelegramToken) == "" || strings.TrimSpace(cfg.AlertTelegramChatID) == "" {
 			out.Failed["telegram"] = "telegram token/chat_id not configured"
-		} else if err := sendTelegramAlert(s.cfg.AlertTelegramToken, s.cfg.AlertTelegramChatID, message); err != nil {
+		} else if err := sendTelegramAlert(cfg.AlertTelegramToken, cfg.AlertTelegramChatID, message); err != nil {
 			out.Failed["telegram"] = err.Error()
 		} else {
 			out.Sent = append(out.Sent, "telegram")
 		}
 	}
-	if s.cfg.AlertDiscord {
-		if strings.TrimSpace(s.cfg.AlertDiscordWebhook) == "" {
+	if cfg.AlertDiscord {
+		if strings.TrimSpace(cfg.AlertDiscordWebhook) == "" {
 			out.Failed["discord"] = "discord webhook not configured"
-		} else if err := sendDiscordAlert(s.cfg.AlertDiscordWebhook, message); err != nil {
+		} else if err := sendDiscordAlert(cfg.AlertDiscordWebhook, message); err != nil {
 			out.Failed["discord"] = err.Error()
 		} else {
 			out.Sent = append(out.Sent, "discord")
@@ -938,6 +1210,9 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 }
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	userCfg := s.loadConfigForUser(userID)
+
 	var req scanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid json")
@@ -985,7 +1260,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
-		results = s.enrichStructureNames(results)
+		results = s.enrichStructureNames(userID, results)
 	} else {
 		results = filterFlipResultsExcludeStructures(results)
 	}
@@ -1005,7 +1280,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	if scanID > 0 {
 		scanIDPtr = &scanID
 	}
-	go s.processWatchlistAlerts(results, scanIDPtr)
+	go s.processWatchlistAlerts(userID, userCfg, results, scanIDPtr)
 
 	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
 	if marshalErr != nil {
@@ -1020,6 +1295,9 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	userCfg := s.loadConfigForUser(userID)
+
 	var req scanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid json")
@@ -1067,7 +1345,7 @@ func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
-		results = s.enrichStructureNames(results)
+		results = s.enrichStructureNames(userID, results)
 	} else {
 		results = filterFlipResultsExcludeStructures(results)
 	}
@@ -1087,7 +1365,7 @@ func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
 	if scanID > 0 {
 		scanIDPtr = &scanID
 	}
-	go s.processWatchlistAlerts(results, scanIDPtr)
+	go s.processWatchlistAlerts(userID, userCfg, results, scanIDPtr)
 
 	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
 	if marshalErr != nil {
@@ -1172,6 +1450,8 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+
 	var req struct {
 		SystemName           string  `json:"system_name"`
 		CargoCapacity        float64 `json:"cargo_capacity"`
@@ -1256,7 +1536,7 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
-		results = s.enrichRouteStructureNames(results)
+		results = s.enrichRouteStructureNames(userID, results)
 	} else {
 		results = filterRouteResultsExcludeStructures(results)
 	}
@@ -1287,10 +1567,13 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 // --- Watchlist ---
 
 func (s *Server) handleGetWatchlist(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.db.GetWatchlist())
+	userID := userIDFromRequest(r)
+	writeJSON(w, s.db.GetWatchlistForUser(userID))
 }
 
 func (s *Server) handleAddWatchlist(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+
 	var item config.WatchlistItem
 	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 		writeError(w, 400, "invalid json")
@@ -1323,30 +1606,34 @@ func (s *Server) handleAddWatchlist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	item.AddedAt = time.Now().Format(time.RFC3339)
-	inserted := s.db.AddWatchlistItem(item)
+	inserted := s.db.AddWatchlistItemForUser(userID, item)
 
 	type addResponse struct {
 		Items    []config.WatchlistItem `json:"items"`
 		Inserted bool                   `json:"inserted"`
 	}
 	writeJSON(w, addResponse{
-		Items:    s.db.GetWatchlist(),
+		Items:    s.db.GetWatchlistForUser(userID),
 		Inserted: inserted,
 	})
 }
 
 func (s *Server) handleDeleteWatchlist(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+
 	idStr := r.PathValue("typeID")
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		writeError(w, 400, "invalid type_id")
 		return
 	}
-	s.db.DeleteWatchlistItem(int32(id))
-	writeJSON(w, s.db.GetWatchlist())
+	s.db.DeleteWatchlistItemForUser(userID, int32(id))
+	writeJSON(w, s.db.GetWatchlistForUser(userID))
 }
 
 func (s *Server) handleUpdateWatchlist(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+
 	idStr := r.PathValue("typeID")
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -1390,11 +1677,13 @@ func (s *Server) handleUpdateWatchlist(w http.ResponseWriter, r *http.Request) {
 		alertEnabled = true
 	}
 
-	s.db.UpdateWatchlistItem(int32(id), body.AlertMinMargin, alertEnabled, alertMetric, alertThreshold)
-	writeJSON(w, s.db.GetWatchlist())
+	s.db.UpdateWatchlistItemForUser(userID, int32(id), body.AlertMinMargin, alertEnabled, alertMetric, alertThreshold)
+	writeJSON(w, s.db.GetWatchlistForUser(userID))
 }
 
 func (s *Server) handleGetAlertHistory(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+
 	// Optional filter by type_id
 	typeIDStr := r.URL.Query().Get("type_id")
 	var typeID int32
@@ -1433,7 +1722,7 @@ func (s *Server) handleGetAlertHistory(w http.ResponseWriter, r *http.Request) {
 		offset = o
 	}
 
-	history, err := s.db.GetAlertHistoryPage(typeID, limit, offset)
+	history, err := s.db.GetAlertHistoryPageForUser(userID, typeID, limit, offset)
 	if err != nil {
 		log.Printf("[API] Failed to get alert history: %v", err)
 		writeError(w, 500, "failed to retrieve alert history")
@@ -1446,6 +1735,9 @@ func (s *Server) handleGetAlertHistory(w http.ResponseWriter, r *http.Request) {
 // --- Station Trading ---
 
 func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	userCfg := s.loadConfigForUser(userID)
+
 	var req struct {
 		StationID            int64   `json:"station_id"`  // 0 = all stations
 		RegionID             int32   `json:"region_id"`   // required
@@ -1564,8 +1856,8 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 
 	// Get auth token if available (for structure name resolution)
 	accessToken := ""
-	if req.IncludeStructures {
-		if token, err := s.sessions.EnsureValidToken(s.sso); err == nil {
+	if req.IncludeStructures && s.sessions != nil {
+		if token, err := s.sessions.EnsureValidTokenForUser(s.sso, userID); err == nil {
 			accessToken = token
 		}
 	}
@@ -1645,7 +1937,7 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	if scanID > 0 {
 		scanIDPtr = &scanID
 	}
-	go s.processWatchlistAlerts(allResults, scanIDPtr)
+	go s.processWatchlistAlerts(userID, userCfg, allResults, scanIDPtr)
 
 	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": allResults, "count": len(allResults), "scan_id": scanID})
 	if marshalErr != nil {
@@ -1688,6 +1980,11 @@ func (s *Server) handleGetStations(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, stationsResponse{Stations: []stationInfo{}})
 		return
 	}
+	if len(stations) == 0 {
+		// If station map isn't available yet, avoid false "no NPC stations" hints in UI.
+		writeJSON(w, stationsResponse{Stations: []stationInfo{}})
+		return
+	}
 
 	regionID := int32(0)
 	if sys, ok2 := s.sdeData.Systems[systemID]; ok2 {
@@ -1727,7 +2024,8 @@ func (s *Server) handleGetStations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthStructures(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+	token, err := s.sessions.EnsureValidTokenForUser(s.sso, userID)
 	if err != nil {
 		writeError(w, 401, err.Error())
 		return
@@ -1955,6 +2253,98 @@ func (s *Server) handleClearHistory(w http.ResponseWriter, r *http.Request) {
 
 // --- Auth ---
 
+type authCharacterSummary struct {
+	CharacterID   int64  `json:"character_id"`
+	CharacterName string `json:"character_name"`
+	Active        bool   `json:"active"`
+}
+
+func parseAuthScope(r *http.Request) (characterID int64, all bool, err error) {
+	scope := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("scope")))
+	charParam := strings.TrimSpace(r.URL.Query().Get("character_id"))
+
+	if scope == "all" || strings.EqualFold(charParam, "all") {
+		if charParam != "" && !strings.EqualFold(charParam, "all") {
+			return 0, false, fmt.Errorf("character_id and scope=all cannot be combined")
+		}
+		return 0, true, nil
+	}
+
+	if charParam == "" {
+		return 0, false, nil
+	}
+	id, parseErr := strconv.ParseInt(charParam, 10, 64)
+	if parseErr != nil || id <= 0 {
+		return 0, false, fmt.Errorf("invalid character_id")
+	}
+	return id, false, nil
+}
+
+func (s *Server) authSessionsForScope(userID string, characterID int64, all bool, allowAll bool) ([]*auth.Session, error) {
+	if s.sessions == nil {
+		return nil, fmt.Errorf("not logged in")
+	}
+	if all {
+		if !allowAll {
+			return nil, fmt.Errorf("scope=all is not supported for this endpoint")
+		}
+		allSessions := s.sessions.ListForUser(userID)
+		if len(allSessions) == 0 {
+			return nil, fmt.Errorf("not logged in")
+		}
+		return allSessions, nil
+	}
+	if characterID > 0 {
+		sess := s.sessions.GetByCharacterIDForUser(userID, characterID)
+		if sess == nil {
+			return nil, fmt.Errorf("character not logged in")
+		}
+		return []*auth.Session{sess}, nil
+	}
+	sess := s.sessions.GetForUser(userID)
+	if sess == nil {
+		return nil, fmt.Errorf("not logged in")
+	}
+	return []*auth.Session{sess}, nil
+}
+
+func (s *Server) authStatusPayload(userID string) map[string]interface{} {
+	revision := s.authRevisionForUser(userID)
+	if s.sessions == nil {
+		return map[string]interface{}{
+			"logged_in":     false,
+			"auth_revision": revision,
+		}
+	}
+	active := s.sessions.GetForUser(userID)
+	if active == nil {
+		return map[string]interface{}{
+			"logged_in":     false,
+			"auth_revision": revision,
+		}
+	}
+	all := s.sessions.ListForUser(userID)
+	characters := make([]authCharacterSummary, 0, len(all))
+	for _, sess := range all {
+		characters = append(characters, authCharacterSummary{
+			CharacterID:   sess.CharacterID,
+			CharacterName: sess.CharacterName,
+			Active:        sess.Active,
+		})
+	}
+	return map[string]interface{}{
+		"logged_in":      true,
+		"character_id":   active.CharacterID,
+		"character_name": active.CharacterName,
+		"characters":     characters,
+		"auth_revision":  revision,
+	}
+}
+
+func (s *Server) writeAuthStatus(w http.ResponseWriter, userID string) {
+	writeJSON(w, s.authStatusPayload(userID))
+}
+
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if s.sso == nil {
 		writeError(w, 500, "SSO not configured")
@@ -1962,6 +2352,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	state := auth.GenerateState()
 	desktop := r.URL.Query().Get("desktop") == "1"
+	userID := userIDFromRequest(r)
 
 	s.ssoStatesMu.Lock()
 	// Purge expired states
@@ -1974,6 +2365,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	s.ssoStates[state] = ssoStateEntry{
 		ExpiresAt: now.Add(10 * time.Minute),
 		Desktop:   desktop,
+		UserID:    userID,
 	}
 	s.ssoStatesMu.Unlock()
 
@@ -2018,6 +2410,11 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Save session
+	userID := strings.TrimSpace(entry.UserID)
+	if !isValidUserID(userID) {
+		userID = userIDFromRequest(r)
+	}
+	userID = s.setUserIDCookie(w, r, userID)
 	sess := &auth.Session{
 		CharacterID:   info.CharacterID,
 		CharacterName: info.CharacterName,
@@ -2025,11 +2422,12 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		RefreshToken:  tok.RefreshToken,
 		ExpiresAt:     time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second),
 	}
-	if err := s.sessions.Save(sess); err != nil {
+	if err := s.sessions.SaveAndActivateForUser(userID, sess); err != nil {
 		log.Printf("[AUTH] Save session error: %v", err)
 		writeError(w, 500, "save session failed")
 		return
 	}
+	s.bumpAuthRevision(userID)
 
 	log.Printf("[AUTH] Logged in as %s (ID: %d)", info.CharacterName, info.CharacterID)
 
@@ -2067,36 +2465,69 @@ p{color:#8b949e;margin-bottom:.25rem}
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeJSON(w, map[string]interface{}{"logged_in": false})
-		return
-	}
-	writeJSON(w, map[string]interface{}{
-		"logged_in":      true,
-		"character_id":   sess.CharacterID,
-		"character_name": sess.CharacterName,
-	})
+	userID := userIDFromRequest(r)
+	s.writeAuthStatus(w, userID)
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	s.sessions.Delete()
+	userID := userIDFromRequest(r)
+	if s.sessions != nil {
+		s.sessions.DeleteForUser(userID)
+	}
+	s.bumpAuthRevision(userID)
 	s.clearWalletTxnCache()
 	log.Println("[AUTH] Logged out")
-	writeJSON(w, map[string]interface{}{"logged_in": false})
+	s.writeAuthStatus(w, userID)
 }
 
-func (s *Server) handleAuthCharacter(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
-	if err != nil {
-		writeError(w, 401, err.Error())
-		return
-	}
-	sess := s.sessions.Get()
-	if sess == nil {
+func (s *Server) handleAuthCharacterSelect(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if s.sessions == nil {
 		writeError(w, 401, "not logged in")
 		return
 	}
+	var req struct {
+		CharacterID int64 `json:"character_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+	if req.CharacterID <= 0 {
+		writeError(w, 400, "character_id is required")
+		return
+	}
+	if err := s.sessions.SetActiveForUser(userID, req.CharacterID); err != nil {
+		writeError(w, 404, err.Error())
+		return
+	}
+	s.bumpAuthRevision(userID)
+	s.clearWalletTxnCache()
+	s.writeAuthStatus(w, userID)
+}
+
+func (s *Server) handleAuthCharacterDelete(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if s.sessions == nil {
+		writeError(w, 401, "not logged in")
+		return
+	}
+	characterID, err := strconv.ParseInt(r.PathValue("characterID"), 10, 64)
+	if err != nil || characterID <= 0 {
+		writeError(w, 400, "invalid characterID")
+		return
+	}
+	if err := s.sessions.DeleteByCharacterIDForUser(userID, characterID); err != nil {
+		writeError(w, 500, "delete failed: "+err.Error())
+		return
+	}
+	s.bumpAuthRevision(userID)
+	s.clearWalletTxnCache()
+	s.writeAuthStatus(w, userID)
+}
+
+func (s *Server) handleAuthCharacter(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
 
 	type charInfo struct {
 		CharacterID   int64                        `json:"character_id"`
@@ -2109,73 +2540,130 @@ func (s *Server) handleAuthCharacter(w http.ResponseWriter, r *http.Request) {
 		Risk          *engine.PortfolioRiskSummary `json:"risk,omitempty"`
 	}
 
-	result := charInfo{
-		CharacterID:   sess.CharacterID,
-		CharacterName: sess.CharacterName,
+	characterID, allScope, err := parseAuthScope(r)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, true)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
+		return
 	}
 
-	// Fetch all character data in parallel for faster popup loading.
-	var wgChar sync.WaitGroup
-	var muChar sync.Mutex
-
-	wgChar.Add(5)
-
-	go func() {
-		defer wgChar.Done()
-		if balance, err := s.esi.GetWalletBalance(sess.CharacterID, token); err == nil {
-			muChar.Lock()
-			result.Wallet = balance
-			muChar.Unlock()
-		} else {
-			log.Printf("[AUTH] Wallet error: %v", err)
+	fetchOne := func(sess *auth.Session) (*charInfo, error) {
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			return nil, tokenErr
 		}
-	}()
 
-	go func() {
-		defer wgChar.Done()
-		if orders, err := s.esi.GetCharacterOrders(sess.CharacterID, token); err == nil {
-			muChar.Lock()
-			result.Orders = orders
-			muChar.Unlock()
-		} else {
-			log.Printf("[AUTH] Orders error: %v", err)
+		result := &charInfo{
+			CharacterID:   sess.CharacterID,
+			CharacterName: sess.CharacterName,
 		}
-	}()
 
-	go func() {
-		defer wgChar.Done()
-		if history, err := s.esi.GetOrderHistory(sess.CharacterID, token); err == nil {
-			muChar.Lock()
-			result.OrderHistory = history
-			muChar.Unlock()
-		} else {
-			log.Printf("[AUTH] Order history error: %v", err)
+		// Fetch all character data in parallel for faster popup loading.
+		var wgChar sync.WaitGroup
+		var muChar sync.Mutex
+
+		wgChar.Add(5)
+
+		go func() {
+			defer wgChar.Done()
+			if balance, fetchErr := s.esi.GetWalletBalance(sess.CharacterID, token); fetchErr == nil {
+				muChar.Lock()
+				result.Wallet = balance
+				muChar.Unlock()
+			} else {
+				log.Printf("[AUTH] Wallet error (%s): %v", sess.CharacterName, fetchErr)
+			}
+		}()
+
+		go func() {
+			defer wgChar.Done()
+			if orders, fetchErr := s.esi.GetCharacterOrders(sess.CharacterID, token); fetchErr == nil {
+				muChar.Lock()
+				result.Orders = orders
+				muChar.Unlock()
+			} else {
+				log.Printf("[AUTH] Orders error (%s): %v", sess.CharacterName, fetchErr)
+			}
+		}()
+
+		go func() {
+			defer wgChar.Done()
+			if history, fetchErr := s.esi.GetOrderHistory(sess.CharacterID, token); fetchErr == nil {
+				muChar.Lock()
+				result.OrderHistory = history
+				muChar.Unlock()
+			} else {
+				log.Printf("[AUTH] Order history error (%s): %v", sess.CharacterName, fetchErr)
+			}
+		}()
+
+		go func() {
+			defer wgChar.Done()
+			if txns, fetchErr := s.esi.GetWalletTransactions(sess.CharacterID, token); fetchErr == nil {
+				muChar.Lock()
+				result.Transactions = txns
+				muChar.Unlock()
+			} else {
+				log.Printf("[AUTH] Transactions error (%s): %v", sess.CharacterName, fetchErr)
+			}
+		}()
+
+		go func() {
+			defer wgChar.Done()
+			if skills, fetchErr := s.esi.GetSkills(sess.CharacterID, token); fetchErr == nil {
+				muChar.Lock()
+				result.Skills = skills
+				muChar.Unlock()
+			} else {
+				log.Printf("[AUTH] Skills error (%s): %v", sess.CharacterName, fetchErr)
+			}
+		}()
+
+		wgChar.Wait()
+		return result, nil
+	}
+
+	collected := make([]*charInfo, 0, len(selectedSessions))
+	for _, sess := range selectedSessions {
+		info, fetchErr := fetchOne(sess)
+		if fetchErr != nil {
+			log.Printf("[AUTH] Failed to fetch character (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 401, fetchErr.Error())
+				return
+			}
+			continue
 		}
-	}()
+		collected = append(collected, info)
+	}
+	if len(collected) == 0 {
+		writeError(w, 401, "failed to fetch character data")
+		return
+	}
 
-	go func() {
-		defer wgChar.Done()
-		if txns, err := s.esi.GetWalletTransactions(sess.CharacterID, token); err == nil {
-			muChar.Lock()
-			result.Transactions = txns
-			muChar.Unlock()
-		} else {
-			log.Printf("[AUTH] Transactions error: %v", err)
+	var result charInfo
+	if allScope {
+		result = charInfo{
+			CharacterID:   0,
+			CharacterName: "All Characters",
 		}
-	}()
-
-	go func() {
-		defer wgChar.Done()
-		if skills, err := s.esi.GetSkills(sess.CharacterID, token); err == nil {
-			muChar.Lock()
-			result.Skills = skills
-			muChar.Unlock()
-		} else {
-			log.Printf("[AUTH] Skills error: %v", err)
+		for _, part := range collected {
+			result.Wallet += part.Wallet
+			result.Orders = append(result.Orders, part.Orders...)
+			result.OrderHistory = append(result.OrderHistory, part.OrderHistory...)
+			result.Transactions = append(result.Transactions, part.Transactions...)
 		}
-	}()
-
-	wgChar.Wait()
+	} else {
+		result = *collected[0]
+	}
 
 	// Enrich orders with type/location names
 	s.mu.RLock()
@@ -2232,14 +2720,27 @@ func (s *Server) handleAuthCharacter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthLocation(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+
+	characterID, allScope, err := parseAuthScope(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, 400, err.Error())
 		return
 	}
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeError(w, 401, "not logged in")
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, false)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
+		return
+	}
+	sess := selectedSessions[0]
+
+	token, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+	if err != nil {
+		writeError(w, 401, err.Error())
 		return
 	}
 
@@ -2282,22 +2783,45 @@ func (s *Server) handleAuthLocation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthUndercuts(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+
+	characterID, allScope, err := parseAuthScope(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, 400, err.Error())
 		return
 	}
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeError(w, 401, "not logged in")
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, true)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
 		return
 	}
 
-	// Fetch active orders using the shared ESI client.
-	orders, err := s.esi.GetCharacterOrders(sess.CharacterID, token)
-	if err != nil {
-		writeError(w, 500, "failed to fetch orders: "+err.Error())
-		return
+	// Fetch active orders for the selected scope.
+	var orders []esi.CharacterOrder
+	for _, sess := range selectedSessions {
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			log.Printf("[AUTH] Undercuts token error (%s): %v", sess.CharacterName, tokenErr)
+			if !allScope {
+				writeError(w, 401, tokenErr.Error())
+				return
+			}
+			continue
+		}
+		charOrders, fetchErr := s.esi.GetCharacterOrders(sess.CharacterID, token)
+		if fetchErr != nil {
+			log.Printf("[AUTH] Undercuts orders error (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 500, "failed to fetch orders: "+fetchErr.Error())
+				return
+			}
+			continue
+		}
+		orders = append(orders, charOrders...)
 	}
 
 	if len(orders) == 0 {
@@ -2353,20 +2877,26 @@ func (s *Server) handleAuthUndercuts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthOrderDesk(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+
+	characterID, allScope, err := parseAuthScope(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, 400, err.Error())
 		return
 	}
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeError(w, 401, "not logged in")
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, true)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
 		return
 	}
 
 	salesTax := 8.0
-	if s.cfg != nil {
-		salesTax = s.cfg.SalesTaxPercent
+	if cfg := s.loadConfigForUser(userID); cfg != nil {
+		salesTax = cfg.SalesTaxPercent
 	}
 	if v := r.URL.Query().Get("sales_tax"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
@@ -2386,11 +2916,29 @@ func (s *Server) handleAuthOrderDesk(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	orders, err := s.esi.GetCharacterOrders(sess.CharacterID, token)
-	if err != nil {
-		writeError(w, 500, "failed to fetch orders: "+err.Error())
-		return
+	var orders []esi.CharacterOrder
+	for _, sess := range selectedSessions {
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			log.Printf("[AUTH] OrderDesk token error (%s): %v", sess.CharacterName, tokenErr)
+			if !allScope {
+				writeError(w, 401, tokenErr.Error())
+				return
+			}
+			continue
+		}
+		charOrders, fetchErr := s.esi.GetCharacterOrders(sess.CharacterID, token)
+		if fetchErr != nil {
+			log.Printf("[AUTH] OrderDesk orders error (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 500, "failed to fetch orders: "+fetchErr.Error())
+				return
+			}
+			continue
+		}
+		orders = append(orders, charOrders...)
 	}
+
 	if len(orders) == 0 {
 		writeJSON(w, engine.ComputeOrderDesk(nil, nil, nil, nil, engine.OrderDeskOptions{
 			SalesTaxPercent:  salesTax,
@@ -2492,14 +3040,20 @@ func (s *Server) handleAuthOrderDesk(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+
+	characterID, allScope, err := parseAuthScope(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, 400, err.Error())
 		return
 	}
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeError(w, 401, "not logged in")
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, true)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
 		return
 	}
 
@@ -2511,8 +3065,8 @@ func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	salesTax := 8.0
-	if s.cfg != nil {
-		salesTax = s.cfg.SalesTaxPercent
+	if cfg := s.loadConfigForUser(userID); cfg != nil {
+		salesTax = cfg.SalesTaxPercent
 	}
 	if v := r.URL.Query().Get("sales_tax"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
@@ -2532,21 +3086,23 @@ func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var txns []esi.WalletTransaction
-	if cached, ok := s.getWalletTxnCache(sess.CharacterID); ok {
-		txns = cached
-	} else {
+	fetchTxns := func(sess *auth.Session) ([]esi.WalletTransaction, error) {
+		if cached, ok := s.getWalletTxnCache(sess.CharacterID); ok {
+			return cached, nil
+		}
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			return nil, tokenErr
+		}
 		freshTxns, fetchErr := s.esi.GetWalletTransactions(sess.CharacterID, token)
 		if fetchErr != nil {
-			writeError(w, 500, "failed to fetch transactions: "+fetchErr.Error())
-			return
+			return nil, fetchErr
 		}
 
 		// Enrich type names from SDE
 		s.mu.RLock()
 		sdeData := s.sdeData
 		s.mu.RUnlock()
-
 		if sdeData != nil {
 			for i := range freshTxns {
 				if t, ok := sdeData.Types[freshTxns[i].TypeID]; ok {
@@ -2554,11 +3110,30 @@ func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-
-		// Store in cache
 		s.setWalletTxnCache(sess.CharacterID, freshTxns)
+		return freshTxns, nil
+	}
 
-		txns = freshTxns
+	var txns []esi.WalletTransaction
+	for _, sess := range selectedSessions {
+		part, fetchErr := fetchTxns(sess)
+		if fetchErr != nil {
+			log.Printf("[AUTH] Portfolio txns error (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 500, "failed to fetch transactions: "+fetchErr.Error())
+				return
+			}
+			continue
+		}
+		txns = append(txns, part...)
+	}
+	if len(txns) == 0 && len(selectedSessions) > 0 {
+		if allScope {
+			writeError(w, 500, "failed to fetch transactions for selected characters")
+		} else {
+			writeError(w, 500, "failed to fetch transactions")
+		}
+		return
 	}
 
 	result := engine.ComputePortfolioPnLWithOptions(txns, engine.PortfolioPnLOptions{
@@ -2572,14 +3147,20 @@ func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthPortfolioOptimize(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+
+	characterID, allScope, err := parseAuthScope(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, 400, err.Error())
 		return
 	}
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeError(w, 401, "not logged in")
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, true)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
 		return
 	}
 
@@ -2591,21 +3172,23 @@ func (s *Server) handleAuthPortfolioOptimize(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	var txns []esi.WalletTransaction
-	if cached, ok := s.getWalletTxnCache(sess.CharacterID); ok {
-		txns = cached
-	} else {
+	fetchTxns := func(sess *auth.Session) ([]esi.WalletTransaction, error) {
+		if cached, ok := s.getWalletTxnCache(sess.CharacterID); ok {
+			return cached, nil
+		}
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			return nil, tokenErr
+		}
 		freshTxns, fetchErr := s.esi.GetWalletTransactions(sess.CharacterID, token)
 		if fetchErr != nil {
-			writeError(w, 500, "failed to fetch transactions: "+fetchErr.Error())
-			return
+			return nil, fetchErr
 		}
 
 		// Enrich type names from SDE
 		s.mu.RLock()
 		sdeData := s.sdeData
 		s.mu.RUnlock()
-
 		if sdeData != nil {
 			for i := range freshTxns {
 				if t, ok := sdeData.Types[freshTxns[i].TypeID]; ok {
@@ -2613,11 +3196,30 @@ func (s *Server) handleAuthPortfolioOptimize(w http.ResponseWriter, r *http.Requ
 				}
 			}
 		}
-
-		// Store in cache
 		s.setWalletTxnCache(sess.CharacterID, freshTxns)
+		return freshTxns, nil
+	}
 
-		txns = freshTxns
+	var txns []esi.WalletTransaction
+	for _, sess := range selectedSessions {
+		part, fetchErr := fetchTxns(sess)
+		if fetchErr != nil {
+			log.Printf("[AUTH] Optimizer txns error (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 500, "failed to fetch transactions: "+fetchErr.Error())
+				return
+			}
+			continue
+		}
+		txns = append(txns, part...)
+	}
+	if len(txns) == 0 && len(selectedSessions) > 0 {
+		if allScope {
+			writeError(w, 500, "failed to fetch transactions for selected characters")
+		} else {
+			writeError(w, 500, "failed to fetch transactions")
+		}
+		return
 	}
 
 	result, diag := engine.ComputePortfolioOptimization(txns, days)
@@ -3480,14 +4082,26 @@ func (s *Server) handlePLEXDashboard(w http.ResponseWriter, r *http.Request) {
 
 // handleAuthRoles returns the character's corporation roles and director status.
 func (s *Server) handleAuthRoles(w http.ResponseWriter, r *http.Request) {
-	token, err := s.sessions.EnsureValidToken(s.sso)
+	userID := userIDFromRequest(r)
+
+	characterID, allScope, err := parseAuthScope(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, 400, err.Error())
 		return
 	}
-	sess := s.sessions.Get()
-	if sess == nil {
-		writeError(w, 401, "not logged in")
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, false)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
+		return
+	}
+	sess := selectedSessions[0]
+	token, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+	if err != nil {
+		writeError(w, 401, err.Error())
 		return
 	}
 
@@ -3532,13 +4146,19 @@ func (s *Server) handleAuthRoles(w http.ResponseWriter, r *http.Request) {
 func (s *Server) corpProvider(r *http.Request) (corp.CorpDataProvider, error) {
 	mode := r.URL.Query().Get("mode")
 	if mode == "live" {
-		token, err := s.sessions.EnsureValidToken(s.sso)
+		userID := userIDFromRequest(r)
+		characterID, allScope, err := parseAuthScope(r)
+		if err != nil {
+			return nil, err
+		}
+		selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, false)
 		if err != nil {
 			return nil, fmt.Errorf("not logged in: %w", err)
 		}
-		sess := s.sessions.Get()
-		if sess == nil {
-			return nil, fmt.Errorf("not logged in")
+		sess := selectedSessions[0]
+		token, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if err != nil {
+			return nil, fmt.Errorf("not logged in: %w", err)
 		}
 		corpID, err := s.esi.GetCharacterCorporationID(sess.CharacterID)
 		if err != nil {

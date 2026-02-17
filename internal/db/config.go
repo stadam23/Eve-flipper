@@ -13,9 +13,16 @@ import (
 
 // LoadConfig reads config from SQLite. If empty, returns defaults.
 func (d *DB) LoadConfig() *config.Config {
+	return d.LoadConfigForUser(DefaultUserID)
+}
+
+// LoadConfigForUser reads config from SQLite for a specific user.
+// If empty, returns defaults.
+func (d *DB) LoadConfigForUser(userID string) *config.Config {
+	userID = normalizeUserID(userID)
 	cfg := config.Default()
 
-	rows, err := d.sql.Query("SELECT key, value FROM config")
+	rows, err := d.sql.Query("SELECT key, value FROM config WHERE user_id = ?", userID)
 	if err != nil {
 		return cfg
 	}
@@ -107,6 +114,13 @@ func (d *DB) LoadConfig() *config.Config {
 
 // SaveConfig writes config to SQLite (upsert all fields).
 func (d *DB) SaveConfig(cfg *config.Config) error {
+	return d.SaveConfigForUser(DefaultUserID, cfg)
+}
+
+// SaveConfigForUser writes config to SQLite (upsert all fields) for a specific user.
+func (d *DB) SaveConfigForUser(userID string, cfg *config.Config) error {
+	userID = normalizeUserID(userID)
+
 	pairs := map[string]string{
 		"system_name":             cfg.SystemName,
 		"cargo_capacity":          fmt.Sprintf("%g", cfg.CargoCapacity),
@@ -137,7 +151,7 @@ func (d *DB) SaveConfig(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")
+	stmt, err := tx.Prepare("INSERT OR REPLACE INTO config (user_id, key, value) VALUES (?, ?, ?)")
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -145,7 +159,7 @@ func (d *DB) SaveConfig(cfg *config.Config) error {
 	defer stmt.Close()
 
 	for k, v := range pairs {
-		if _, err := stmt.Exec(k, v); err != nil {
+		if _, err := stmt.Exec(userID, k, v); err != nil {
 			tx.Rollback()
 			return err
 		}

@@ -76,6 +76,12 @@ const baseColumnDefs: ColumnDef[] = [
     numeric: true,
   },
   {
+    key: "IskPerM3",
+    labelKey: "colIskPerM3",
+    width: "min-w-[90px]",
+    numeric: true,
+  },
+  {
     key: "UnitsToBuy",
     labelKey: "colUnitsToBuy",
     width: "min-w-[80px]",
@@ -250,9 +256,34 @@ function passesTextFilter(val: unknown, fval: string): boolean {
     .includes(fval.toLowerCase());
 }
 
+function rowProfitPerUnit(row: FlipResult): number {
+  if (row.RealProfit != null && row.FilledQty != null && row.FilledQty > 0) {
+    const realPerUnit = row.RealProfit / row.FilledQty;
+    if (Number.isFinite(realPerUnit)) return realPerUnit;
+  }
+  const fallback = row.ProfitPerUnit;
+  return Number.isFinite(fallback) ? fallback : 0;
+}
+
+function rowIskPerM3(row: FlipResult): number {
+  const volume = Number(row.Volume);
+  if (!Number.isFinite(volume) || volume <= 0) return 0;
+  return rowProfitPerUnit(row) / volume;
+}
+
+function getCellValue(row: FlipResult, key: SortKey): unknown {
+  if (key === "IskPerM3") {
+    if (row.IskPerM3 != null && Number.isFinite(row.IskPerM3)) {
+      return row.IskPerM3;
+    }
+    return rowIskPerM3(row);
+  }
+  return row[key];
+}
+
 function passesFilter(row: FlipResult, col: ColumnDef, fval: string): boolean {
   if (!fval) return true;
-  const cellVal = row[col.key];
+  const cellVal = getCellValue(row, col.key);
   return col.numeric
     ? passesNumericFilter(cellVal as number, fval)
     : passesTextFilter(cellVal, fval);
@@ -261,7 +292,7 @@ function passesFilter(row: FlipResult, col: ColumnDef, fval: string): boolean {
 /* ─── Cell formatting ─── */
 
 function fmtCell(col: ColumnDef, row: FlipResult): string {
-  const val = row[col.key];
+  const val = getCellValue(row, col.key);
   if (col.key === "ExpectedProfit" || col.key === "RealProfit") {
     if (val == null || Number.isNaN(val)) return "\u2014";
     return formatISK(val as number);
@@ -275,7 +306,8 @@ function fmtCell(col: ColumnDef, row: FlipResult): string {
     col.key === "SellPrice" ||
     col.key === "TotalProfit" ||
     col.key === "ProfitPerJump" ||
-    col.key === "DailyProfit"
+    col.key === "DailyProfit" ||
+    col.key === "IskPerM3"
   ) {
     return formatISK(val as number);
   }
@@ -392,8 +424,8 @@ export function ScanResultsTable({
         const bPin = pinnedIds.has(b.id);
         if (aPin !== bPin) return aPin ? -1 : 1;
 
-        const av = a.row[sortKey];
-        const bv = b.row[sortKey];
+        const av = getCellValue(a.row, sortKey);
+        const bv = getCellValue(b.row, sortKey);
         if (typeof av === "number" || typeof bv === "number") {
           if (av == null && bv == null) return 0;
           if (av == null) return 1;
@@ -545,7 +577,7 @@ export function ScanResultsTable({
     const csvRows = rows.map((ir) =>
       columnDefs
         .map((col) => {
-          const str = String(ir.row[col.key] ?? "");
+          const str = String(getCellValue(ir.row, col.key) ?? "");
           return str.includes(",") ? `"${str}"` : str;
         })
         .join(","),

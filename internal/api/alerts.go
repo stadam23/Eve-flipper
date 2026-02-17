@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"eve-flipper/internal/config"
 	"eve-flipper/internal/db"
 	"eve-flipper/internal/engine"
 )
@@ -29,8 +30,8 @@ type AlertCheckResult struct {
 
 // CheckWatchlistAlerts evaluates watchlist items against scan results and determines which alerts to fire.
 // Returns list of alerts that should be sent (respecting cooldown and deduplication).
-func (s *Server) CheckWatchlistAlerts(results interface{}) []AlertCheckResult {
-	watchlist := s.db.GetWatchlist()
+func (s *Server) CheckWatchlistAlerts(userID string, results interface{}) []AlertCheckResult {
+	watchlist := s.db.GetWatchlistForUser(userID)
 	var alerts []AlertCheckResult
 
 	for _, item := range watchlist {
@@ -62,7 +63,7 @@ func (s *Server) CheckWatchlistAlerts(results interface{}) []AlertCheckResult {
 		}
 
 		// Check cooldown (deduplication)
-		lastAlertTime, err := s.db.GetLastAlertTime(item.TypeID, metric, threshold)
+		lastAlertTime, err := s.db.GetLastAlertTimeForUser(userID, item.TypeID, metric, threshold)
 		if err != nil {
 			log.Printf("[ALERT] Error checking last alert time for type %d: %v", item.TypeID, err)
 			continue
@@ -98,26 +99,26 @@ func (s *Server) CheckWatchlistAlerts(results interface{}) []AlertCheckResult {
 }
 
 // processWatchlistAlerts evaluates alerts for a result set and sends all triggered alerts.
-func (s *Server) processWatchlistAlerts(results interface{}, scanID *int64) {
+func (s *Server) processWatchlistAlerts(userID string, cfg *config.Config, results interface{}, scanID *int64) {
 	// Desktop notifications are handled on frontend; backend processes only external channels.
-	if s.cfg == nil || (!s.cfg.AlertTelegram && !s.cfg.AlertDiscord) {
+	if cfg == nil || (!cfg.AlertTelegram && !cfg.AlertDiscord) {
 		return
 	}
-	alerts := s.CheckWatchlistAlerts(results)
+	alerts := s.CheckWatchlistAlerts(userID, results)
 	if len(alerts) == 0 {
 		return
 	}
 	for _, alert := range alerts {
-		if err := s.SendAlert(alert, scanID); err != nil {
+		if err := s.SendAlert(userID, cfg, alert, scanID); err != nil {
 			log.Printf("[ALERT] Failed sending alert for type %d: %v", alert.TypeID, err)
 		}
 	}
 }
 
 // SendAlert sends an alert via configured channels and records it in history.
-func (s *Server) SendAlert(alert AlertCheckResult, scanID *int64) error {
+func (s *Server) SendAlert(userID string, cfg *config.Config, alert AlertCheckResult, scanID *int64) error {
 	// Send via configured channels
-	result := s.sendConfiguredExternalAlerts(alert.Message)
+	result := s.sendConfiguredExternalAlerts(cfg, alert.Message)
 
 	// Record in history
 	channelsSent := result.Sent
@@ -136,7 +137,7 @@ func (s *Server) SendAlert(alert AlertCheckResult, scanID *int64) error {
 		ScanID:          scanID,
 	}
 
-	if err := s.db.SaveAlertHistory(entry); err != nil {
+	if err := s.db.SaveAlertHistoryForUser(userID, entry); err != nil {
 		log.Printf("[ALERT] Failed to save alert history: %v", err)
 		// Don't fail the alert send if history save fails
 	}

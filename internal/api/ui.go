@@ -4,14 +4,33 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // handleUIOpenMarket opens a market window in the EVE client for the given type_id.
 // POST /api/ui/open-market
 // Body: {"type_id": 34}
 func (s *Server) handleUIOpenMarket(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessions.Get()
+	if s.sessions == nil {
+		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+		return
+	}
+	userID := userIDFromRequest(r)
+	sess := s.sessions.GetForUser(userID)
 	if sess == nil || sess.AccessToken == "" {
+		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+		return
+	}
+	token := strings.TrimSpace(sess.AccessToken)
+	if s.sso != nil {
+		refreshed, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if err != nil {
+			http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+			return
+		}
+		token = strings.TrimSpace(refreshed)
+	}
+	if token == "" {
 		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
 		return
 	}
@@ -30,7 +49,7 @@ func (s *Server) handleUIOpenMarket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[API] OpenMarketWindow: type_id=%d, character_id=%d", req.TypeID, sess.CharacterID)
-	if err := s.esi.OpenMarketWindow(req.TypeID, sess.AccessToken); err != nil {
+	if err := s.esi.OpenMarketWindow(req.TypeID, token); err != nil {
 		log.Printf("[API] OpenMarketWindow error: type_id=%d, err=%v", req.TypeID, err)
 		http.Error(w, `{"error":"esi_error"}`, http.StatusInternalServerError)
 		return
@@ -45,8 +64,26 @@ func (s *Server) handleUIOpenMarket(w http.ResponseWriter, r *http.Request) {
 // POST /api/ui/set-waypoint
 // Body: {"solar_system_id": 30000142, "clear_other_waypoints": true, "add_to_beginning": false}
 func (s *Server) handleUISetWaypoint(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessions.Get()
+	if s.sessions == nil {
+		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+		return
+	}
+	userID := userIDFromRequest(r)
+	sess := s.sessions.GetForUser(userID)
 	if sess == nil || sess.AccessToken == "" {
+		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+		return
+	}
+	token := strings.TrimSpace(sess.AccessToken)
+	if s.sso != nil {
+		refreshed, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if err != nil {
+			http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+			return
+		}
+		token = strings.TrimSpace(refreshed)
+	}
+	if token == "" {
 		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
 		return
 	}
@@ -68,7 +105,7 @@ func (s *Server) handleUISetWaypoint(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[API] SetWaypoint: solar_system_id=%d, clear=%t, add_to_beginning=%t, character_id=%d",
 		req.SolarSystemID, req.ClearOtherWaypoints, req.AddToBeginning, sess.CharacterID)
-	if err := s.esi.SetWaypoint(req.SolarSystemID, req.ClearOtherWaypoints, req.AddToBeginning, sess.AccessToken); err != nil {
+	if err := s.esi.SetWaypoint(req.SolarSystemID, req.ClearOtherWaypoints, req.AddToBeginning, token); err != nil {
 		log.Printf("[API] SetWaypoint error: solar_system_id=%d, err=%v", req.SolarSystemID, err)
 		http.Error(w, `{"error":"esi_error"}`, http.StatusInternalServerError)
 		return
@@ -83,8 +120,26 @@ func (s *Server) handleUISetWaypoint(w http.ResponseWriter, r *http.Request) {
 // POST /api/ui/open-contract
 // Body: {"contract_id": 123456789}
 func (s *Server) handleUIOpenContract(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessions.Get()
+	if s.sessions == nil {
+		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+		return
+	}
+	userID := userIDFromRequest(r)
+	sess := s.sessions.GetForUser(userID)
 	if sess == nil || sess.AccessToken == "" {
+		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+		return
+	}
+	token := strings.TrimSpace(sess.AccessToken)
+	if s.sso != nil {
+		refreshed, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if err != nil {
+			http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
+			return
+		}
+		token = strings.TrimSpace(refreshed)
+	}
+	if token == "" {
 		http.Error(w, `{"error":"not_logged_in"}`, http.StatusUnauthorized)
 		return
 	}
@@ -103,7 +158,7 @@ func (s *Server) handleUIOpenContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[API] OpenContractWindow: contract_id=%d, character_id=%d", req.ContractID, sess.CharacterID)
-	if err := s.esi.OpenContractWindow(req.ContractID, sess.AccessToken); err != nil {
+	if err := s.esi.OpenContractWindow(req.ContractID, token); err != nil {
 		log.Printf("[API] OpenContractWindow error: contract_id=%d, err=%v", req.ContractID, err)
 		http.Error(w, `{"error":"esi_error"}`, http.StatusInternalServerError)
 		return

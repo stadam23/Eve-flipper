@@ -497,6 +497,159 @@ func (d *DB) migrate() error {
 		logger.Info("DB", "Applied migration v14 (alert history)")
 	}
 
+	if version < 15 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS auth_session_new (
+				character_id    INTEGER PRIMARY KEY,
+				character_name  TEXT NOT NULL,
+				access_token    TEXT NOT NULL,
+				refresh_token   TEXT NOT NULL,
+				expires_at      INTEGER NOT NULL,
+				is_active       INTEGER NOT NULL DEFAULT 0
+			);
+
+			INSERT OR REPLACE INTO auth_session_new (character_id, character_name, access_token, refresh_token, expires_at, is_active)
+			SELECT
+				character_id,
+				character_name,
+				access_token,
+				refresh_token,
+				expires_at,
+				CASE WHEN id = 1 THEN 1 ELSE 0 END
+			FROM auth_session;
+
+			DROP TABLE auth_session;
+			ALTER TABLE auth_session_new RENAME TO auth_session;
+
+			-- Exactly one active character is preferred; ensure at least one.
+			UPDATE auth_session
+			   SET is_active = 1
+			 WHERE character_id = (
+				SELECT character_id
+				  FROM auth_session
+				 ORDER BY is_active DESC, character_id ASC
+				 LIMIT 1
+			 )
+			   AND NOT EXISTS (
+				SELECT 1 FROM auth_session WHERE is_active = 1
+			 );
+
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_session_active ON auth_session(is_active) WHERE is_active = 1;
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (15);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v15: %w", err)
+		}
+		logger.Info("DB", "Applied migration v15 (multi-character auth sessions)")
+	}
+
+	if version < 16 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS config_new (
+				user_id TEXT NOT NULL,
+				key     TEXT NOT NULL,
+				value   TEXT NOT NULL,
+				PRIMARY KEY (user_id, key)
+			);
+
+			INSERT OR IGNORE INTO config_new (user_id, key, value)
+			SELECT 'default', key, value FROM config;
+
+			DROP TABLE config;
+			ALTER TABLE config_new RENAME TO config;
+
+			ALTER TABLE watchlist RENAME TO watchlist_legacy;
+
+			CREATE TABLE IF NOT EXISTS watchlist (
+				user_id          TEXT NOT NULL,
+				type_id          INTEGER NOT NULL,
+				type_name        TEXT NOT NULL,
+				added_at         TEXT NOT NULL,
+				alert_min_margin REAL NOT NULL DEFAULT 0,
+				alert_enabled    INTEGER NOT NULL DEFAULT 0,
+				alert_metric     TEXT NOT NULL DEFAULT 'margin_percent',
+				alert_threshold  REAL NOT NULL DEFAULT 0,
+				PRIMARY KEY (user_id, type_id)
+			);
+
+			INSERT OR IGNORE INTO watchlist (
+				user_id, type_id, type_name, added_at,
+				alert_min_margin, alert_enabled, alert_metric, alert_threshold
+			)
+			SELECT
+				'default', type_id, type_name, added_at,
+				alert_min_margin, alert_enabled, alert_metric, alert_threshold
+			FROM watchlist_legacy;
+
+			CREATE INDEX IF NOT EXISTS idx_watchlist_user_added ON watchlist(user_id, added_at DESC);
+
+			CREATE TABLE IF NOT EXISTS alert_history_new (
+				id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id             TEXT NOT NULL,
+				watchlist_type_id   INTEGER NOT NULL,
+				type_name           TEXT NOT NULL,
+				alert_metric        TEXT NOT NULL,
+				alert_threshold     REAL NOT NULL,
+				current_value       REAL NOT NULL,
+				message             TEXT NOT NULL,
+				channels_sent       TEXT NOT NULL,
+				channels_failed     TEXT,
+				sent_at             TEXT NOT NULL,
+				scan_id             INTEGER,
+				FOREIGN KEY (user_id, watchlist_type_id) REFERENCES watchlist(user_id, type_id) ON DELETE CASCADE
+			);
+
+			INSERT OR IGNORE INTO alert_history_new (
+				user_id, watchlist_type_id, type_name, alert_metric, alert_threshold,
+				current_value, message, channels_sent, channels_failed, sent_at, scan_id
+			)
+			SELECT
+				'default', ah.watchlist_type_id, ah.type_name, ah.alert_metric, ah.alert_threshold,
+				ah.current_value, ah.message, ah.channels_sent, ah.channels_failed, ah.sent_at, ah.scan_id
+			FROM alert_history ah
+			INNER JOIN watchlist_legacy w
+				ON w.type_id = ah.watchlist_type_id;
+
+			DROP TABLE alert_history;
+			ALTER TABLE alert_history_new RENAME TO alert_history;
+			CREATE INDEX IF NOT EXISTS idx_alert_history_user_type ON alert_history(user_id, watchlist_type_id, sent_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_alert_history_user_time ON alert_history(user_id, sent_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_alert_history_scan ON alert_history(scan_id);
+
+			DROP TABLE watchlist_legacy;
+
+			CREATE TABLE IF NOT EXISTS auth_session_new (
+				user_id         TEXT NOT NULL,
+				character_id    INTEGER NOT NULL,
+				character_name  TEXT NOT NULL,
+				access_token    TEXT NOT NULL,
+				refresh_token   TEXT NOT NULL,
+				expires_at      INTEGER NOT NULL,
+				is_active       INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (user_id, character_id)
+			);
+
+			INSERT OR REPLACE INTO auth_session_new (
+				user_id, character_id, character_name, access_token, refresh_token, expires_at, is_active
+			)
+			SELECT
+				'default', character_id, character_name, access_token, refresh_token, expires_at, is_active
+			FROM auth_session;
+
+			DROP TABLE auth_session;
+			ALTER TABLE auth_session_new RENAME TO auth_session;
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_session_active ON auth_session(user_id) WHERE is_active = 1;
+			CREATE INDEX IF NOT EXISTS idx_auth_session_user ON auth_session(user_id, character_name, character_id);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (16);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v16: %w", err)
+		}
+		logger.Info("DB", "Applied migration v16 (user-scoped auth/config/watchlist/alerts)")
+	}
+
 	return nil
 }
 

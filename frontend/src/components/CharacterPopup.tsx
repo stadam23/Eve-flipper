@@ -1,19 +1,34 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { Modal } from "./Modal";
-import { getCharacterInfo, getCharacterRoles, getOrderDesk, getUndercuts, getPortfolioPnL, getPortfolioOptimization, type OptimizerResult } from "../lib/api";
+import { getCharacterInfo, getCharacterRoles, getOrderDesk, getUndercuts, getPortfolioPnL, getPortfolioOptimization, openMarketInGame, type CharacterScope, type OptimizerResult } from "../lib/api";
 import { useI18n, type TranslationKey } from "../lib/i18n";
-import type { CharacterInfo, CharacterOrder, CharacterRoles, HistoricalOrder, PortfolioPnL, ItemPnL, StationPnL, UndercutStatus, WalletTransaction, AssetStats, AllocationSuggestion, OrderDeskResponse } from "../lib/types";
+import type { AuthCharacter, CharacterInfo, CharacterOrder, CharacterRoles, HistoricalOrder, PortfolioPnL, ItemPnL, StationPnL, UndercutStatus, WalletTransaction, AssetStats, AllocationSuggestion, OrderDeskResponse } from "../lib/types";
+import { useGlobalToast } from "./Toast";
+import { handleEveUIError } from "../lib/handleEveUIError";
 
 interface CharacterPopupProps {
   open: boolean;
   onClose: () => void;
-  characterId: number;
-  characterName: string;
+  activeCharacterId?: number;
+  characters: AuthCharacter[];
+  onSelectCharacter: (characterId: number) => Promise<void>;
+  onDeleteCharacter: (characterId: number) => Promise<void>;
+  onAddCharacter: () => Promise<void>;
+  onAuthRefresh: () => Promise<void>;
 }
 
 type CharTab = "overview" | "orders" | "transactions" | "pnl" | "risk" | "optimizer";
 
-export function CharacterPopup({ open, onClose, characterId, characterName }: CharacterPopupProps) {
+export function CharacterPopup({
+  open,
+  onClose,
+  activeCharacterId,
+  characters,
+  onSelectCharacter,
+  onDeleteCharacter,
+  onAddCharacter,
+  onAuthRefresh,
+}: CharacterPopupProps) {
   const { t } = useI18n();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,26 +36,104 @@ export function CharacterPopup({ open, onClose, characterId, characterName }: Ch
   const [tab, setTab] = useState<CharTab>("overview");
   const [corpRoles, setCorpRoles] = useState<CharacterRoles | null>(null);
   const [corpRolesLoading, setCorpRolesLoading] = useState(false);
+  const [selectedScope, setSelectedScope] = useState<CharacterScope>(activeCharacterId ?? "all");
+  const [scopeBusy, setScopeBusy] = useState(false);
+  const [deletingCharacterId, setDeletingCharacterId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    if (activeCharacterId) {
+      setSelectedScope(activeCharacterId);
+      return;
+    }
+    setSelectedScope("all");
+  }, [open, activeCharacterId]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (selectedScope === "all") return;
+    if (characters.some((c) => c.character_id === selectedScope)) return;
+    if (activeCharacterId) {
+      setSelectedScope(activeCharacterId);
+      return;
+    }
+    setSelectedScope("all");
+  }, [open, selectedScope, characters, activeCharacterId]);
+
+  const selectedCharacter = selectedScope === "all"
+    ? null
+    : characters.find((c) => c.character_id === selectedScope);
+  const modalTitle = selectedScope === "all"
+    ? t("charAllCharacters")
+    : selectedCharacter?.character_name ?? t("charOverview");
 
   const loadData = useCallback(() => {
     setLoading(true);
     setError(null);
-    getCharacterInfo()
+    getCharacterInfo(selectedScope)
       .then(setData)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, []);
+  }, [selectedScope]);
 
   useEffect(() => {
     if (!open) return;
     loadData();
-    // Also check corp roles
+    if (selectedScope === "all") {
+      setCorpRoles(null);
+      setCorpRolesLoading(false);
+      return;
+    }
+    // Also check corp roles for selected character
     setCorpRolesLoading(true);
-    getCharacterRoles()
+    getCharacterRoles(undefined, selectedScope)
       .then(setCorpRoles)
       .catch(() => setCorpRoles(null))
       .finally(() => setCorpRolesLoading(false));
-  }, [open, loadData]);
+  }, [open, loadData, selectedScope]);
+
+  const handleSelectScope = useCallback(async (scope: CharacterScope) => {
+    if (scope === "all") {
+      setSelectedScope("all");
+      return;
+    }
+    if (selectedScope === scope) return;
+    setScopeBusy(true);
+    setError(null);
+    try {
+      await onSelectCharacter(scope);
+      setSelectedScope(scope);
+    } catch (e: any) {
+      setError(e?.message || "Failed to switch character");
+    } finally {
+      setScopeBusy(false);
+    }
+  }, [selectedScope, onSelectCharacter]);
+
+  const handleDeleteScope = useCallback(async (characterId: number) => {
+    setDeletingCharacterId(characterId);
+    setError(null);
+    try {
+      await onDeleteCharacter(characterId);
+      await onAuthRefresh();
+      if (selectedScope === characterId) {
+        setSelectedScope("all");
+      }
+    } catch (e: any) {
+      setError(e?.message || "Failed to remove character");
+    } finally {
+      setDeletingCharacterId(null);
+    }
+  }, [onDeleteCharacter, onAuthRefresh, selectedScope]);
+
+  const handleAdd = useCallback(async () => {
+    setScopeBusy(true);
+    try {
+      await onAddCharacter();
+    } finally {
+      setScopeBusy(false);
+    }
+  }, [onAddCharacter]);
 
   const formatIsk = (value: number) => {
     if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
@@ -69,8 +162,68 @@ export function CharacterPopup({ open, onClose, characterId, characterName }: Ch
   const totalSold = sellTxns.reduce((sum, t) => sum + t.unit_price * t.quantity, 0);
 
   return (
-    <Modal open={open} onClose={onClose} title={characterName} width="max-w-4xl">
+    <Modal open={open} onClose={onClose} title={modalTitle} width="max-w-5xl">
       <div className="flex flex-col h-[70vh]">
+        {/* Character selector */}
+        <div className="border-b border-eve-border bg-eve-panel/60 px-4 py-3 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[10px] text-eve-dim uppercase tracking-wider">{t("charSelectCharacter")}</div>
+            <button
+              onClick={() => { void handleAdd(); }}
+              disabled={scopeBusy}
+              className="px-2 py-1 text-[10px] rounded-sm border border-eve-border bg-eve-dark text-eve-dim hover:text-eve-accent hover:border-eve-accent/50 transition-colors disabled:opacity-50"
+            >
+              {t("charAddCharacter")}
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => { void handleSelectScope("all"); }}
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-sm border text-[11px] transition-colors ${
+                selectedScope === "all"
+                  ? "border-eve-accent bg-eve-accent/15 text-eve-accent"
+                  : "border-eve-border bg-eve-dark text-eve-dim hover:text-eve-text hover:border-eve-accent/50"
+              }`}
+            >
+              {t("charAllCharacters")}
+            </button>
+            {characters.map((character) => (
+              <div key={character.character_id} className="inline-flex items-center rounded-sm border border-eve-border bg-eve-dark overflow-hidden">
+                <button
+                  onClick={() => { void handleSelectScope(character.character_id); }}
+                  className={`inline-flex items-center gap-1.5 px-2 py-1 text-[11px] transition-colors ${
+                    selectedScope === character.character_id
+                      ? "text-eve-accent bg-eve-accent/10"
+                      : "text-eve-dim hover:text-eve-text"
+                  }`}
+                >
+                  <img
+                    src={`https://images.evetech.net/characters/${character.character_id}/portrait?size=32`}
+                    alt=""
+                    className="w-4 h-4 rounded-sm"
+                  />
+                  <span>{character.character_name}</span>
+                  {character.active && <span className="text-[9px] text-eve-dim">({t("charActive")})</span>}
+                </button>
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void handleDeleteScope(character.character_id);
+                  }}
+                  disabled={deletingCharacterId === character.character_id}
+                  className="px-1.5 py-1 text-eve-dim hover:text-eve-error transition-colors disabled:opacity-50"
+                  title={t("charRemoveCharacter")}
+                  aria-label={t("charRemoveCharacter")}
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+
         {/* Tabs + Refresh */}
         <div className="flex items-center border-b border-eve-border bg-eve-panel">
           <div className="flex flex-1 overflow-x-auto scrollbar-thin">
@@ -84,7 +237,7 @@ export function CharacterPopup({ open, onClose, characterId, characterName }: Ch
           {/* Refresh button */}
           <button
             onClick={loadData}
-            disabled={loading}
+            disabled={loading || scopeBusy}
             className="px-2 py-1.5 mr-2 text-eve-dim hover:text-eve-accent transition-colors disabled:opacity-50"
             title={t("charRefresh")}
           >
@@ -107,7 +260,8 @@ export function CharacterPopup({ open, onClose, characterId, characterName }: Ch
               {tab === "overview" && (
                 <OverviewTab
                   data={data}
-                  characterId={characterId}
+                  characterId={selectedScope === "all" ? undefined : selectedScope}
+                  isAllScope={selectedScope === "all"}
                   formatIsk={formatIsk}
                   formatNumber={formatNumber}
                   buyOrders={buyOrders}
@@ -123,6 +277,7 @@ export function CharacterPopup({ open, onClose, characterId, characterName }: Ch
               )}
               {tab === "orders" && (
                 <CombinedOrdersTab
+                  characterScope={selectedScope}
                   orders={data.orders}
                   history={data.order_history ?? []}
                   formatIsk={formatIsk}
@@ -134,18 +289,19 @@ export function CharacterPopup({ open, onClose, characterId, characterName }: Ch
                 <TransactionsTab transactions={data.transactions ?? []} formatIsk={formatIsk} formatDate={formatDate} t={t} />
               )}
               {tab === "pnl" && (
-                <PnLTab formatIsk={formatIsk} t={t} />
+                <PnLTab formatIsk={formatIsk} characterScope={selectedScope} t={t} />
               )}
               {tab === "risk" && (
                 <RiskTab
-                  characterId={characterId}
+                  characterId={selectedScope === "all" ? undefined : selectedScope}
+                  isAllScope={selectedScope === "all"}
                   data={data}
                   formatIsk={formatIsk}
                   t={t}
                 />
               )}
               {tab === "optimizer" && (
-                <OptimizerTab formatIsk={formatIsk} t={t} />
+                <OptimizerTab formatIsk={formatIsk} characterScope={selectedScope} t={t} />
               )}
             </>
           )}
@@ -172,7 +328,8 @@ function TabBtn({ active, onClick, label }: { active: boolean; onClick: () => vo
 
 interface OverviewTabProps {
   data: CharacterInfo;
-  characterId: number;
+  characterId?: number;
+  isAllScope: boolean;
   formatIsk: (v: number) => string;
   formatNumber: (v: number) => string;
   buyOrders: CharacterOrder[];
@@ -189,6 +346,7 @@ interface OverviewTabProps {
 function OverviewTab({
   data,
   characterId,
+  isAllScope,
   formatIsk,
   formatNumber,
   buyOrders,
@@ -211,14 +369,20 @@ function OverviewTab({
     <div className="space-y-4">
       {/* Character Header */}
       <div className="flex items-center gap-4 p-4 bg-eve-panel border border-eve-border rounded-sm">
-        <img
-          src={`https://images.evetech.net/characters/${characterId}/portrait?size=128`}
-          alt=""
-          className="w-16 h-16 rounded-sm"
-        />
+        {characterId ? (
+          <img
+            src={`https://images.evetech.net/characters/${characterId}/portrait?size=128`}
+            alt=""
+            className="w-16 h-16 rounded-sm"
+          />
+        ) : (
+          <div className="w-16 h-16 rounded-sm bg-eve-dark border border-eve-border flex items-center justify-center text-xs text-eve-accent font-semibold">
+            ALL
+          </div>
+        )}
         <div>
-          <h2 className="text-lg font-bold text-eve-text">{data.character_name}</h2>
-          {data.skills && (
+          <h2 className="text-lg font-bold text-eve-text">{isAllScope ? t("charAllCharacters") : data.character_name}</h2>
+          {data.skills && !isAllScope && (
             <div className="text-sm text-eve-dim">{formatNumber(data.skills.total_sp)} SP</div>
           )}
         </div>
@@ -251,57 +415,59 @@ function OverviewTab({
       </div>
 
       {/* Corp Dashboard Section */}
-      <div className="bg-eve-panel border border-eve-border rounded-sm p-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <svg className="w-5 h-5 text-eve-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
-            </svg>
-            <div>
-              <div className="text-sm font-medium text-eve-text">{t("corpDashboard")}</div>
-              {corpRolesLoading ? (
-                <div className="flex items-center gap-1.5 text-xs text-eve-dim">
-                  <span className="inline-block w-3 h-3 border-2 border-eve-accent/40 border-t-eve-accent rounded-full animate-spin" />
-                  {t("corpRolesChecking")}
-                </div>
-              ) : corpRoles?.is_director ? (
-                <div className="flex items-center gap-1.5 text-xs">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                  <span className="text-emerald-400 font-medium">{t("corpDirector")}</span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1.5 text-xs">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-eve-dim" />
-                  <span className="text-eve-dim">{t("corpNotDirector")}</span>
-                </div>
+      {!isAllScope && (
+        <div className="bg-eve-panel border border-eve-border rounded-sm p-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <svg className="w-5 h-5 text-eve-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+              </svg>
+              <div>
+                <div className="text-sm font-medium text-eve-text">{t("corpDashboard")}</div>
+                {corpRolesLoading ? (
+                  <div className="flex items-center gap-1.5 text-xs text-eve-dim">
+                    <span className="inline-block w-3 h-3 border-2 border-eve-accent/40 border-t-eve-accent rounded-full animate-spin" />
+                    {t("corpRolesChecking")}
+                  </div>
+                ) : corpRoles?.is_director ? (
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                    <span className="text-emerald-400 font-medium">{t("corpDirector")}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="inline-block w-1.5 h-1.5 rounded-full bg-eve-dim" />
+                    <span className="text-eve-dim">{t("corpNotDirector")}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex gap-2">
+              {/* Demo button — dev mode only */}
+              {import.meta.env.DEV && (
+                <button
+                  onClick={() => window.open("/corp/?mode=demo", "_blank")}
+                  className="px-3 py-1.5 text-xs font-medium rounded-sm border border-eve-border bg-eve-dark text-eve-dim hover:text-eve-text hover:border-eve-accent/50 transition-colors"
+                >
+                  {t("corpDashboardDemo")}
+                </button>
+              )}
+              {/* Live button — only for directors */}
+              {!corpRolesLoading && corpRoles?.is_director && (
+                <button
+                  onClick={() => window.open("/corp/?mode=live", "_blank")}
+                  className="px-3 py-1.5 text-xs font-medium rounded-sm border border-eve-accent bg-eve-accent/10 text-eve-accent hover:bg-eve-accent/20 transition-colors"
+                >
+                  {t("corpDashboardLive")}
+                </button>
               )}
             </div>
           </div>
-          <div className="flex gap-2">
-            {/* Demo button — dev mode only */}
-            {import.meta.env.DEV && (
-              <button
-                onClick={() => window.open("/corp/?mode=demo", "_blank")}
-                className="px-3 py-1.5 text-xs font-medium rounded-sm border border-eve-border bg-eve-dark text-eve-dim hover:text-eve-text hover:border-eve-accent/50 transition-colors"
-              >
-                {t("corpDashboardDemo")}
-              </button>
-            )}
-            {/* Live button — only for directors */}
-            {!corpRolesLoading && corpRoles?.is_director && (
-              <button
-                onClick={() => window.open("/corp/?mode=live", "_blank")}
-                className="px-3 py-1.5 text-xs font-medium rounded-sm border border-eve-accent bg-eve-accent/10 text-eve-accent hover:bg-eve-accent/20 transition-colors"
-              >
-                {t("corpDashboardLive")}
-              </button>
-            )}
-          </div>
+          {!corpRolesLoading && !corpRoles?.is_director && (
+            <div className="mt-2 text-[10px] text-eve-dim">{t("corpDemoOnly")}</div>
+          )}
         </div>
-        {!corpRolesLoading && !corpRoles?.is_director && (
-          <div className="mt-2 text-[10px] text-eve-dim">{t("corpDemoOnly")}</div>
-        )}
-      </div>
+      )}
     </div>
   );
 }
@@ -312,10 +478,11 @@ type PnLPeriod = 7 | 30 | 90 | 180;
 
 interface PnLTabProps {
   formatIsk: (v: number) => string;
+  characterScope: CharacterScope;
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
 }
 
-function PnLTab({ formatIsk, t }: PnLTabProps) {
+function PnLTab({ formatIsk, characterScope, t }: PnLTabProps) {
   const [period, setPeriod] = useState<PnLPeriod>(30);
   const [data, setData] = useState<PortfolioPnL | null>(null);
   const [loading, setLoading] = useState(false);
@@ -329,11 +496,11 @@ function PnLTab({ formatIsk, t }: PnLTabProps) {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    getPortfolioPnL(period, { salesTax, brokerFee, ledgerLimit: 500 })
+    getPortfolioPnL(period, { salesTax, brokerFee, ledgerLimit: 500, characterId: characterScope })
       .then(setData)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [period, salesTax, brokerFee]);
+  }, [period, salesTax, brokerFee, characterScope]);
 
   if (loading) {
     return (
@@ -1109,10 +1276,11 @@ type OptPeriod = 30 | 90 | 180;
 
 interface OptimizerTabProps {
   formatIsk: (v: number) => string;
+  characterScope: CharacterScope;
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
 }
 
-function OptimizerTab({ formatIsk, t }: OptimizerTabProps) {
+function OptimizerTab({ formatIsk, characterScope, t }: OptimizerTabProps) {
   const [period, setPeriod] = useState<OptPeriod>(90);
   const [result, setResult] = useState<OptimizerResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1121,11 +1289,11 @@ function OptimizerTab({ formatIsk, t }: OptimizerTabProps) {
   useEffect(() => {
     setLoading(true);
     setFetchError(null);
-    getPortfolioOptimization(period)
+    getPortfolioOptimization(period, characterScope)
       .then(setResult)
       .catch((e) => setFetchError(e.message))
       .finally(() => setLoading(false));
-  }, [period]);
+  }, [period, characterScope]);
 
   if (loading) {
     return (
@@ -1636,13 +1804,14 @@ function SuggestionsPanel({
 // --- Risk Tab ---
 
 interface RiskTabProps {
-  characterId: number;
+  characterId?: number;
+  isAllScope: boolean;
   data: CharacterInfo;
   formatIsk: (v: number) => string;
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
 }
 
-function RiskTab({ characterId, data, formatIsk, t }: RiskTabProps) {
+function RiskTab({ characterId, isAllScope, data, formatIsk, t }: RiskTabProps) {
   const risk = data.risk;
 
   if (!risk) {
@@ -1680,11 +1849,17 @@ function RiskTab({ characterId, data, formatIsk, t }: RiskTabProps) {
     <div className="space-y-4">
       {/* Header */}
       <div className="flex items-center gap-4 p-4 bg-eve-panel border border-eve-border rounded-sm">
-        <img
-          src={`https://images.evetech.net/characters/${characterId}/portrait?size=64`}
-          alt=""
-          className="w-12 h-12 rounded-sm"
-        />
+        {characterId ? (
+          <img
+            src={`https://images.evetech.net/characters/${characterId}/portrait?size=64`}
+            alt=""
+            className="w-12 h-12 rounded-sm"
+          />
+        ) : (
+          <div className="w-12 h-12 rounded-sm bg-eve-dark border border-eve-border flex items-center justify-center text-[10px] text-eve-accent font-semibold">
+            ALL
+          </div>
+        )}
         <div className="flex-1">
           <div className="text-[10px] uppercase tracking-wider text-eve-dim mb-1">
             {t("charRiskTitle")}
@@ -1697,6 +1872,9 @@ function RiskTab({ characterId, data, formatIsk, t }: RiskTabProps) {
               {t("charRiskScoreLabel", { score: Math.round(riskScore) })}
             </div>
           </div>
+          {isAllScope && (
+            <div className="text-[10px] text-eve-dim mt-1">{t("charAllCharacters")}</div>
+          )}
           <div className="mt-2 h-2 w-full bg-eve-dark rounded-full overflow-hidden">
             <div
               className={`h-full ${riskColor}`}
@@ -1788,6 +1966,7 @@ function RiskTab({ characterId, data, formatIsk, t }: RiskTabProps) {
 }
 
 interface CombinedOrdersTabProps {
+  characterScope: CharacterScope;
   orders: CharacterOrder[];
   history: HistoricalOrder[];
   formatIsk: (v: number) => string;
@@ -1795,7 +1974,7 @@ interface CombinedOrdersTabProps {
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
 }
 
-function CombinedOrdersTab({ orders, history, formatIsk, formatDate, t }: CombinedOrdersTabProps) {
+function CombinedOrdersTab({ characterScope, orders, history, formatIsk, formatDate, t }: CombinedOrdersTabProps) {
   const [subTab, setSubTab] = useState<"active" | "history">("active");
 
   return (
@@ -1827,7 +2006,7 @@ function CombinedOrdersTab({ orders, history, formatIsk, formatDate, t }: Combin
       {/* Content */}
       <div className="flex-1 min-h-0 overflow-auto">
         {subTab === "active" && (
-          <ActiveOrdersWithDeskTab orders={orders} formatIsk={formatIsk} t={t} />
+          <ActiveOrdersWithDeskTab characterScope={characterScope} orders={orders} formatIsk={formatIsk} t={t} />
         )}
         {subTab === "history" && (
           <HistoryTab history={history} formatIsk={formatIsk} formatDate={formatDate} t={t} />
@@ -1838,12 +2017,14 @@ function CombinedOrdersTab({ orders, history, formatIsk, formatDate, t }: Combin
 }
 
 interface ActiveOrdersWithDeskTabProps {
+  characterScope: CharacterScope;
   orders: CharacterOrder[];
   formatIsk: (v: number) => string;
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
 }
 
-function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskTabProps) {
+function ActiveOrdersWithDeskTab({ characterScope, orders, formatIsk, t }: ActiveOrdersWithDeskTabProps) {
+  const { addToast } = useGlobalToast();
   const [filter, setFilter] = useState<"all" | "buy" | "sell">("all");
   const [expandedOrder, setExpandedOrder] = useState<number | null>(null);
   const [undercuts, setUndercuts] = useState<Record<number, UndercutStatus>>({});
@@ -1872,7 +2053,7 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
     setUndercutLoading(true);
     setUndercutError(null);
     try {
-      const data = await getUndercuts();
+      const data = await getUndercuts(characterScope);
       const map: Record<number, UndercutStatus> = {};
       for (const u of data) map[u.order_id] = u;
       setUndercuts(map);
@@ -1882,7 +2063,7 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
     } finally {
       setUndercutLoading(false);
     }
-  }, [undercutLoaded, undercutLoading]);
+  }, [undercutLoaded, undercutLoading, characterScope]);
 
   const toggleExpand = useCallback((orderId: number) => {
     if (!undercutLoaded && !undercutLoading) loadUndercuts();
@@ -1893,7 +2074,7 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
     const reqID = ++deskReqSeq.current;
     setDeskLoading(true);
     setDeskError(null);
-    getOrderDesk({ salesTax, brokerFee, targetEtaDays })
+    getOrderDesk({ salesTax, brokerFee, targetEtaDays, characterId: characterScope })
       .then((next) => {
         if (reqID !== deskReqSeq.current) return;
         setDeskData(next);
@@ -1907,7 +2088,7 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
           setDeskLoading(false);
         }
       });
-  }, [salesTax, brokerFee, targetEtaDays]);
+  }, [salesTax, brokerFee, targetEtaDays, characterScope]);
 
   const toggleDesk = useCallback(() => {
     if (!showDesk && !deskData) {
@@ -1949,6 +2130,21 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
     if (value === "reprice") return t("orderDeskActionReprice");
     return t("orderDeskActionHold");
   }, [t]);
+
+  const openMarketForType = useCallback(async (typeID: number) => {
+    if (!typeID) return;
+    try {
+      await openMarketInGame(typeID);
+      addToast(t("actionSuccess"), "success", 2000);
+    } catch (err: any) {
+      const { messageKey, duration } = handleEveUIError(err);
+      if (messageKey === "actionFailed") {
+        addToast(t(messageKey, { error: err?.message || "Unknown error" }), "error", duration);
+      } else {
+        addToast(t(messageKey), "error", duration);
+      }
+    }
+  }, [addToast, t]);
 
   if (orders.length === 0) {
     return <div className="text-center text-eve-dim py-8">{t("charNoOrders")}</div>;
@@ -2110,7 +2306,20 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
                           </span>
                         </td>
                         <td className={`px-2 py-2 ${sideClass}`}>{sideLabel} {positionLabel}</td>
-                        <td className="px-2 py-2 text-eve-text max-w-[220px] truncate" title={row.type_name}>{row.type_name || `#${row.type_id}`}</td>
+                        <td className="px-2 py-2 text-eve-text max-w-[220px]" title={row.type_name}>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate">{row.type_name || `#${row.type_id}`}</span>
+                            <button
+                              type="button"
+                              onClick={() => { void openMarketForType(row.type_id); }}
+                              className="shrink-0 px-1.5 py-0.5 rounded border border-eve-border text-[9px] text-eve-dim hover:text-eve-accent hover:border-eve-accent/50 transition-colors"
+                              title={t("openMarket")}
+                              aria-label={t("openMarket")}
+                            >
+                              EVE
+                            </button>
+                          </div>
+                        </td>
                         <td className="px-2 py-2 text-right text-eve-accent">{formatIsk(row.price)}</td>
                         <td className="px-2 py-2 text-right text-eve-dim">{row.volume_remain.toLocaleString()}</td>
                         <td className="px-2 py-2 text-right text-eve-dim">{queueLabel}</td>
@@ -2166,6 +2375,7 @@ function ActiveOrdersWithDeskTab({ orders, formatIsk, t }: ActiveOrdersWithDeskT
                   undercutLoading={undercutLoading}
                   formatIsk={formatIsk}
                   toggleExpand={toggleExpand}
+                  onOpenMarket={openMarketForType}
                   t={t}
                 />
               );
@@ -2207,6 +2417,7 @@ function OrderRow({
   undercutLoading,
   formatIsk,
   toggleExpand,
+  onOpenMarket,
   t,
 }: {
   order: CharacterOrder;
@@ -2216,6 +2427,7 @@ function OrderRow({
   undercutLoading: boolean;
   formatIsk: (v: number) => string;
   toggleExpand: (id: number) => void;
+  onOpenMarket: (typeID: number) => Promise<void>;
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
 }) {
   return (
@@ -2229,13 +2441,24 @@ function OrderRow({
           </span>
         </td>
         <td className="px-3 py-2 text-eve-text font-medium">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
             <img
               src={`https://images.evetech.net/types/${order.type_id}/icon?size=32`}
               alt=""
               className="w-5 h-5"
             />
-            {order.type_name || `Type #${order.type_id}`}
+              <span className="truncate">{order.type_name || `Type #${order.type_id}`}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => { void onOpenMarket(order.type_id); }}
+              className="shrink-0 px-1.5 py-0.5 rounded border border-eve-border text-[9px] text-eve-dim hover:text-eve-accent hover:border-eve-accent/50 transition-colors"
+              title={t("openMarket")}
+              aria-label={t("openMarket")}
+            >
+              EVE
+            </button>
           </div>
         </td>
         <td className="px-3 py-2 text-right text-eve-accent">{formatIsk(order.price)}</td>

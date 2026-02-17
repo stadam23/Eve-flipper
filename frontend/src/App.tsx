@@ -109,7 +109,16 @@ function App() {
       /* ignore */
     }
   }, []);
-  const { authStatus, loginPolling, handleLogin, handleLogout } = useAuth();
+  const {
+    authStatus,
+    loginPolling,
+    handleLogin,
+    handleLogout,
+    handleSelectCharacter,
+    handleDeleteCharacter,
+    refreshAuthStatus,
+  } = useAuth();
+  const characterCount = authStatus.characters?.length ?? (authStatus.logged_in ? 1 : 0);
   const { appVersion, latestVersion, hasUpdate } = useVersionCheck();
   const { esiAvailable } = useEsiStatus();
 
@@ -596,6 +605,22 @@ function App() {
                     <span className="text-eve-accent font-medium">
                       {authStatus.character_name}
                     </span>
+                    {characterCount > 1 && (
+                      <span className="text-[10px] text-eve-dim bg-eve-dark px-1.5 py-0.5 rounded-sm">
+                        {characterCount}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    onClick={handleLogin}
+                    disabled={loginPolling}
+                    className="ml-1 p-1 text-eve-dim hover:text-eve-accent hover:bg-eve-dark/50 rounded-sm transition-colors disabled:opacity-60"
+                    title={t("charAddCharacter")}
+                    aria-label={t("charAddCharacter")}
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v14m-7-7h14" />
+                    </svg>
                   </button>
                   <button
                     onClick={handleLogout}
@@ -706,6 +731,32 @@ function App() {
                   <span className="text-eve-accent font-medium">
                     {authStatus.character_name}
                   </span>
+                  {characterCount > 1 && (
+                    <span className="text-[10px] text-eve-dim bg-eve-dark px-1.5 py-0.5 rounded-sm">
+                      {characterCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={handleLogin}
+                  disabled={loginPolling}
+                  className="ml-1 p-1 text-eve-dim hover:text-eve-accent disabled:opacity-60"
+                  title={t("charAddCharacter")}
+                  aria-label={t("charAddCharacter")}
+                >
+                  <svg
+                    className="w-3.5 h-3.5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 5v14m-7-7h14"
+                    />
+                  </svg>
                 </button>
                 <button
                   onClick={handleLogout}
@@ -1052,8 +1103,12 @@ function App() {
         <CharacterPopup
           open={showCharacter}
           onClose={() => setShowCharacter(false)}
-          characterId={authStatus.character_id!}
-          characterName={authStatus.character_name!}
+          activeCharacterId={authStatus.character_id}
+          characters={authStatus.characters ?? []}
+          onSelectCharacter={handleSelectCharacter}
+          onDeleteCharacter={handleDeleteCharacter}
+          onAddCharacter={handleLogin}
+          onAuthRefresh={refreshAuthStatus}
         />
       )}
 

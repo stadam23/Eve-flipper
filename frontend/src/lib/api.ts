@@ -352,6 +352,17 @@ export function getLoginUrl(): string {
   return `${BASE}/api/auth/login`;
 }
 
+export type CharacterScope = number | "all";
+
+function appendCharacterScope(params: URLSearchParams, characterId?: CharacterScope): void {
+  if (characterId == null) return;
+  if (characterId === "all") {
+    params.set("scope", "all");
+    return;
+  }
+  params.set("character_id", String(characterId));
+}
+
 export async function getAuthStatus(): Promise<AuthStatus> {
   const res = await fetch(`${BASE}/api/auth/status`);
   return handleResponse<AuthStatus>(res);
@@ -364,8 +375,25 @@ export async function logout(): Promise<void> {
   }
 }
 
-export async function getCharacterInfo(): Promise<CharacterInfo> {
-  const res = await fetch(`${BASE}/api/auth/character`);
+export async function selectAuthCharacter(characterId: number): Promise<AuthStatus> {
+  const res = await fetch(`${BASE}/api/auth/character/select`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ character_id: characterId }),
+  });
+  return handleResponse<AuthStatus>(res);
+}
+
+export async function deleteAuthCharacter(characterId: number): Promise<AuthStatus> {
+  const res = await fetch(`${BASE}/api/auth/characters/${characterId}`, { method: "DELETE" });
+  return handleResponse<AuthStatus>(res);
+}
+
+export async function getCharacterInfo(characterId?: CharacterScope): Promise<CharacterInfo> {
+  const params = new URLSearchParams();
+  appendCharacterScope(params, characterId);
+  const query = params.toString();
+  const res = await fetch(`${BASE}/api/auth/character${query ? `?${query}` : ""}`);
   return handleResponse<CharacterInfo>(res);
 }
 
@@ -376,13 +404,19 @@ export interface CharacterLocation {
   station_name?: string;
 }
 
-export async function getCharacterLocation(): Promise<CharacterLocation> {
-  const res = await fetch(`${BASE}/api/auth/location`);
+export async function getCharacterLocation(characterId?: number): Promise<CharacterLocation> {
+  const params = new URLSearchParams();
+  appendCharacterScope(params, characterId);
+  const query = params.toString();
+  const res = await fetch(`${BASE}/api/auth/location${query ? `?${query}` : ""}`);
   return handleResponse<CharacterLocation>(res);
 }
 
-export async function getUndercuts(): Promise<UndercutStatus[]> {
-  const res = await fetch(`${BASE}/api/auth/undercuts`);
+export async function getUndercuts(characterId?: CharacterScope): Promise<UndercutStatus[]> {
+  const params = new URLSearchParams();
+  appendCharacterScope(params, characterId);
+  const query = params.toString();
+  const res = await fetch(`${BASE}/api/auth/undercuts${query ? `?${query}` : ""}`);
   return handleResponse<UndercutStatus[]>(res);
 }
 
@@ -390,6 +424,7 @@ export interface OrderDeskParams {
   salesTax?: number;
   brokerFee?: number;
   targetEtaDays?: number;
+  characterId?: CharacterScope;
 }
 
 export async function getOrderDesk(params?: OrderDeskParams): Promise<OrderDeskResponse> {
@@ -397,6 +432,7 @@ export async function getOrderDesk(params?: OrderDeskParams): Promise<OrderDeskR
   if (params?.salesTax != null) qp.set("sales_tax", String(params.salesTax));
   if (params?.brokerFee != null) qp.set("broker_fee", String(params.brokerFee));
   if (params?.targetEtaDays != null) qp.set("target_eta_days", String(params.targetEtaDays));
+  appendCharacterScope(qp, params?.characterId);
   const qs = qp.toString();
   const res = await fetch(`${BASE}/api/auth/orders/desk${qs ? `?${qs}` : ""}`);
   return handleResponse<OrderDeskResponse>(res);
@@ -406,6 +442,7 @@ export interface PortfolioPnLParams {
   salesTax?: number;
   brokerFee?: number;
   ledgerLimit?: number;
+  characterId?: CharacterScope;
 }
 
 export async function getPortfolioPnL(days: number = 30, params?: PortfolioPnLParams): Promise<PortfolioPnL> {
@@ -414,6 +451,7 @@ export async function getPortfolioPnL(days: number = 30, params?: PortfolioPnLPa
   if (params?.salesTax != null) qp.set("sales_tax", String(params.salesTax));
   if (params?.brokerFee != null) qp.set("broker_fee", String(params.brokerFee));
   if (params?.ledgerLimit != null) qp.set("ledger_limit", String(params.ledgerLimit));
+  appendCharacterScope(qp, params?.characterId);
   const res = await fetch(`${BASE}/api/auth/portfolio?${qp.toString()}`);
   return handleResponse<PortfolioPnL>(res);
 }
@@ -422,8 +460,11 @@ export type OptimizerResult =
   | { ok: true; data: PortfolioOptimization }
   | { ok: false; diagnostic: OptimizerDiagnostic | null };
 
-export async function getPortfolioOptimization(days: number = 90): Promise<OptimizerResult> {
-  const res = await fetch(`${BASE}/api/auth/portfolio/optimize?days=${days}`);
+export async function getPortfolioOptimization(days: number = 90, characterId?: CharacterScope): Promise<OptimizerResult> {
+  const qp = new URLSearchParams();
+  qp.set("days", String(days));
+  appendCharacterScope(qp, characterId);
+  const res = await fetch(`${BASE}/api/auth/portfolio/optimize?${qp.toString()}`);
   if (res.ok) {
     const data: PortfolioOptimization = await res.json();
     return { ok: true, data };
@@ -613,8 +654,11 @@ export async function getPLEXDashboard(p?: PLEXDashboardParams, signal?: AbortSi
 
 // --- Corporation ---
 
-export async function getCharacterRoles(signal?: AbortSignal): Promise<CharacterRoles> {
-  const res = await fetch(`${BASE}/api/auth/roles`, { signal });
+export async function getCharacterRoles(signal?: AbortSignal, characterId?: number): Promise<CharacterRoles> {
+  const qp = new URLSearchParams();
+  appendCharacterScope(qp, characterId);
+  const qs = qp.toString();
+  const res = await fetch(`${BASE}/api/auth/roles${qs ? `?${qs}` : ""}`, { signal });
   return handleResponse<CharacterRoles>(res);
 }
 

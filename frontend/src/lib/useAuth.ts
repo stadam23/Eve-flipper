@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getAuthStatus, logout as apiLogout, getLoginUrl } from "./api";
+import { deleteAuthCharacter, getAuthStatus, getLoginUrl, logout as apiLogout, selectAuthCharacter } from "./api";
 import type { AuthStatus } from "./types";
 
 interface UseAuthReturn {
@@ -7,6 +7,38 @@ interface UseAuthReturn {
   loginPolling: boolean;
   handleLogin: () => Promise<void>;
   handleLogout: () => Promise<void>;
+  handleSelectCharacter: (characterId: number) => Promise<void>;
+  handleDeleteCharacter: (characterId: number) => Promise<void>;
+  refreshAuthStatus: () => Promise<void>;
+}
+
+function normalizeAuthStatus(status: AuthStatus): AuthStatus {
+  if (!status.logged_in) return { logged_in: false, characters: [] };
+
+  const characters = [...(status.characters ?? [])];
+  if (characters.length === 0 && status.character_id && status.character_name) {
+    characters.push({
+      character_id: status.character_id,
+      character_name: status.character_name,
+      active: true,
+    });
+  }
+
+  return {
+    ...status,
+    characters,
+  };
+}
+
+function authFingerprint(status: AuthStatus): string {
+  const normalized = normalizeAuthStatus(status);
+  const ids = (normalized.characters ?? []).map((c) => c.character_id).sort((a, b) => a - b);
+  return JSON.stringify({
+    logged_in: normalized.logged_in,
+    character_id: normalized.character_id ?? null,
+    auth_revision: normalized.auth_revision ?? 0,
+    ids,
+  });
 }
 
 /**
@@ -17,7 +49,7 @@ interface UseAuthReturn {
  * on mount and cleans up polling timers on unmount.
  */
 export function useAuth(): UseAuthReturn {
-  const [authStatus, setAuthStatus] = useState<AuthStatus>({ logged_in: false });
+  const [authStatus, setAuthStatus] = useState<AuthStatus>({ logged_in: false, characters: [] });
   const [loginPolling, setLoginPolling] = useState(false);
 
   const loginPollRef = useRef<ReturnType<typeof setInterval>>(undefined);
@@ -25,7 +57,7 @@ export function useAuth(): UseAuthReturn {
 
   // Fetch initial auth status on mount
   useEffect(() => {
-    getAuthStatus().then(setAuthStatus).catch(() => {});
+    getAuthStatus().then((s) => setAuthStatus(normalizeAuthStatus(s))).catch(() => {});
   }, []);
 
   // Cleanup login polling on unmount
@@ -38,11 +70,29 @@ export function useAuth(): UseAuthReturn {
 
   const handleLogout = useCallback(async () => {
     await apiLogout();
-    setAuthStatus({ logged_in: false });
+    setAuthStatus({ logged_in: false, characters: [] });
+  }, []);
+
+  const handleSelectCharacter = useCallback(async (characterId: number) => {
+    const status = await selectAuthCharacter(characterId);
+    setAuthStatus(normalizeAuthStatus(status));
+  }, []);
+
+  const handleDeleteCharacter = useCallback(async (characterId: number) => {
+    const status = await deleteAuthCharacter(characterId);
+    setAuthStatus(normalizeAuthStatus(status));
+  }, []);
+
+  const refreshAuthStatus = useCallback(async () => {
+    const status = await getAuthStatus();
+    setAuthStatus(normalizeAuthStatus(status));
   }, []);
 
   // Open EVE SSO login in system browser (Tauri) or same window (web)
   const handleLogin = useCallback(async () => {
+    const baseline = normalizeAuthStatus(authStatus);
+    const baselineFingerprint = authFingerprint(baseline);
+    const wasLoggedIn = baseline.logged_in;
     const baseUrl = getLoginUrl();
     // Detect Tauri runtime
     const isTauri = !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -71,10 +121,11 @@ export function useAuth(): UseAuthReturn {
     setLoginPolling(true);
     loginPollRef.current = setInterval(async () => {
       try {
-        const status = await getAuthStatus();
-        if (status.logged_in) {
+        const status = normalizeAuthStatus(await getAuthStatus());
+        const changed = authFingerprint(status) !== baselineFingerprint;
+        if (status.logged_in && (!wasLoggedIn || changed)) {
           clearInterval(loginPollRef.current);
-          setAuthStatus(status);
+          setAuthStatus(normalizeAuthStatus(status));
           setLoginPolling(false);
         }
       } catch {
@@ -86,7 +137,15 @@ export function useAuth(): UseAuthReturn {
       clearInterval(loginPollRef.current);
       setLoginPolling(false);
     }, 5 * 60 * 1000);
-  }, []);
+  }, [authStatus]);
 
-  return { authStatus, loginPolling, handleLogin, handleLogout };
+  return {
+    authStatus,
+    loginPolling,
+    handleLogin,
+    handleLogout,
+    handleSelectCharacter,
+    handleDeleteCharacter,
+    refreshAuthStatus,
+  };
 }

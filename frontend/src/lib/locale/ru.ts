@@ -87,6 +87,7 @@ export const ru = {
     colSellStation: "Станция продажи",
     colSellRegion: "Регион продажи",
     colMargin: "Маржа %",
+    colIskPerM3: "ISK/m³",
     colUnitsToBuy: "Покупать",
     colFilledQty: "Исполнимо",
     colCanFill: "Исполн.",
@@ -604,6 +605,11 @@ export const ru = {
 
     // Character
     charViewInfo: "Информация о персонаже",
+    charSelectCharacter: "Область персонажей",
+    charAllCharacters: "Все персонажи",
+    charAddCharacter: "Добавить персонажа",
+    charRemoveCharacter: "Удалить персонажа",
+    charActive: "активный",
     logout: "Выйти",
 
     // Theme switcher
