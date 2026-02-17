@@ -153,6 +153,15 @@ func stationExecutionDesiredQty(dailyShare int64, buyVolume, sellVolume int32) i
 	return fallbackQty
 }
 
+// stationExecutionDesiredQtyFromDailyShare is strict daily-throughput mode:
+// if daily share is unknown/non-positive, we do not assume synthetic fallback qty.
+func stationExecutionDesiredQtyFromDailyShare(dailyShare int64, buyVolume, sellVolume int32) int32 {
+	if dailyShare <= 0 {
+		return 0
+	}
+	return stationExecutionDesiredQty(dailyShare, buyVolume, sellVolume)
+}
+
 // StationTradeParams holds input parameters for station trading scan.
 type StationTradeParams struct {
 	StationIDs      map[int64]bool // nil or empty = all stations in region
@@ -503,9 +512,19 @@ func applyStationTradeFilters(results []StationTrade, params StationTradeParams)
 		params.LimitBuyToPriceLow
 
 	// Debug counters
-	var dropHistory, dropMargin, dropItemProfit, dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice int
+	var dropExecution, dropHistory, dropMargin, dropItemProfit, dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice int
 
 	for _, r := range results {
+		// If we have market activity/history but no profitable executable qty, treat as non-tradable.
+		if r.HistoryAvailable && r.DailyVolume > 0 && r.FilledQty <= 0 {
+			dropExecution++
+			continue
+		}
+		// Defensive guard against inconsistent execution payloads.
+		if r.FilledQty > 0 && r.RealProfit <= 0 {
+			dropExecution++
+			continue
+		}
 		if needsHistory && !r.HistoryAvailable {
 			dropHistory++
 			continue
@@ -581,8 +600,8 @@ func applyStationTradeFilters(results []StationTrade, params StationTradeParams)
 	}
 
 	if len(results) != len(filtered) {
-		log.Printf("[DEBUG] StationFilter drops: history=%d margin=%d item_profit=%d vol=%d s2b=%d bfs=%d roi=%d bvs=%d pvi=%d sds=%d price=%d",
-			dropHistory, dropMargin, dropItemProfit, dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice)
+		log.Printf("[DEBUG] StationFilter drops: execution=%d history=%d margin=%d item_profit=%d vol=%d s2b=%d bfs=%d roi=%d bvs=%d pvi=%d sds=%d price=%d",
+			dropExecution, dropHistory, dropMargin, dropItemProfit, dropVol, dropS2B, dropBfS, dropROI, dropBvS, dropPVI, dropSDS, dropPrice)
 	}
 
 	return filtered
@@ -674,7 +693,7 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		// This fixes fixed-qty distortion from early pre-history enrichment.
 		execKey := stationTypeKey{results[idx].StationID, results[idx].TypeID}
 		if g, ok := orderGroups[execKey]; ok {
-			desiredQty := stationExecutionDesiredQty(dailyShare, results[idx].BuyVolume, results[idx].SellVolume)
+			desiredQty := stationExecutionDesiredQtyFromDailyShare(dailyShare, results[idx].BuyVolume, results[idx].SellVolume)
 			if desiredQty > 0 {
 				safeQty, planBuy, planSell, expectedProfit := findSafeExecutionQuantity(
 					g.sellOrders, // asks we buy from
@@ -700,6 +719,11 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 							(results[idx].ExpectedProfit / effectiveBuyPerUnit) * 100,
 						)
 					}
+				}
+				if safeQty <= 0 {
+					// History says there is flow, but executable profitable qty is zero after depth/slippage.
+					results[idx].DailyProfit = 0
+					results[idx].TotalProfit = 0
 				}
 			}
 		}

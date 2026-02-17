@@ -49,6 +49,15 @@ func TestStationExecutionDesiredQty(t *testing.T) {
 	}
 }
 
+func TestStationExecutionDesiredQtyFromDailyShare(t *testing.T) {
+	if got := stationExecutionDesiredQtyFromDailyShare(0, 5000, 8000); got != 0 {
+		t.Fatalf("strict daily-share qty with unknown share = %d, want 0", got)
+	}
+	if got := stationExecutionDesiredQtyFromDailyShare(120, 1000, 90); got != 90 {
+		t.Fatalf("strict daily-share qty with depth cap = %d, want 90", got)
+	}
+}
+
 func TestEstimateSideFlowsPerDay_MassBalance(t *testing.T) {
 	total := 100.0
 	s2b, bfs := estimateSideFlowsPerDay(total, 600, 400)
@@ -106,5 +115,14 @@ func TestApplyStationTradeFilters_UsesExecutionAwareMarginsAndHistory(t *testing
 	out = applyStationTradeFilters(rows, params)
 	if len(out) != 0 {
 		t.Fatalf("expected row to be dropped by execution-aware negative margin/profit, got %d rows", len(out))
+	}
+
+	rows[0].RealMarginPercent = 8
+	rows[0].RealProfit = 100
+	rows[0].FilledQty = 0
+	rows[0].DailyVolume = 50
+	out = applyStationTradeFilters(rows, StationTradeParams{})
+	if len(out) != 0 {
+		t.Fatalf("expected row to be dropped as unexecutable with positive history flow, got %d rows", len(out))
 	}
 }

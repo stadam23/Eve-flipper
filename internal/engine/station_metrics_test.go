@@ -132,6 +132,21 @@ func TestCalcSDS_BestBuyAboveHalfVWAP_NoOtherTriggers(t *testing.T) {
 	}
 }
 
+func TestCalcSDS_ZeroVolumeHistoryStillCountsAsNoRecentTrades(t *testing.T) {
+	today := time.Now().Format("2006-01-02")
+	history := []esi.HistoryEntry{
+		{Date: today, Average: 100, Volume: 0},
+	}
+	orders := []esi.MarketOrder{
+		{Price: 60, VolumeRemain: 50},
+		{Price: 59, VolumeRemain: 50},
+	}
+	got := CalcSDS(orders, history, 100)
+	if got < 20 {
+		t.Errorf("CalcSDS with zero-volume history = %v, want >= 20 (no recent trades trigger)", got)
+	}
+}
+
 // --- normalize and CalcCTS (composite) ---
 
 func TestNormalize(t *testing.T) {

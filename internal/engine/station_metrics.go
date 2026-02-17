@@ -238,7 +238,15 @@ func singleOrderDominance(orders []esi.MarketOrder) float64 {
 // noRecentTrades checks if there were no trades in the last N days.
 func noRecentTrades(history []esi.HistoryEntry, days int) bool {
 	entries := filterLastNDays(history, days)
-	return len(entries) == 0
+	if len(entries) == 0 {
+		return true
+	}
+	for _, h := range entries {
+		if h.Volume > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // CalcCI calculates Competition Index.
@@ -307,9 +315,9 @@ func countTightSpreadOrders(orders []esi.MarketOrder) int {
 //     compression already; kept at lower weight to avoid double-counting.
 func CalcCTS(spreadROI, obds, drvi float64, ci, sds int, dailyVolume float64) float64 {
 	// Normalize each component to 0-100 scale
-	roiScore := normalize(spreadROI, 0, 300) * 100         // Higher spread ROI = better (300% cap for lowsec/null)
-	obdsScore := normalize(obds, 0, 2) * 100               // Higher depth = better
-	pviScore := 100 - normalize(drvi, 0, 50)*100           // Lower volatility = better
+	roiScore := normalize(spreadROI, 0, 300) * 100        // Higher spread ROI = better (300% cap for lowsec/null)
+	obdsScore := normalize(obds, 0, 2) * 100              // Higher depth = better
+	pviScore := 100 - normalize(drvi, 0, 50)*100          // Lower volatility = better
 	ciScore := 100 - normalize(float64(ci), 0, 100)*100   // Lower competition = better
 	sdsScore := 100 - normalize(float64(sds), 0, 100)*100 // Lower scam score = better
 
