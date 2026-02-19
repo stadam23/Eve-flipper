@@ -74,7 +74,13 @@ func selectClosestRouteRegions(systemRegion map[int32]int32, systems map[int32]i
 }
 
 // buildOrderIndex builds per-system order maps from raw orders.
+// This legacy helper keeps historical behavior (structures included).
 func buildOrderIndex(sellOrders, buyOrders []esi.MarketOrder) *orderIndex {
+	return buildOrderIndexWithFilters(sellOrders, buyOrders, true)
+}
+
+// buildOrderIndexWithFilters builds per-system order maps and applies route-level order filters.
+func buildOrderIndexWithFilters(sellOrders, buyOrders []esi.MarketOrder, includeStructures bool) *orderIndex {
 	idx := &orderIndex{
 		cheapestSell: make(map[int32]map[int32]orderEntry),
 		highestBuy:   make(map[int32]map[int32]orderEntry),
@@ -82,6 +88,9 @@ func buildOrderIndex(sellOrders, buyOrders []esi.MarketOrder) *orderIndex {
 
 	for _, o := range sellOrders {
 		if isMarketDisabledType(o.TypeID) {
+			continue
+		}
+		if !includeStructures && isPlayerStructureLocationID(o.LocationID) {
 			continue
 		}
 		byType, ok := idx.cheapestSell[o.SystemID]
@@ -96,6 +105,9 @@ func buildOrderIndex(sellOrders, buyOrders []esi.MarketOrder) *orderIndex {
 
 	for _, o := range buyOrders {
 		if isMarketDisabledType(o.TypeID) {
+			continue
+		}
+		if !includeStructures && isPlayerStructureLocationID(o.LocationID) {
 			continue
 		}
 		byType, ok := idx.highestBuy[o.SystemID]
@@ -326,7 +338,7 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 	log.Printf("[Route] Fetched %d sell, %d buy orders across %d regions (%d systems in envelope)",
 		len(sellOrders), len(buyOrders), len(regions), len(searchSystems))
 	progress("Building order index...")
-	idx := buildOrderIndex(sellOrders, buyOrders)
+	idx := buildOrderIndexWithFilters(sellOrders, buyOrders, params.IncludeStructures)
 
 	// Scale beam search parameters based on requested depth
 	beamWidth := 50    // keep top N partial routes per level

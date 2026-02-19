@@ -129,6 +129,7 @@ type RouteParams struct {
 	MinHops              int
 	MaxHops              int
 	MinRouteSecurity     float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7
+	IncludeStructures    bool    // true = allow Upwell structure orders; false = NPC stations only
 }
 
 // ScanParams holds the input parameters for radius and region scans.

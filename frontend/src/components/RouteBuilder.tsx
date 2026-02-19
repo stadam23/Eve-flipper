@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { findRoutes, setWaypointInGame } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import type { RouteResult, RouteHop, ScanParams } from "@/lib/types";
@@ -145,8 +145,8 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
 
   const routeSummary = (route: RouteResult) =>
     route.Hops.map((h) => h.SystemName).concat([route.Hops[route.Hops.length - 1]?.DestSystemName ?? ""]).filter(Boolean).join(" → ");
-  const copyRouteSystems = (route: RouteResult) => {
-    navigator.clipboard.writeText(routeSummary(route));
+  const copyRouteSystems = async (route: RouteResult) => {
+    await navigator.clipboard.writeText(routeSummary(route));
   };
 
   return (
@@ -240,7 +240,7 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
           </table>
         ) : !scanning ? (
           <div className="flex items-center justify-center h-full text-eve-dim text-xs">
-            {t("routePrompt")}
+            {progress || t("routePrompt")}
           </div>
         ) : null}
       </div>
@@ -311,7 +311,7 @@ function RouteDetailPopup({
 }: {
   route: RouteResult;
   onClose: () => void;
-  onCopySystems: (route: RouteResult) => void;
+  onCopySystems: (route: RouteResult) => Promise<void>;
   salesTaxPercent?: number;
   brokerFeePercent?: number;
   splitTradeFees?: boolean;
@@ -332,6 +332,33 @@ function RouteDetailPopup({
     } catch (err: any) {
       const { messageKey, duration } = handleEveUIError(err);
       addToast(t(messageKey), "error", duration);
+    }
+  };
+
+  const handleCopySystems = async () => {
+    try {
+      await onCopySystems(route);
+      addToast(t("copied"), "success", 1400);
+    } catch {
+      addToast(t("errorSomethingWentWrong"), "error", 2200);
+    }
+  };
+
+  const handleCopyRoute = async () => {
+    const lines = ["=== EVE Flipper Route ==="];
+    route.Hops.forEach((hop, i) => {
+      lines.push(`[${i + 1}] ${hop.StationName || hop.SystemName}`);
+      lines.push(`    Buy: ${hop.TypeName} x${hop.Units} @ ${formatISKFull(hop.BuyPrice)} ISK`);
+      lines.push(`    → ${hop.DestSystemName} (${hop.Jumps} jumps)`);
+      lines.push(`    Sell: @ ${formatISKFull(hop.SellPrice)} ISK → Profit: ${formatISK(hop.Profit)}`);
+      lines.push("");
+    });
+    lines.push(`Total: ${formatISKFull(route.TotalProfit)} ISK / ${route.TotalJumps} jumps / ${formatISK(route.ProfitPerJump)} ISK/jump`);
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      addToast(t("copied"), "success", 1400);
+    } catch {
+      addToast(t("errorSomethingWentWrong"), "error", 2200);
     }
   };
 
@@ -371,26 +398,24 @@ function RouteDetailPopup({
                   <span className="text-xs font-medium text-eve-text">
                     {hop.StationName || hop.SystemName}
                   </span>
-                  <div className="ml-auto flex items-center gap-1">
+                  <div className="ml-auto flex items-center gap-1.5">
                     {isLoggedIn && hop.SystemID && (
-                      <button
-                        type="button"
-                        onClick={() => handleSetWaypoint(hop.SystemID)}
-                        className="px-2 py-0.5 text-[10px] rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
-                        title={t("setDestination")}
-                      >
-                        🎯
-                      </button>
+                      <RouteDetailActionButton onClick={() => handleSetWaypoint(hop.SystemID)} title={t("setDestination")} tone="neutral">
+                        <span className="text-[11px] leading-none">⌖</span>
+                        <span>{t("routeBuy")}</span>
+                      </RouteDetailActionButton>
+                    )}
+                    {isLoggedIn && hop.DestSystemID && (
+                      <RouteDetailActionButton onClick={() => handleSetWaypoint(hop.DestSystemID)} title={t("setDestination")} tone="neutral">
+                        <span className="text-[11px] leading-none">⌖</span>
+                        <span>{t("routeSell")}</span>
+                      </RouteDetailActionButton>
                     )}
                     {hop.RegionID != null && hop.RegionID > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setExecPlanHop(hop)}
-                        className="px-2 py-0.5 text-[10px] rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
-                        title={t("execPlanTitle")}
-                      >
-                        📊
-                      </button>
+                      <RouteDetailActionButton onClick={() => setExecPlanHop(hop)} title={t("execPlanTitle")} tone="accent">
+                        <span className="text-[11px] leading-none">▦</span>
+                        <span className="hidden sm:inline">{t("execPlanTitle")}</span>
+                      </RouteDetailActionButton>
                     )}
                   </div>
                 </div>
@@ -407,16 +432,6 @@ function RouteDetailPopup({
                     <span className="text-eve-dim">→ {t("routeDeliverTo")}:</span>
                     <span className="text-eve-text">{hop.DestStationName || hop.DestSystemName}</span>
                     <span className="text-eve-dim font-mono">({hop.Jumps} {t("routeJumpsUnit")})</span>
-                    {isLoggedIn && hop.DestSystemID && (
-                      <button
-                        type="button"
-                        onClick={() => handleSetWaypoint(hop.DestSystemID)}
-                        className="px-1 py-0.5 text-[9px] rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
-                        title={t("setDestination")}
-                      >
-                        🎯
-                      </button>
-                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-eve-dim">{t("routeSell")}:</span>
@@ -443,47 +458,28 @@ function RouteDetailPopup({
           ))}
         </div>
 
-        {/* Copy route button + Summary footer */}
-        <div className="flex items-center gap-6 px-4 py-3 border-t border-eve-border text-xs">
-          <div>
-            <span className="text-eve-dim">{t("routeTotalProfit")}: </span>
-            <span className="font-mono text-green-400 font-semibold">{formatISKFull(route.TotalProfit)} ISK</span>
+        {/* Summary + actions footer */}
+        <div className="px-4 py-3 border-t border-eve-border bg-eve-dark/30 space-y-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <RouteMetricChip label={t("routeTotalProfit")} value={`${formatISKFull(route.TotalProfit)} ISK`} tone="profit" />
+            <RouteMetricChip label={t("routeTotalJumps")} value={String(route.TotalJumps)} tone="dim" />
+            <RouteMetricChip label={`ISK/${t("routeJumpsUnit")}`} value={formatISK(route.ProfitPerJump)} tone="ppj" />
+            <RouteMetricChip label={t("routeHopsCol")} value={String(route.HopCount)} tone="dim" />
           </div>
-          <div>
-            <span className="text-eve-dim">{t("routeTotalJumps")}: </span>
-            <span className="font-mono text-eve-text">{route.TotalJumps}</span>
-          </div>
-          <div>
-            <span className="text-eve-dim">ISK/{t("routeJumpsUnit")}: </span>
-            <span className="font-mono text-yellow-400">{formatISK(route.ProfitPerJump)}</span>
-          </div>
-          <div>
-            <span className="text-eve-dim">{t("routeHopsCol")}: </span>
-            <span className="font-mono text-eve-text">{route.HopCount}</span>
-          </div>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             <button
-              onClick={() => onCopySystems(route)}
-              className="px-3 py-1 rounded-sm text-xs font-medium text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors cursor-pointer"
+              onClick={handleCopySystems}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-sm text-[11px] font-semibold uppercase tracking-wider text-eve-dim border border-eve-border bg-eve-dark/60 hover:text-eve-text hover:border-eve-accent/30 hover:bg-eve-dark transition-all"
             >
-              {t("copyRouteSystems")}
+              <span className="text-[11px] leading-none">⎘</span>
+              <span>{t("copyRouteSystems")}</span>
             </button>
             <button
-              onClick={() => {
-                const lines = ["=== EVE Flipper Route ==="];
-                route.Hops.forEach((hop, i) => {
-                  lines.push(`[${i + 1}] ${hop.StationName || hop.SystemName}`);
-                  lines.push(`    Buy: ${hop.TypeName} x${hop.Units} @ ${formatISKFull(hop.BuyPrice)} ISK`);
-                  lines.push(`    → ${hop.DestSystemName} (${hop.Jumps} jumps)`);
-                  lines.push(`    Sell: @ ${formatISKFull(hop.SellPrice)} ISK → Profit: ${formatISK(hop.Profit)}`);
-                  lines.push("");
-                });
-                lines.push(`Total: ${formatISKFull(route.TotalProfit)} ISK / ${route.TotalJumps} jumps / ${formatISK(route.ProfitPerJump)} ISK/jump`);
-                navigator.clipboard.writeText(lines.join("\n"));
-              }}
-              className="px-3 py-1 rounded-sm text-xs font-medium text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors cursor-pointer"
+              onClick={handleCopyRoute}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-sm text-[11px] font-semibold uppercase tracking-wider text-eve-dark bg-eve-accent border border-eve-accent hover:bg-eve-accent-hover shadow-eve-glow transition-all"
             >
-              {t("copyRoute")}
+              <span className="text-[11px] leading-none">⎘</span>
+              <span>{t("copyRoute")}</span>
             </button>
           </div>
         </div>
@@ -507,5 +503,50 @@ function RouteDetailPopup({
       sellSalesTaxPercent={sellSalesTaxPercent}
     />
     </>
+  );
+}
+
+function RouteDetailActionButton({
+  onClick,
+  title,
+  children,
+  tone,
+}: {
+  onClick: () => void;
+  title: string;
+  children: ReactNode;
+  tone: "neutral" | "accent";
+}) {
+  const styleByTone =
+    tone === "accent"
+      ? "text-eve-accent border-eve-accent/40 bg-eve-accent/10 hover:bg-eve-accent/20 hover:border-eve-accent/60"
+      : "text-eve-dim border-eve-border bg-eve-dark/40 hover:text-eve-text hover:border-eve-accent/30 hover:bg-eve-dark/70";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-sm text-[10px] font-semibold uppercase tracking-wide border transition-all ${styleByTone}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function RouteMetricChip({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "profit" | "ppj" | "dim";
+}) {
+  const valueClass = tone === "profit" ? "text-green-400" : tone === "ppj" ? "text-yellow-400" : "text-eve-text";
+  return (
+    <div className="border border-eve-border/60 bg-eve-dark/70 px-2 py-1.5 rounded-sm">
+      <div className="text-[10px] uppercase tracking-wide text-eve-dim">{label}</div>
+      <div className={`text-xs font-mono font-semibold ${valueClass}`}>{value}</div>
+    </div>
   );
 }

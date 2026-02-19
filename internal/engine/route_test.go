@@ -98,6 +98,44 @@ func TestBuildOrderIndex_Empty(t *testing.T) {
 	}
 }
 
+func TestBuildOrderIndexWithFilters_ExcludeStructures(t *testing.T) {
+	sellOrders := []esi.MarketOrder{
+		{SystemID: 1, TypeID: 100, Price: 10, VolumeRemain: 50, LocationID: 1_000_000_000_123}, // structure
+		{SystemID: 1, TypeID: 100, Price: 15, VolumeRemain: 50, LocationID: 60003760},          // NPC station
+	}
+	buyOrders := []esi.MarketOrder{
+		{SystemID: 2, TypeID: 100, Price: 30, VolumeRemain: 50, LocationID: 1_000_000_000_456}, // structure
+		{SystemID: 2, TypeID: 100, Price: 25, VolumeRemain: 50, LocationID: 60008494},          // NPC station
+	}
+
+	idx := buildOrderIndexWithFilters(sellOrders, buyOrders, false)
+	if got := idx.cheapestSell[1][100].LocationID; got != 60003760 {
+		t.Fatalf("cheapestSell location = %d, want NPC station 60003760", got)
+	}
+	if got := idx.highestBuy[2][100].LocationID; got != 60008494 {
+		t.Fatalf("highestBuy location = %d, want NPC station 60008494", got)
+	}
+}
+
+func TestBuildOrderIndexWithFilters_IncludeStructures(t *testing.T) {
+	sellOrders := []esi.MarketOrder{
+		{SystemID: 1, TypeID: 100, Price: 10, VolumeRemain: 50, LocationID: 1_000_000_000_123}, // structure, best price
+		{SystemID: 1, TypeID: 100, Price: 15, VolumeRemain: 50, LocationID: 60003760},          // NPC station
+	}
+	buyOrders := []esi.MarketOrder{
+		{SystemID: 2, TypeID: 100, Price: 30, VolumeRemain: 50, LocationID: 1_000_000_000_456}, // structure, best price
+		{SystemID: 2, TypeID: 100, Price: 25, VolumeRemain: 50, LocationID: 60008494},          // NPC station
+	}
+
+	idx := buildOrderIndexWithFilters(sellOrders, buyOrders, true)
+	if got := idx.cheapestSell[1][100].LocationID; got != 1_000_000_000_123 {
+		t.Fatalf("cheapestSell location = %d, want structure 1000000000123", got)
+	}
+	if got := idx.highestBuy[2][100].LocationID; got != 1_000_000_000_456 {
+		t.Fatalf("highestBuy location = %d, want structure 1000000000456", got)
+	}
+}
+
 func TestSelectClosestRouteRegions(t *testing.T) {
 	systemRegion := map[int32]int32{
 		1: 10, // dist 0

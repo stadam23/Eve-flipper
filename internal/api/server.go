@@ -568,11 +568,7 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 
 // isPlayerStructure returns true if the location ID is a player-owned structure (not NPC station).
 func isPlayerStructure(id int64) bool {
-	// NPC stations: 60,000,000 – 64,000,000 range.
-	// Player-owned Upwell structures: > 1,000,000,000,000 (1 trillion).
-	// The old check (id >= 100M && not in 60M-64M) had false positives
-	// for IDs in the 100M–1T range. Use the definitive threshold instead.
-	return id > 1_000_000_000_000
+	return engine.IsPlayerStructureLocationID(id)
 }
 
 func filterFlipResultsExcludeStructures(results []engine.FlipResult) []engine.FlipResult {
@@ -1649,6 +1645,7 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 		MinHops:              req.MinHops,
 		MaxHops:              req.MaxHops,
 		MinRouteSecurity:     req.MinRouteSecurity,
+		IncludeStructures:    req.IncludeStructures,
 	}
 
 	log.Printf("[API] RouteFind: system=%s, cargo=%.0f, margin=%.1f, hops=%d-%d",
@@ -1671,6 +1668,8 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	durationMs := time.Since(startTime).Milliseconds()
 	log.Printf("[API] RouteFind complete: %d routes in %dms", len(results), durationMs)
 
+	rawCount := len(results)
+
 	// Resolve structure names if user enabled the toggle
 	if req.IncludeStructures {
 		results = s.enrichRouteStructureNames(userID, results)
@@ -1678,6 +1677,15 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 		results = filterRouteResultsExcludeStructures(results)
 	}
 	results = filterRouteResultsMarketDisabled(results)
+	if len(results) != rawCount {
+		log.Printf("[API] RouteFind post-filter: raw=%d final=%d (include_structures=%t)", rawCount, len(results), req.IncludeStructures)
+		line, _ := json.Marshal(map[string]string{
+			"type":    "progress",
+			"message": fmt.Sprintf("Filtered routes: %d/%d remain", len(results), rawCount),
+		})
+		fmt.Fprintf(w, "%s\n", line)
+		flusher.Flush()
+	}
 
 	var topProfit, totalProfit float64
 	for _, r := range results {
