@@ -267,7 +267,7 @@ function MarketDepthCard({ depth }: { depth: MarketDepthInfo }) {
     <div className="bg-eve-dark border border-eve-border rounded-sm p-3 shrink-0">
       <h3 className="text-xs font-semibold text-eve-dim uppercase tracking-wider mb-1">{t("plexMarketDepth")}</h3>
       <p className="text-[10px] text-eve-dim mb-2">{t("mmDepthHint")}</p>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
         {/* PLEX */}
         <DepthCard
           label="PLEX"
@@ -287,12 +287,6 @@ function MarketDepthCard({ depth }: { depth: MarketDepthInfo }) {
           label={t("plexDepthInjector")}
           sellVol={depth.injector_sell_qty}
           buyVol={depth.injector_buy_qty}
-        />
-        {/* MPTC */}
-        <DepthCard
-          label={t("plexDepthMPTC")}
-          sellVol={depth.mptc_sell_qty}
-          buyVol={depth.mptc_buy_qty}
         />
       </div>
     </div>

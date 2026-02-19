@@ -59,16 +59,22 @@ export function ParametersPanel({
   });
   const help = HELP_STEPS[tab];
   const splitTradeFees = Boolean(params.split_trade_fees);
-  const hideSellRadius = tab === "region" && Boolean(params.target_region);
+  const isFlowTab = tab === "radius" || tab === "region";
+  const hideSellRadius =
+    (tab === "region" && Boolean(params.target_region)) || tab === "route";
+  const showBuyRadius = tab !== "route";
+  const showCargoInMain = tab !== "region" && tab !== "contracts";
 
   const activeAdvancedCount =
     Number((params.min_route_security ?? 0) > 0) +
-    Number((params.min_daily_volume ?? 0) > 0) +
-    Number((params.max_investment ?? 0) > 0) +
-    Number((params.min_s2b_per_day ?? 0) > 0) +
-    Number((params.min_bfs_per_day ?? 0) > 0) +
-    Number((params.min_s2b_bfs_ratio ?? 0) > 0) +
-    Number((params.max_s2b_bfs_ratio ?? 0) > 0);
+    (isFlowTab
+      ? Number((params.min_daily_volume ?? 0) > 0) +
+        Number((params.max_investment ?? 0) > 0) +
+        Number((params.min_s2b_per_day ?? 0) > 0) +
+        Number((params.min_bfs_per_day ?? 0) > 0) +
+        Number((params.min_s2b_bfs_ratio ?? 0) > 0) +
+        Number((params.max_s2b_bfs_ratio ?? 0) > 0)
+      : 0);
 
   const toggleExpanded = () => {
     setExpanded((prev) => {
@@ -189,7 +195,7 @@ export function ParametersPanel({
                       placeholder="Delve, Catch, Vale of the Silent..."
                     />
                   </Field>
-                ) : (
+                ) : showCargoInMain ? (
                   <Field label={t("paramsCargo")}>
                     <NumberInput
                       value={params.cargo_capacity}
@@ -198,16 +204,18 @@ export function ParametersPanel({
                       max={1000000}
                     />
                   </Field>
-                )}
+                ) : null}
 
-                <Field label={t("paramsBuy")}>
-                  <NumberInput
-                    value={params.buy_radius}
-                    onChange={(v) => set("buy_radius", v)}
-                    min={1}
-                    max={50}
-                  />
-                </Field>
+                {showBuyRadius && (
+                  <Field label={t("paramsBuy")}>
+                    <NumberInput
+                      value={params.buy_radius}
+                      onChange={(v) => set("buy_radius", v)}
+                      min={1}
+                      max={50}
+                    />
+                  </Field>
+                )}
 
                 {!hideSellRadius && (
                   <Field label={t("paramsSell")}>
@@ -379,63 +387,67 @@ export function ParametersPanel({
                   </select>
                 </Field>
 
-                <Field label={t("minDailyVolume")}>
-                  <NumberInput
-                    value={params.min_daily_volume ?? 0}
-                    onChange={(v) => set("min_daily_volume", v)}
-                    min={0}
-                    max={999999999}
-                  />
-                </Field>
+                {isFlowTab && (
+                  <>
+                    <Field label={t("minDailyVolume")}>
+                      <NumberInput
+                        value={params.min_daily_volume ?? 0}
+                        onChange={(v) => set("min_daily_volume", v)}
+                        min={0}
+                        max={999999999}
+                      />
+                    </Field>
 
-                <Field label={t("maxInvestment")}>
-                  <NumberInput
-                    value={params.max_investment ?? 0}
-                    onChange={(v) => set("max_investment", v)}
-                    min={0}
-                    max={999999999999}
-                  />
-                </Field>
+                    <Field label={t("maxInvestment")}>
+                      <NumberInput
+                        value={params.max_investment ?? 0}
+                        onChange={(v) => set("max_investment", v)}
+                        min={0}
+                        max={999999999999}
+                      />
+                    </Field>
 
-                <Field label={t("minS2BPerDay")}>
-                  <NumberInput
-                    value={params.min_s2b_per_day ?? 0}
-                    onChange={(v) => set("min_s2b_per_day", v)}
-                    min={0}
-                    max={999999999}
-                    step={0.1}
-                  />
-                </Field>
+                    <Field label={t("minS2BPerDay")}>
+                      <NumberInput
+                        value={params.min_s2b_per_day ?? 0}
+                        onChange={(v) => set("min_s2b_per_day", v)}
+                        min={0}
+                        max={999999999}
+                        step={0.1}
+                      />
+                    </Field>
 
-                <Field label={t("minBfSPerDay")}>
-                  <NumberInput
-                    value={params.min_bfs_per_day ?? 0}
-                    onChange={(v) => set("min_bfs_per_day", v)}
-                    min={0}
-                    max={999999999}
-                    step={0.1}
-                  />
-                </Field>
+                    <Field label={t("minBfSPerDay")}>
+                      <NumberInput
+                        value={params.min_bfs_per_day ?? 0}
+                        onChange={(v) => set("min_bfs_per_day", v)}
+                        min={0}
+                        max={999999999}
+                        step={0.1}
+                      />
+                    </Field>
 
-                <Field label={t("minS2BBfSRatio")}>
-                  <NumberInput
-                    value={params.min_s2b_bfs_ratio ?? 0}
-                    onChange={(v) => set("min_s2b_bfs_ratio", v)}
-                    min={0}
-                    max={999999}
-                    step={0.1}
-                  />
-                </Field>
+                    <Field label={t("minS2BBfSRatio")}>
+                      <NumberInput
+                        value={params.min_s2b_bfs_ratio ?? 0}
+                        onChange={(v) => set("min_s2b_bfs_ratio", v)}
+                        min={0}
+                        max={999999}
+                        step={0.1}
+                      />
+                    </Field>
 
-                <Field label={t("maxS2BBfSRatio")}>
-                  <NumberInput
-                    value={params.max_s2b_bfs_ratio ?? 0}
-                    onChange={(v) => set("max_s2b_bfs_ratio", v)}
-                    min={0}
-                    max={999999}
-                    step={0.1}
-                  />
-                </Field>
+                    <Field label={t("maxS2BBfSRatio")}>
+                      <NumberInput
+                        value={params.max_s2b_bfs_ratio ?? 0}
+                        onChange={(v) => set("max_s2b_bfs_ratio", v)}
+                        min={0}
+                        max={999999}
+                        step={0.1}
+                      />
+                    </Field>
+                  </>
+                )}
               </div>
             )}
           </section>

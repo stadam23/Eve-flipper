@@ -174,10 +174,9 @@ export function SPFarmCard({ farm }: { farm: PLEXDashboard["sp_farm"] }) {
   const isViable = perCharProfit > 0;
 
   // Multi-char scaling (same account): 1st char uses Omega + extractors,
-  // additional chars need MPTC + extractors only (Omega is shared per account)
-  const mptcCost = farm.mptc_cost_isk ?? 0;
+  // additional chars scale by extractor demand (Omega is shared per account).
   const extractorCostPerChar = farm.total_cost_isk - farm.omega_cost_isk; // just extractor cost
-  const totalMonthlyCost = farm.total_cost_isk + (numChars > 1 ? (numChars - 1) * (extractorCostPerChar + mptcCost) : 0);
+  const totalMonthlyCost = farm.total_cost_isk + (numChars > 1 ? (numChars - 1) * extractorCostPerChar : 0);
   const totalMonthlyRevenue = numChars * perCharRevenue;
   const totalMonthlyProfit = totalMonthlyRevenue - totalMonthlyCost;
 
@@ -276,12 +275,7 @@ export function SPFarmCard({ farm }: { farm: PLEXDashboard["sp_farm"] }) {
             onChange={(e) => setNumChars(Math.max(1, parseInt(e.target.value) || 1))}
             className="w-14 px-1.5 py-0.5 bg-eve-input border border-eve-border rounded-sm text-xs text-eve-text font-mono text-center"
           />
-          {numChars > 1 && (
-            <span className="text-[10px] text-eve-dim">
-              ({t("plexMPTCperChar")}: {farm.mptc_cost_plex ?? 0} PLEX = {formatISK(mptcCost)})
-            </span>
-          )}
-        </div>
+          </div>
         {numChars > 1 && (
           <div className="flex justify-between items-center mt-1">
             <span className="font-semibold text-eve-text text-[11px]">{t("plexTotalMonthlyProfit")} ({numChars}x)</span>
@@ -378,10 +372,9 @@ export function MarketDepthCard({ depth }: { depth: MarketDepthInfo }) {
         </div>
 
         {/* Item depth grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
           <DepthItem label={t("plexDepthExtractor")} sell={depth.extractor_sell_qty} buy={depth.extractor_buy_qty} fillHours={depth.extractor_fill_hours} />
           <DepthItem label={t("plexDepthInjector")} sell={depth.injector_sell_qty} buy={depth.injector_buy_qty} fillHours={depth.injector_fill_hours} />
-          <DepthItem label={t("plexDepthMPTC")} sell={depth.mptc_sell_qty} buy={depth.mptc_buy_qty} fillHours={depth.mptc_fill_hours} />
         </div>
       </div>
     </div>

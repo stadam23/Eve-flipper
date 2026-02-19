@@ -32,14 +32,6 @@ function getFlowSteps(arb: ArbitragePath): { label: string; sub: string; color: 
       { label: "Sell on Market", sub: `${revStr} ISK`, color: "border-eve-success/40 bg-eve-success/5" },
     ];
   }
-  if (arb.type === "nes_sell" && arb.name.includes("MPTC")) {
-    return [
-      { label: "Buy PLEX", sub: `${arb.plex_cost} PLEX × market`, color: "border-eve-accent/40 bg-eve-accent/5" },
-      { label: "NES Store", sub: `Spend ${arb.plex_cost} PLEX`, color: "border-eve-warning/40 bg-eve-warning/5" },
-      { label: "MPTC", sub: "Receive 1 certificate", color: "border-blue-500/40 bg-blue-500/5" },
-      { label: "Sell on Market", sub: `${revStr} ISK`, color: "border-eve-success/40 bg-eve-success/5" },
-    ];
-  }
   if (arb.type === "spread") {
     // Extract item name from arb name (e.g. "PLEX Spread ..." → "PLEX")
     const itemName = arb.name.split(" ")[0];
@@ -213,12 +205,6 @@ export function ArbitrageModal({ arb, onClose }: { arb: ArbitragePath; onClose: 
                 <p>• {t("plexTipMarket1")}</p>
                 <p>• {t("plexTipSPChain1")}</p>
                 <p>• {t("plexTipSPChain3")}</p>
-              </>
-            )}
-            {arb.type === "nes_sell" && arb.name.includes("MPTC") && (
-              <>
-                <p>• {t("plexTipMPTC1")}</p>
-                <p>• {t("plexTipMPTC2")}</p>
               </>
             )}
             {arb.type === "spread" && (

@@ -32,13 +32,14 @@ type StationStore interface {
 // (thousands of market-order pages) never starve lightweight
 // API calls (profile, station names, history, auth).
 type Client struct {
-	http         *http.Client
-	sem          chan struct{} // lightweight / individual API calls
-	scanSem      chan struct{} // bulk scan page fetches (GetPaginatedDirect)
-	mu           sync.Mutex
-	stationCache sync.Map     // int64 -> string (L1 in-memory)
-	stationStore StationStore // L2 persistent cache (SQLite)
-	orderCache   *OrderCache  // region order cache with ETag/Expires
+	http          *http.Client
+	sem           chan struct{} // lightweight / individual API calls
+	scanSem       chan struct{} // bulk scan page fetches (GetPaginatedDirect)
+	mu            sync.Mutex
+	stationCache  sync.Map     // int64 -> string (L1 in-memory)
+	stationStore  StationStore // L2 persistent cache (SQLite)
+	typeNameCache sync.Map     // int32 -> string (L1 in-memory)
+	orderCache    *OrderCache  // region order cache with ETag/Expires
 
 	// EVERef structure name fallback (loaded at startup)
 	everefNames sync.Map // int64 -> string
@@ -132,6 +133,31 @@ func (c *Client) EVERefStructureName(structureID int64) string {
 		return v.(string)
 	}
 	return ""
+}
+
+// TypeName resolves an item type name by typeID via ESI and caches successful lookups.
+// Returns empty string when the name cannot be resolved.
+func (c *Client) TypeName(typeID int32) string {
+	if typeID <= 0 {
+		return ""
+	}
+	if v, ok := c.typeNameCache.Load(typeID); ok {
+		return v.(string)
+	}
+
+	var info struct {
+		Name string `json:"name"`
+	}
+	url := fmt.Sprintf("%s/universe/types/%d/?datasource=tranquility", baseURL, typeID)
+	if err := c.GetJSON(url, &info); err != nil {
+		return ""
+	}
+	name := strings.TrimSpace(info.Name)
+	if name == "" {
+		return ""
+	}
+	c.typeNameCache.Store(typeID, name)
+	return name
 }
 
 // HealthCheck pings ESI to verify connectivity.

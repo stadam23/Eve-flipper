@@ -369,3 +369,31 @@ func TestAvgDailyVolume_ZeroDays(t *testing.T) {
 		t.Errorf("avgDailyVolume(0 days) = %v, want 0", got)
 	}
 }
+
+func TestCalcCI_BasePlusTightSpreadBonus(t *testing.T) {
+	orders := []esi.MarketOrder{
+		{Price: 100.00, VolumeRemain: 10},
+		{Price: 100.005, VolumeRemain: 10}, // tight to 100.00 (<= 0.01 floor)
+		{Price: 101.00, VolumeRemain: 10},
+	}
+	got := CalcCI(orders)
+	// Base = len(orders)=3; tight pairs=1 => +2.
+	if got != 5 {
+		t.Fatalf("CalcCI = %d, want 5", got)
+	}
+	if CalcCI(nil) != 0 {
+		t.Fatalf("CalcCI(nil) must be 0")
+	}
+}
+
+func TestIsExtremePrice_Threshold(t *testing.T) {
+	if !IsExtremePrice(151, 100, 50) {
+		t.Fatalf("151 vs avg 100 with 50%% threshold should be extreme")
+	}
+	if IsExtremePrice(149, 100, 50) {
+		t.Fatalf("149 vs avg 100 with 50%% threshold should not be extreme")
+	}
+	if IsExtremePrice(100, 0, 50) {
+		t.Fatalf("avgPrice<=0 should never be extreme")
+	}
+}

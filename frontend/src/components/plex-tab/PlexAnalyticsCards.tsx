@@ -140,22 +140,17 @@ export function FleetManagerCard({ spFarm }: { spFarm: SPFarmResult }) {
   };
 
   const totalChars = cfg.accounts * cfg.charsPerAccount;
-  // First char on each account is the "main" → Omega only; additional chars need MPTC
-  const mptcCharsPerAccount = Math.max(0, cfg.charsPerAccount - 1);
-  const totalMPTCChars = cfg.accounts * mptcCharsPerAccount;
 
   // Costs per account
   const omegaCostPerAcct = spFarm.omega_cost_isk;
-  const mptcCostPerAcct = mptcCharsPerAccount * spFarm.mptc_cost_isk;
   const extractorsPerAcct = cfg.charsPerAccount * spFarm.extractors_per_month;
   const extractorCostPerAcct = extractorsPerAcct * (spFarm.extractor_cost_isk / spFarm.extractors_per_month);
   const revenuePerAcct = cfg.charsPerAccount * spFarm.revenue_isk;
-  const totalCostPerAcct = omegaCostPerAcct + mptcCostPerAcct + extractorCostPerAcct;
+  const totalCostPerAcct = omegaCostPerAcct + extractorCostPerAcct;
   const profitPerAcct = revenuePerAcct - totalCostPerAcct;
 
   // Totals
   const totalOmega = cfg.accounts * omegaCostPerAcct;
-  const totalMPTC = cfg.accounts * mptcCostPerAcct;
   const totalRevenue = cfg.accounts * revenuePerAcct;
   const totalProfit = cfg.accounts * profitPerAcct;
 
@@ -187,7 +182,7 @@ export function FleetManagerCard({ spFarm }: { spFarm: SPFarmResult }) {
             className="w-16 px-1.5 py-0.5 bg-eve-input border border-eve-border rounded-sm text-xs text-eve-text font-mono"
           />
         </div>
-        <span className="text-eve-dim text-[10px]">{t("plexFleetTotalChars")}: {totalChars} ({totalMPTCChars} MPTC)</span>
+        <span className="text-eve-dim text-[10px]">{t("plexFleetTotalChars")}: {totalChars}</span>
       </div>
 
       {/* Fleet summary table */}
@@ -196,7 +191,6 @@ export function FleetManagerCard({ spFarm }: { spFarm: SPFarmResult }) {
           <tr className="text-eve-dim border-b border-eve-border">
             <th className="text-left py-1 px-2 font-medium">#</th>
             <th className="text-right py-1 px-2 font-medium">{t("plexFleetOmegaCost")}</th>
-            <th className="text-right py-1 px-2 font-medium">{t("plexFleetMPTCCost")}</th>
             <th className="text-right py-1 px-2 font-medium">{t("plexFleetExtractors")}</th>
             <th className="text-right py-1 px-2 font-medium">{t("plexFleetRevenue")}</th>
             <th className="text-right py-1 px-2 font-medium">{t("plexFleetProfit")}</th>
@@ -207,7 +201,6 @@ export function FleetManagerCard({ spFarm }: { spFarm: SPFarmResult }) {
             <tr key={i} className="border-b border-eve-border/30">
               <td className="py-1 px-2 text-eve-dim">Acct {i + 1}</td>
               <td className="py-1 px-2 text-right font-mono text-eve-text">{formatISK(omegaCostPerAcct)}</td>
-              <td className="py-1 px-2 text-right font-mono text-eve-text">{mptcCharsPerAccount > 0 ? formatISK(mptcCostPerAcct) : "—"}</td>
               <td className="py-1 px-2 text-right font-mono text-eve-text">{extractorsPerAcct.toFixed(1)}</td>
               <td className="py-1 px-2 text-right font-mono text-eve-text">{formatISK(revenuePerAcct)}</td>
               <td className={`py-1 px-2 text-right font-mono font-semibold ${profitPerAcct >= 0 ? "text-eve-positive" : "text-eve-negative"}`}>
@@ -219,7 +212,6 @@ export function FleetManagerCard({ spFarm }: { spFarm: SPFarmResult }) {
           <tr className="border-t-2 border-eve-border font-semibold">
             <td className="py-1.5 px-2 text-eve-text">{t("plexFleetTotal")}</td>
             <td className="py-1.5 px-2 text-right font-mono text-eve-text">{formatISK(totalOmega)}</td>
-            <td className="py-1.5 px-2 text-right font-mono text-eve-text">{totalMPTCChars > 0 ? formatISK(totalMPTC) : "—"}</td>
             <td className="py-1.5 px-2 text-right font-mono text-eve-text">{(cfg.accounts * extractorsPerAcct).toFixed(1)}</td>
             <td className="py-1.5 px-2 text-right font-mono text-eve-text">{formatISK(totalRevenue)}</td>
             <td className={`py-1.5 px-2 text-right font-mono ${totalProfit >= 0 ? "text-eve-positive" : "text-eve-negative"}`}>

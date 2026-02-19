@@ -1,8 +1,13 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"math"
 	"testing"
+
+	"eve-flipper/internal/esi"
+	"eve-flipper/internal/sde"
 )
 
 // getContractFilters returns effective minPrice, maxMargin, minPricedRatio (defaults when params are 0).
@@ -209,35 +214,136 @@ func TestContractCarryDays(t *testing.T) {
 	}
 }
 
-func TestIsRig(t *testing.T) {
-	tests := []struct {
-		name    string
-		groupID int32
-		want    bool
-	}{
-		{"Small rig group", 28, true},
-		{"Medium rig group", 54, true},
-		{"Large rig group", 80, true},
-		{"Capital rig group", 106, true},
-		{"Armor rig group", 132, true},
-		{"Shield rig group", 158, true},
-		{"Astronautic rig group", 184, true},
-		{"Projectile weapon rig group", 210, true},
-		{"Drone rig group", 236, true},
-		{"Launcher rig group", 262, true},
-		{"Energy weapon rig group", 289, true},
-		{"Hybrid weapon rig group", 290, true},
-		{"Electronic superiority rig group", 291, true},
-		{"Ship group (not a rig)", 25, false},       // Frigate
-		{"Module group (not a rig)", 53, false},     // Energy Weapon
-		{"Ammunition group (not a rig)", 83, false}, // Hybrid Charge
-		{"Unknown group", 99999, false},
+func TestIsMarketDisabledType(t *testing.T) {
+	if !isMarketDisabledType(MPTCTypeID) {
+		t.Fatalf("MPTCTypeID should be marked market-disabled")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isRig(tt.groupID); got != tt.want {
-				t.Errorf("isRig(groupID=%d) = %v, want %v", tt.groupID, got, tt.want)
-			}
-		})
+	if isMarketDisabledType(PLEXTypeID) {
+		t.Fatalf("PLEXTypeID should not be market-disabled")
+	}
+}
+
+func TestSelectInstantLiquidationSystem_RequiresSingleSystemForAllTypes(t *testing.T) {
+	items := []instantValuationItem{
+		{TypeID: 1, Quantity: 1, Label: "Item A", ValueFactor: 1},
+		{TypeID: 2, Quantity: 1, Label: "Item B", ValueFactor: 1},
+	}
+	books := map[int32]map[int32][]esi.MarketOrder{
+		1: {
+			30000142: {{TypeID: 1, SystemID: 30000142, IsBuyOrder: true, Price: 100, VolumeRemain: 10}},
+		},
+		2: {
+			30002187: {{TypeID: 2, SystemID: 30002187, IsBuyOrder: true, Price: 200, VolumeRemain: 10}},
+		},
+	}
+
+	if _, ok := selectInstantLiquidationSystem(items, books); ok {
+		t.Fatalf("expected no valid system when item liquidity is split across different systems")
+	}
+}
+
+func TestSelectInstantLiquidationSystem_PicksBestCommonSystem(t *testing.T) {
+	items := []instantValuationItem{
+		{TypeID: 1, Quantity: 1, Label: "Item A", ValueFactor: 1},
+		{TypeID: 2, Quantity: 1, Label: "Item B", ValueFactor: 1},
+	}
+	books := map[int32]map[int32][]esi.MarketOrder{
+		1: {
+			30000142: {{TypeID: 1, SystemID: 30000142, IsBuyOrder: true, Price: 100, VolumeRemain: 10}},
+			30002187: {{TypeID: 1, SystemID: 30002187, IsBuyOrder: true, Price: 95, VolumeRemain: 10}},
+		},
+		2: {
+			30000142: {{TypeID: 2, SystemID: 30000142, IsBuyOrder: true, Price: 40, VolumeRemain: 10}},
+			30002187: {{TypeID: 2, SystemID: 30002187, IsBuyOrder: true, Price: 80, VolumeRemain: 10}},
+		},
+	}
+
+	choice, ok := selectInstantLiquidationSystem(items, books)
+	if !ok {
+		t.Fatalf("expected a valid liquidation system")
+	}
+	if choice.SystemID != 30002187 {
+		t.Fatalf("SystemID = %d, want 30002187", choice.SystemID)
+	}
+	if math.Abs(choice.MarketValue-175) > 1e-9 {
+		t.Fatalf("MarketValue = %f, want 175", choice.MarketValue)
+	}
+	if choice.PricedCount != 2 {
+		t.Fatalf("PricedCount = %d, want 2", choice.PricedCount)
+	}
+}
+
+func TestShouldExcludeRigWithShip(t *testing.T) {
+	if !shouldExcludeRigWithShip(esi.ContractItem{Flag: 92}, "Large Core Defense Field Extender I", 3, false) {
+		t.Fatalf("flagged rig slot should be excluded")
+	}
+	if !shouldExcludeRigWithShip(esi.ContractItem{Singleton: true}, "Large Core Defense Field Extender I", 3, false) {
+		t.Fatalf("singleton rig should be excluded")
+	}
+	if !shouldExcludeRigWithShip(esi.ContractItem{}, "Large Core Defense Field Extender I", 3, false) {
+		t.Fatalf("size-matched rig should be excluded")
+	}
+	if shouldExcludeRigWithShip(esi.ContractItem{}, "Small Core Defense Field Extender I", 3, false) {
+		t.Fatalf("mismatched rig without fitted signal should not be excluded")
+	}
+	if !shouldExcludeRigWithShip(esi.ContractItem{}, "Small Core Defense Field Extender I", 3, true) {
+		t.Fatalf("forceExclude should exclude all rigs when ship is present")
+	}
+	if shouldExcludeRigWithShip(esi.ContractItem{Flag: 92}, "Large Core Defense Field Extender I", 0, true) {
+		t.Fatalf("no ship present: rig should not be excluded by ship logic")
+	}
+}
+
+func TestBlockedContractTypeID(t *testing.T) {
+	items := []esi.ContractItem{
+		{TypeID: 34, Quantity: 100},        // Tritanium
+		{TypeID: MPTCTypeID, Quantity: 1},  // market-disabled
+		{TypeID: PLEXTypeID, Quantity: 1},  // tradable
+		{TypeID: MPTCTypeID, Quantity: 0},  // ignored (non-positive qty)
+		{TypeID: MPTCTypeID, Quantity: -5}, // ignored (non-positive qty)
+	}
+	if got := blockedContractTypeID(items); got != MPTCTypeID {
+		t.Fatalf("blockedContractTypeID = %d, want %d", got, MPTCTypeID)
+	}
+	if got := blockedContractTypeID([]esi.ContractItem{{TypeID: 34, Quantity: 10}}); got != 0 {
+		t.Fatalf("blockedContractTypeID(non-blocked) = %d, want 0", got)
+	}
+}
+
+func TestScanContractsWithContext_CanceledBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s := &Scanner{}
+	_, err := s.ScanContractsWithContext(ctx, ScanParams{}, func(string) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestContractItemLabel_UsesSDENameFirst(t *testing.T) {
+	s := &Scanner{
+		SDE: &sde.Data{
+			Types: map[int32]*sde.ItemType{
+				34: {ID: 34, Name: "Tritanium"},
+			},
+		},
+	}
+	got := s.contractItemLabel(34, map[int32]string{})
+	if got != "Tritanium" {
+		t.Fatalf("contractItemLabel = %q, want Tritanium", got)
+	}
+}
+
+func TestContractItemLabel_FallbackToTypeIDAndCachesPerScan(t *testing.T) {
+	s := &Scanner{SDE: &sde.Data{Types: map[int32]*sde.ItemType{}}}
+	cache := map[int32]string{}
+
+	got := s.contractItemLabel(34133, cache)
+	if got != "Type 34133" {
+		t.Fatalf("contractItemLabel = %q, want Type 34133", got)
+	}
+	if cache[34133] != "Type 34133" {
+		t.Fatalf("expected scan cache to store fallback label, got %q", cache[34133])
 	}
 }

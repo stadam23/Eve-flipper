@@ -19,8 +19,8 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 
 	stmt, err := tx.Prepare(`INSERT INTO flip_results (
 		scan_id, type_id, type_name, volume,
-		buy_price, buy_station, buy_system_name, buy_system_id,
-		sell_price, sell_station, sell_system_name, sell_system_id,
+		buy_price, best_ask_price, best_ask_qty, buy_station, buy_system_name, buy_system_id,
+		sell_price, best_bid_price, best_bid_qty, sell_station, sell_system_name, sell_system_id,
 		profit_per_unit, margin_percent, units_to_buy,
 		buy_order_remain, sell_order_remain,
 		total_profit, profit_per_jump, buy_jumps, sell_jumps, total_jumps,
@@ -29,7 +29,7 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 		daily_profit, real_profit, real_margin_percent, filled_qty, can_fill,
 		expected_profit, expected_buy_price, expected_sell_price,
 		slippage_buy_pct, slippage_sell_pct, history_available
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("[DB] InsertFlipResults prepare: %v", err)
@@ -48,8 +48,8 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 		}
 		if _, err := stmt.Exec(
 			scanID, r.TypeID, r.TypeName, r.Volume,
-			r.BuyPrice, r.BuyStation, r.BuySystemName, r.BuySystemID,
-			r.SellPrice, r.SellStation, r.SellSystemName, r.SellSystemID,
+			r.BuyPrice, r.BestAskPrice, r.BestAskQty, r.BuyStation, r.BuySystemName, r.BuySystemID,
+			r.SellPrice, r.BestBidPrice, r.BestBidQty, r.SellStation, r.SellSystemName, r.SellSystemID,
 			r.ProfitPerUnit, r.MarginPercent, r.UnitsToBuy,
 			r.BuyOrderRemain, r.SellOrderRemain,
 			r.TotalProfit, r.ProfitPerJump, r.BuyJumps, r.SellJumps, r.TotalJumps,
@@ -74,8 +74,8 @@ func (d *DB) InsertFlipResults(scanID int64, results []engine.FlipResult) {
 func (d *DB) GetFlipResults(scanID int64) []engine.FlipResult {
 	rows, err := d.sql.Query(`
 		SELECT type_id, type_name, volume,
-			buy_price, buy_station, buy_system_name, buy_system_id,
-			sell_price, sell_station, sell_system_name, sell_system_id,
+			buy_price, best_ask_price, best_ask_qty, buy_station, buy_system_name, buy_system_id,
+			sell_price, best_bid_price, best_bid_qty, sell_station, sell_system_name, sell_system_id,
 			profit_per_unit, margin_percent, units_to_buy,
 			buy_order_remain, sell_order_remain,
 			total_profit, profit_per_jump, buy_jumps, sell_jumps, total_jumps,
@@ -98,8 +98,8 @@ func (d *DB) GetFlipResults(scanID int64) []engine.FlipResult {
 		var historyAvailable int
 		if err := rows.Scan(
 			&r.TypeID, &r.TypeName, &r.Volume,
-			&r.BuyPrice, &r.BuyStation, &r.BuySystemName, &r.BuySystemID,
-			&r.SellPrice, &r.SellStation, &r.SellSystemName, &r.SellSystemID,
+			&r.BuyPrice, &r.BestAskPrice, &r.BestAskQty, &r.BuyStation, &r.BuySystemName, &r.BuySystemID,
+			&r.SellPrice, &r.BestBidPrice, &r.BestBidQty, &r.SellStation, &r.SellSystemName, &r.SellSystemID,
 			&r.ProfitPerUnit, &r.MarginPercent, &r.UnitsToBuy,
 			&r.BuyOrderRemain, &r.SellOrderRemain,
 			&r.TotalProfit, &r.ProfitPerJump, &r.BuyJumps, &r.SellJumps, &r.TotalJumps,
@@ -111,6 +111,12 @@ func (d *DB) GetFlipResults(scanID int64) []engine.FlipResult {
 		); err != nil {
 			log.Printf("[DB] GetFlipResults scan row: %v", err)
 			continue
+		}
+		if r.BestAskPrice == 0 && r.BuyPrice > 0 {
+			r.BestAskPrice = r.BuyPrice
+		}
+		if r.BestBidPrice == 0 && r.SellPrice > 0 {
+			r.BestBidPrice = r.SellPrice
 		}
 		r.CanFill = canFill != 0
 		r.HistoryAvailable = historyAvailable != 0
@@ -135,9 +141,10 @@ func (d *DB) InsertContractResults(scanID int64, results []engine.ContractResult
 		scan_id, contract_id, title, price, market_value,
 		profit, margin_percent, expected_profit, expected_margin_percent,
 		sell_confidence, est_liquidation_days, conservative_value, carry_cost,
-		volume, station_name,
+		volume, station_name, system_name, region_name,
+		liquidation_system_name, liquidation_region_name, liquidation_jumps,
 		item_count, jumps, profit_per_jump
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("[DB] InsertContractResults prepare: %v", err)
@@ -150,7 +157,8 @@ func (d *DB) InsertContractResults(scanID int64, results []engine.ContractResult
 			scanID, r.ContractID, r.Title, r.Price, r.MarketValue,
 			r.Profit, r.MarginPercent, r.ExpectedProfit, r.ExpectedMarginPercent,
 			r.SellConfidence, r.EstLiquidationDays, r.ConservativeValue, r.CarryCost,
-			r.Volume, r.StationName,
+			r.Volume, r.StationName, r.SystemName, r.RegionName,
+			r.LiquidationSystemName, r.LiquidationRegionName, r.LiquidationJumps,
 			r.ItemCount, r.Jumps, r.ProfitPerJump,
 		); err != nil {
 			tx.Rollback()
@@ -170,7 +178,8 @@ func (d *DB) GetContractResults(scanID int64) []engine.ContractResult {
 		SELECT contract_id, title, price, market_value,
 			profit, margin_percent, expected_profit, expected_margin_percent,
 			sell_confidence, est_liquidation_days, conservative_value, carry_cost,
-			volume, station_name,
+			volume, station_name, system_name, region_name,
+			liquidation_system_name, liquidation_region_name, liquidation_jumps,
 			item_count, jumps, profit_per_jump
 		FROM contract_results WHERE scan_id = ?
 	`, scanID)
@@ -186,7 +195,8 @@ func (d *DB) GetContractResults(scanID int64) []engine.ContractResult {
 			&r.ContractID, &r.Title, &r.Price, &r.MarketValue,
 			&r.Profit, &r.MarginPercent, &r.ExpectedProfit, &r.ExpectedMarginPercent,
 			&r.SellConfidence, &r.EstLiquidationDays, &r.ConservativeValue, &r.CarryCost,
-			&r.Volume, &r.StationName,
+			&r.Volume, &r.StationName, &r.SystemName, &r.RegionName,
+			&r.LiquidationSystemName, &r.LiquidationRegionName, &r.LiquidationJumps,
 			&r.ItemCount, &r.Jumps, &r.ProfitPerJump,
 		); err != nil {
 			log.Printf("[DB] GetContractResults scan row: %v", err)
@@ -211,8 +221,8 @@ func (d *DB) InsertStationResults(scanID int64, results []engine.StationTrade) {
 
 	stmt, err := tx.Prepare(`INSERT INTO station_results (
 		scan_id, type_id, type_name, buy_price, sell_price,
-		margin, margin_pct, volume, buy_volume, sell_volume,
-		station_id, station_name, cts, sds, period_roi,
+		margin, margin_pct, volume, daily_volume, item_volume_m3, buy_volume, sell_volume,
+		station_id, station_name, system_id, region_id, cts, sds, period_roi,
 		vwap, pvi, obds, bvs_ratio, dos,
 		s2b_per_day, bfs_per_day, s2b_bfs_ratio, real_margin_percent, history_available,
 		daily_profit, real_profit, filled_qty, can_fill,
@@ -224,7 +234,7 @@ func (d *DB) InsertStationResults(scanID int64, results []engine.StationTrade) {
 		avg_price, price_high, price_low,
 		confidence_score, confidence_label, has_execution_evidence,
 		is_extreme_price, is_high_risk
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("[DB] InsertStationResults prepare: %v", err)
@@ -255,8 +265,8 @@ func (d *DB) InsertStationResults(scanID int64, results []engine.StationTrade) {
 		}
 		if _, err := stmt.Exec(
 			scanID, r.TypeID, r.TypeName, r.BuyPrice, r.SellPrice,
-			r.Spread, r.MarginPercent, r.DailyVolume, r.BuyVolume, r.SellVolume,
-			r.StationID, r.StationName, r.CTS, r.SDS, r.PeriodROI,
+			r.Spread, r.MarginPercent, r.DailyVolume, r.DailyVolume, r.Volume, r.BuyVolume, r.SellVolume,
+			r.StationID, r.StationName, r.SystemID, r.RegionID, r.CTS, r.SDS, r.PeriodROI,
 			r.VWAP, r.PVI, r.OBDS, r.BvSRatio, r.DOS,
 			r.S2BPerDay, r.BfSPerDay, r.S2BBfSRatio, r.RealMarginPercent, historyAvailable,
 			r.DailyProfit, r.RealProfit, r.FilledQty, canFill,
@@ -284,8 +294,11 @@ func (d *DB) InsertStationResults(scanID int64, results []engine.StationTrade) {
 func (d *DB) GetStationResults(scanID int64) []engine.StationTrade {
 	rows, err := d.sql.Query(`
 		SELECT type_id, type_name, buy_price, sell_price,
-			margin, margin_pct, volume, buy_volume, sell_volume,
-			station_id, station_name, cts, sds, period_roi,
+			margin, margin_pct,
+			CASE WHEN COALESCE(item_volume_m3, 0) > 0 THEN COALESCE(item_volume_m3, 0) ELSE 0 END,
+			CASE WHEN COALESCE(item_volume_m3, 0) > 0 THEN COALESCE(daily_volume, 0) ELSE CAST(COALESCE(volume, 0) AS INTEGER) END,
+			buy_volume, sell_volume,
+			station_id, station_name, COALESCE(system_id, 0), COALESCE(region_id, 0), cts, sds, period_roi,
 			vwap, pvi, obds, bvs_ratio, dos,
 			s2b_per_day, bfs_per_day, s2b_bfs_ratio, real_margin_percent, history_available,
 			daily_profit, real_profit, filled_qty, can_fill,
@@ -312,8 +325,8 @@ func (d *DB) GetStationResults(scanID int64) []engine.StationTrade {
 		var canFill, historyAvailable, hasExecEvidence, isExtremePrice, isHighRisk int
 		if err := rows.Scan(
 			&r.TypeID, &r.TypeName, &r.BuyPrice, &r.SellPrice,
-			&r.Spread, &r.MarginPercent, &r.DailyVolume, &r.BuyVolume, &r.SellVolume,
-			&r.StationID, &r.StationName, &r.CTS, &r.SDS, &r.PeriodROI,
+			&r.Spread, &r.MarginPercent, &r.Volume, &r.DailyVolume, &r.BuyVolume, &r.SellVolume,
+			&r.StationID, &r.StationName, &r.SystemID, &r.RegionID, &r.CTS, &r.SDS, &r.PeriodROI,
 			&r.VWAP, &r.PVI, &r.OBDS, &r.BvSRatio, &r.DOS,
 			&r.S2BPerDay, &r.BfSPerDay, &r.S2BBfSRatio, &r.RealMarginPercent, &historyAvailable,
 			&r.DailyProfit, &r.RealProfit, &r.FilledQty, &canFill,

@@ -4,6 +4,8 @@ export interface FlipResult {
   Volume: number;
   IskPerM3?: number;
   BuyPrice: number;
+  BestAskPrice?: number;
+  BestAskQty?: number;
   BuyStation: string;
   BuySystemName: string;
   BuySystemID: number;
@@ -11,6 +13,8 @@ export interface FlipResult {
   BuyRegionName?: string;
   BuyLocationID?: number;
   SellPrice: number;
+  BestBidPrice?: number;
+  BestBidQty?: number;
   SellStation: string;
   SellSystemName: string;
   SellSystemID: number;
@@ -66,6 +70,9 @@ export interface ContractResult {
   StationName: string;
   SystemName?: string;
   RegionName?: string;
+  LiquidationSystemName?: string;
+  LiquidationRegionName?: string;
+  LiquidationJumps?: number;
   ItemCount: number;
   Jumps: number;
   ProfitPerJump: number;
@@ -77,6 +84,11 @@ export interface ContractItem {
   quantity: number;
   is_included: boolean;
   is_blueprint_copy: boolean;
+  group_id?: number;
+  group_name?: string;
+  category_id?: number;
+  is_ship?: boolean;
+  is_rig?: boolean;
   record_id: number;
   item_id: number;
   material_efficiency?: number;
@@ -187,6 +199,8 @@ export interface StationTrade {
   ROI: number;
   StationName: string;
   StationID: number;
+  SystemID?: number;
+  RegionID?: number;
   // EVE Guru style metrics
   CapitalRequired: number;
   NowROI: number;
@@ -315,6 +329,8 @@ export interface ScanParams {
   contract_hold_days?: number;
   contract_target_confidence?: number;
   exclude_rigs_with_ship?: boolean;
+  route_min_hops?: number;
+  route_max_hops?: number;
   // Player structures
   include_structures?: boolean;
 }

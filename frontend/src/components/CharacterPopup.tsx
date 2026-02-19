@@ -29,6 +29,7 @@ interface CharacterPopupProps {
 }
 
 type CharTab = "overview" | "orders" | "transactions" | "pnl" | "risk" | "optimizer";
+const SCOPE_COLLAPSE_KEY = "eve-character-scope-collapsed";
 
 export function CharacterPopup({
   open,
@@ -50,6 +51,13 @@ export function CharacterPopup({
   const [selectedScope, setSelectedScope] = useState<CharacterScope>(activeCharacterId ?? "all");
   const [scopeBusy, setScopeBusy] = useState(false);
   const [deletingCharacterId, setDeletingCharacterId] = useState<number | null>(null);
+  const [scopeCollapsed, setScopeCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(SCOPE_COLLAPSE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -146,6 +154,18 @@ export function CharacterPopup({
     }
   }, [onAddCharacter]);
 
+  const toggleScopeCollapsed = useCallback(() => {
+    setScopeCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SCOPE_COLLAPSE_KEY, next ? "1" : "0");
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
   const formatIsk = (value: number) => {
     if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
     if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
@@ -176,45 +196,75 @@ export function CharacterPopup({
     <Modal open={open} onClose={onClose} title={modalTitle} width="max-w-5xl">
       <div className="flex flex-col h-[70vh]">
         {/* Character selector */}
-        <div className="border-b border-eve-border bg-eve-panel/60 px-4 py-3 space-y-2">
+        <div className="border-b border-eve-border bg-gradient-to-r from-eve-panel/90 to-eve-dark/70 px-4 py-3 space-y-2.5">
           <div className="flex items-center justify-between gap-2">
-            <div className="text-[10px] text-eve-dim uppercase tracking-wider">{t("charSelectCharacter")}</div>
+            <div className="flex items-center gap-2 min-w-0">
+              <button
+                type="button"
+                onClick={toggleScopeCollapsed}
+                className="inline-flex items-center gap-1.5 text-[10px] text-eve-dim uppercase tracking-wider hover:text-eve-accent transition-colors"
+              >
+                <span className="text-[11px]">{scopeCollapsed ? "▸" : "▾"}</span>
+                <span>{t("charSelectCharacter")}</span>
+              </button>
+              {scopeCollapsed && (
+                <span className="text-[10px] text-eve-dim/80 truncate">
+                  {selectedScope === "all"
+                    ? t("charAllCharacters")
+                    : selectedCharacter?.character_name ?? t("charOverview")}
+                </span>
+              )}
+            </div>
             <button
               onClick={() => { void handleAdd(); }}
               disabled={scopeBusy}
-              className="px-2 py-1 text-[10px] rounded-sm border border-eve-border bg-eve-dark text-eve-dim hover:text-eve-accent hover:border-eve-accent/50 transition-colors disabled:opacity-50"
+              className="px-2.5 py-1 text-[10px] rounded-sm border border-eve-border bg-eve-dark/80 text-eve-dim hover:text-eve-accent hover:border-eve-accent/50 transition-colors disabled:opacity-50"
             >
               {t("charAddCharacter")}
             </button>
           </div>
-          <div className="flex flex-wrap gap-2">
+          {!scopeCollapsed && (
+            <div className="flex flex-wrap gap-2 p-2 rounded-sm border border-eve-border/60 bg-eve-dark/35">
             <button
               onClick={() => { void handleSelectScope("all"); }}
-              className={`inline-flex items-center gap-1 px-2 py-1 rounded-sm border text-[11px] transition-colors ${
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-sm border text-[11px] transition-colors ${
                 selectedScope === "all"
-                  ? "border-eve-accent bg-eve-accent/15 text-eve-accent"
-                  : "border-eve-border bg-eve-dark text-eve-dim hover:text-eve-text hover:border-eve-accent/50"
+                  ? "border-eve-accent/80 bg-eve-accent/15 text-eve-accent shadow-[0_0_0_1px_rgba(230,149,0,0.15)]"
+                  : "border-eve-border bg-eve-dark/70 text-eve-dim hover:text-eve-text hover:border-eve-accent/50"
               }`}
             >
+              <span className="text-[10px] opacity-80">◉</span>
               {t("charAllCharacters")}
             </button>
             {characters.map((character) => (
-              <div key={character.character_id} className="inline-flex items-center rounded-sm border border-eve-border bg-eve-dark overflow-hidden">
+              <div
+                key={character.character_id}
+                className={`inline-flex items-center rounded-sm border overflow-hidden transition-colors ${
+                  selectedScope === character.character_id
+                    ? "border-eve-accent/70 bg-eve-accent/12 shadow-[0_0_0_1px_rgba(230,149,0,0.12)]"
+                    : "border-eve-border bg-eve-dark/70"
+                }`}
+              >
                 <button
                   onClick={() => { void handleSelectScope(character.character_id); }}
-                  className={`inline-flex items-center gap-1.5 px-2 py-1 text-[11px] transition-colors ${
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] transition-colors max-w-[260px] ${
                     selectedScope === character.character_id
-                      ? "text-eve-accent bg-eve-accent/10"
+                      ? "text-eve-accent"
                       : "text-eve-dim hover:text-eve-text"
                   }`}
                 >
                   <img
                     src={`https://images.evetech.net/characters/${character.character_id}/portrait?size=32`}
                     alt=""
-                    className="w-4 h-4 rounded-sm"
+                    className="w-5 h-5 rounded-sm border border-eve-border/50"
                   />
-                  <span>{character.character_name}</span>
-                  {character.active && <span className="text-[9px] text-eve-dim">({t("charActive")})</span>}
+                  <span className="truncate">{character.character_name}</span>
+                  {character.active && (
+                    <span className="inline-flex items-center gap-1 text-[9px] text-eve-dim/85">
+                      <span className="w-1.5 h-1.5 rounded-full bg-eve-success" />
+                      {t("charActive")}
+                    </span>
+                  )}
                 </button>
                 <button
                   onClick={(event) => {
@@ -222,7 +272,7 @@ export function CharacterPopup({
                     void handleDeleteScope(character.character_id);
                   }}
                   disabled={deletingCharacterId === character.character_id}
-                  className="px-1.5 py-1 text-eve-dim hover:text-eve-error transition-colors disabled:opacity-50"
+                  className="px-1.5 py-1 border-l border-eve-border/50 text-eve-dim hover:text-eve-error hover:bg-eve-error/5 transition-colors disabled:opacity-50"
                   title={t("charRemoveCharacter")}
                   aria-label={t("charRemoveCharacter")}
                 >
@@ -232,7 +282,8 @@ export function CharacterPopup({
                 </button>
               </div>
             ))}
-          </div>
+            </div>
+          )}
         </div>
 
         {/* Tabs + Refresh */}

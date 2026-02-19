@@ -371,12 +371,17 @@ func (s *Scanner) calculateResults(
 	// This collapses e.g. 500 sell orders at Jita into 1 best-price entry.
 	type sellLocBest struct {
 		sellInfo
+		BestPriceVolume int32
 	}
 	type buyLocBest struct {
 		buyInfo
+		BestPriceVolume int32
 	}
 
 	for typeID, sells := range idx.sellByType {
+		if isMarketDisabledType(typeID) {
+			continue
+		}
 		buys := idx.buyByType[typeID]
 		if len(buys) == 0 {
 			continue
@@ -400,16 +405,22 @@ func (s *Scanner) calculateResults(
 		bestSellByLoc := make(map[int64]*sellLocBest)
 		for _, sell := range sells {
 			if existing, ok := bestSellByLoc[sell.LocationID]; ok {
-				// Accumulate volume, keep cheapest price
+				// Accumulate full depth and track L1 quantity at the best ask.
 				existing.VolumeRemain += sell.VolumeRemain
 				if sell.Price < existing.Price {
 					existing.Price = sell.Price
 					existing.SystemID = sell.SystemID
 					existing.OrderCount = sell.OrderCount
+					existing.BestPriceVolume = sell.VolumeRemain
+				} else if sell.Price == existing.Price {
+					existing.BestPriceVolume += sell.VolumeRemain
 				}
 			} else {
 				cp := sell
-				bestSellByLoc[sell.LocationID] = &sellLocBest{cp}
+				bestSellByLoc[sell.LocationID] = &sellLocBest{
+					sellInfo:        cp,
+					BestPriceVolume: sell.VolumeRemain,
+				}
 			}
 		}
 
@@ -417,16 +428,22 @@ func (s *Scanner) calculateResults(
 		bestBuyByLoc := make(map[int64]*buyLocBest)
 		for _, buy := range buys {
 			if existing, ok := bestBuyByLoc[buy.LocationID]; ok {
-				// Accumulate volume, keep highest price
+				// Accumulate full depth and track L1 quantity at the best bid.
 				existing.VolumeRemain += buy.VolumeRemain
 				if buy.Price > existing.Price {
 					existing.Price = buy.Price
 					existing.SystemID = buy.SystemID
 					existing.OrderCount = buy.OrderCount
+					existing.BestPriceVolume = buy.VolumeRemain
+				} else if buy.Price == existing.Price {
+					existing.BestPriceVolume += buy.VolumeRemain
 				}
 			} else {
 				cp := buy
-				bestBuyByLoc[buy.LocationID] = &buyLocBest{cp}
+				bestBuyByLoc[buy.LocationID] = &buyLocBest{
+					buyInfo:         cp,
+					BestPriceVolume: buy.VolumeRemain,
+				}
 			}
 		}
 
@@ -530,6 +547,8 @@ func (s *Scanner) calculateResults(
 					TypeName:        itemType.Name,
 					Volume:          itemType.Volume,
 					BuyPrice:        sell.Price,
+					BestAskPrice:    sell.Price,
+					BestAskQty:      sell.BestPriceVolume,
 					BuyStation:      "",
 					BuySystemName:   s.systemName(sell.SystemID),
 					BuySystemID:     sell.SystemID,
@@ -537,6 +556,8 @@ func (s *Scanner) calculateResults(
 					BuyRegionName:   s.regionName(buyRegionID),
 					BuyLocationID:   sellLocID,
 					SellPrice:       buy.Price,
+					BestBidPrice:    buy.Price,
+					BestBidQty:      buy.BestPriceVolume,
 					SellStation:     "",
 					SellSystemName:  s.systemName(buy.SystemID),
 					SellSystemID:    buy.SystemID,
@@ -859,8 +880,11 @@ func harmonicDailyShare(dailyVolume int64, competitors int) int64 {
 	position := (n + 1) / 2 // ceil(n/2) via integer division
 	share := float64(dailyVolume) * (1.0 / float64(position)) / hn
 	result := int64(math.Round(share))
-	if result < 1 {
-		result = 1
+	if result < 0 {
+		result = 0
+	}
+	if result > dailyVolume {
+		result = dailyVolume
 	}
 	return result
 }

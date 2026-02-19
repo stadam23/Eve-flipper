@@ -46,6 +46,33 @@ export function PresetPicker({ params, onApply, tab, builtinPresets, align = "le
     loadCustomPresets(tab),
   );
   const ref = useRef<HTMLDivElement>(null);
+  const autoAppliedRef = useRef<string | null>(null);
+
+  // Keep active preset selection strictly tab-scoped.
+  useEffect(() => {
+    let stored: string | null = null;
+    try {
+      stored = localStorage.getItem(activeKey);
+    } catch {
+      stored = null;
+    }
+
+    if (stored) {
+      setActivePresetIdRaw(stored);
+      return;
+    }
+
+    // If tab has built-ins and no prior selection, pin a deterministic default.
+    const defaultBuiltin =
+      builtinPresets.find((p) => p.id.includes("normal")) ?? builtinPresets[0];
+    if (defaultBuiltin) {
+      setActivePresetId(defaultBuiltin.id);
+      autoAppliedRef.current = null;
+      return;
+    }
+
+    setActivePresetIdRaw(null);
+  }, [activeKey, builtinPresets, setActivePresetId]);
 
   // Close on outside click
   useEffect(() => {
@@ -76,16 +103,41 @@ export function PresetPicker({ params, onApply, tab, builtinPresets, align = "le
   // Reload when tab changes
   useEffect(() => {
     setCustomPresets(loadCustomPresets(tab));
+    autoAppliedRef.current = null;
   }, [tab]);
+
+  // When switching tabs, auto-apply tab's active preset so scan params follow tab profile.
+  useEffect(() => {
+    if (!activePresetId) return;
+    let storedActiveId: string | null = null;
+    try {
+      storedActiveId = localStorage.getItem(activeKey);
+    } catch {
+      storedActiveId = null;
+    }
+    if (storedActiveId !== activePresetId) return;
+
+    const applyKey = `${tab}:${activePresetId}`;
+    if (autoAppliedRef.current === applyKey) return;
+
+    const builtin = builtinPresets.find((p) => p.id === activePresetId);
+    const custom = loadCustomPresets(tab).find((p) => p.id === activePresetId);
+    const presetParams = builtin?.params ?? custom?.params;
+    if (!presetParams) return;
+
+    onApply({ ...params, ...presetParams });
+    autoAppliedRef.current = applyKey;
+  }, [activeKey, activePresetId, builtinPresets, onApply, params, tab]);
 
   const handleApply = useCallback(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (id: string, presetParams: Record<string, any>) => {
       onApply({ ...params, ...presetParams });
       setActivePresetId(id);
+      autoAppliedRef.current = `${tab}:${id}`;
       setOpen(false);
     },
-    [params, onApply],
+    [params, onApply, setActivePresetId, tab],
   );
 
   const handleDelete = (e: React.MouseEvent, id: string) => {
@@ -108,6 +160,7 @@ export function PresetPicker({ params, onApply, tab, builtinPresets, align = "le
     saveCustomPreset(preset);
     setCustomPresets(loadCustomPresets(tab));
     setActivePresetId(preset.id);
+    autoAppliedRef.current = `${tab}:${preset.id}`;
     setSaveName("");
     setSaving(false);
     addToast(t("presetSaved"), "success", 2000);
@@ -119,6 +172,25 @@ export function PresetPicker({ params, onApply, tab, builtinPresets, align = "le
     if (!existing) return;
     saveCustomPreset({ ...existing, params: { ...params } });
     setCustomPresets(loadCustomPresets(tab));
+    addToast(
+      t("presetUpdated" as TranslationKey) || "Preset updated",
+      "success",
+      2000,
+    );
+  };
+
+  const handleOverwritePreset = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    const existing = customPresets.find((p) => p.id === id);
+    if (!existing) return;
+    saveCustomPreset({
+      ...existing,
+      tab: mapTabToPresetTab(tab),
+      params: { ...params },
+    });
+    setCustomPresets(loadCustomPresets(tab));
+    setActivePresetId(id);
+    autoAppliedRef.current = `${tab}:${id}`;
     addToast(
       t("presetUpdated" as TranslationKey) || "Preset updated",
       "success",
@@ -251,6 +323,16 @@ export function PresetPicker({ params, onApply, tab, builtinPresets, align = "le
                           ✓
                         </span>
                       )}
+                    </button>
+                    <button
+                      onClick={(e) => handleOverwritePreset(e, p.id)}
+                      className="shrink-0 w-6 h-6 flex items-center justify-center text-eve-dim hover:text-eve-accent opacity-0 group-hover:opacity-100 transition-all rounded-sm hover:bg-eve-accent/10"
+                      title={
+                        t("presetUpdate" as TranslationKey) ||
+                        "Update active preset"
+                      }
+                    >
+                      ↻
                     </button>
                     <button
                       onClick={(e) => handleDelete(e, p.id)}

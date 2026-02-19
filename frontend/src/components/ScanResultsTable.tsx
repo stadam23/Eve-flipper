@@ -48,7 +48,19 @@ const baseColumnDefs: ColumnDef[] = [
   {
     key: "BuyPrice",
     labelKey: "colBuyPrice",
-    width: "min-w-[110px]",
+    width: "min-w-[120px]",
+    numeric: true,
+  },
+  {
+    key: "BestAskQty",
+    labelKey: "colBestAskQty",
+    width: "min-w-[90px]",
+    numeric: true,
+  },
+  {
+    key: "ExpectedBuyPrice",
+    labelKey: "colExpectedBuyPrice",
+    width: "min-w-[120px]",
     numeric: true,
   },
   {
@@ -60,7 +72,19 @@ const baseColumnDefs: ColumnDef[] = [
   {
     key: "SellPrice",
     labelKey: "colSellPrice",
-    width: "min-w-[110px]",
+    width: "min-w-[120px]",
+    numeric: true,
+  },
+  {
+    key: "BestBidQty",
+    labelKey: "colBestBidQty",
+    width: "min-w-[90px]",
+    numeric: true,
+  },
+  {
+    key: "ExpectedSellPrice",
+    labelKey: "colExpectedSellPrice",
+    width: "min-w-[120px]",
     numeric: true,
   },
   {
@@ -348,9 +372,19 @@ function passesFilter(row: FlipResult, col: ColumnDef, fval: string): boolean {
 
 function fmtCell(col: ColumnDef, row: FlipResult): string {
   const val = getCellValue(row, col.key);
-  if (col.key === "ExpectedProfit" || col.key === "RealProfit") {
+  if (
+    col.key === "ExpectedProfit" ||
+    col.key === "RealProfit" ||
+    col.key === "ExpectedBuyPrice" ||
+    col.key === "ExpectedSellPrice"
+  ) {
     if (val == null || Number.isNaN(val)) return "\u2014";
+    if (Number(val) <= 0) return "\u2014";
     return formatISK(val as number);
+  }
+  if (col.key === "BestAskQty" || col.key === "BestBidQty") {
+    if (val == null || Number(val) <= 0) return "\u2014";
+    return Number(val).toLocaleString();
   }
   if (col.key === "CanFill") {
     if (val == null) return "\u2014";
@@ -455,7 +489,15 @@ export function ScanResultsTable({
   }, [contextMenu]);
 
   // ── Data pipeline: index → filter → sort → paginate (single memo) ──
-  const { indexed, filtered, sorted, pageRows, totalPages, safePage } =
+  const {
+    indexed,
+    filtered,
+    sorted,
+    pageRows,
+    totalPages,
+    safePage,
+    variantByRowId,
+  } =
     useMemo(() => {
       // Tag each row with stable id
       const indexed: IndexedRow[] = results.map((row) => ({
@@ -496,6 +538,25 @@ export function ScanResultsTable({
         return sortDir === "asc" ? cmp : -cmp;
       });
 
+      // Mark same-item alternatives so UI can show a small "variant" chip.
+      const totalByType = new Map<number, number>();
+      for (const ir of sorted) {
+        totalByType.set(
+          ir.row.TypeID,
+          (totalByType.get(ir.row.TypeID) ?? 0) + 1,
+        );
+      }
+      const seenByType = new Map<number, number>();
+      const variantByRowId = new Map<number, { index: number; total: number }>();
+      for (const ir of sorted) {
+        const total = totalByType.get(ir.row.TypeID) ?? 0;
+        const index = (seenByType.get(ir.row.TypeID) ?? 0) + 1;
+        seenByType.set(ir.row.TypeID, index);
+        if (total > 1) {
+          variantByRowId.set(ir.id, { index, total });
+        }
+      }
+
       // Paginate
       const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
       const safePage = Math.min(page, totalPages - 1);
@@ -504,7 +565,15 @@ export function ScanResultsTable({
         (safePage + 1) * PAGE_SIZE,
       );
 
-      return { indexed, filtered, sorted, pageRows, totalPages, safePage };
+      return {
+        indexed,
+        filtered,
+        sorted,
+        pageRows,
+        totalPages,
+        safePage,
+        variantByRowId,
+      };
     }, [results, filters, columnDefs, sortKey, sortDir, pinnedIds, page]);
 
   // Reset page when data/filters/sort change
@@ -826,6 +895,7 @@ export function ScanResultsTable({
               const isPinned = pinnedIds.has(ir.id);
               const isSelected = selectedIds.has(ir.id);
               const globalIdx = safePage * PAGE_SIZE + i;
+              const variant = variantByRowId.get(ir.id);
               return (
                 <tr
                   key={ir.id}
@@ -864,9 +934,26 @@ export function ScanResultsTable({
                   {columnDefs.map((col) => (
                     <td
                       key={col.key}
-                      className={`px-3 ${compactMode ? "py-1" : "py-1.5"} ${col.width} truncate ${col.numeric ? "text-eve-accent font-mono" : "text-eve-text"}`}
+                      className={`px-3 ${compactMode ? "py-1" : "py-1.5"} ${col.width} ${col.key === "TypeName" ? "" : "truncate"} ${col.numeric ? "text-eve-accent font-mono" : "text-eve-text"}`}
                     >
-                      {fmtCell(col, ir.row)}
+                      {col.key === "TypeName" ? (
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="truncate">{ir.row.TypeName}</span>
+                          {variant && (
+                            <span
+                              title={t("variantChipHint")}
+                              className="shrink-0 inline-flex items-center px-1 py-px rounded-[2px] border border-eve-accent/35 bg-eve-accent/10 text-eve-accent text-[9px] leading-none font-medium uppercase tracking-normal"
+                            >
+                              {t("variantChip", {
+                                index: variant.index,
+                                total: variant.total,
+                              })}
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        fmtCell(col, ir.row)
+                      )}
                     </td>
                   ))}
                 </tr>

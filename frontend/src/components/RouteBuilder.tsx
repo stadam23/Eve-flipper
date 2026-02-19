@@ -17,6 +17,7 @@ type SortDir = "asc" | "desc";
 
 interface Props {
   params: ScanParams;
+  onChange?: (params: ScanParams) => void;
   /** Results loaded externally (e.g. from history) */
   loadedResults?: RouteResult[] | null;
   isLoggedIn?: boolean;
@@ -33,10 +34,10 @@ function formatISKFull(v: number): string {
   return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-export function RouteBuilder({ params, loadedResults, isLoggedIn = false }: Props) {
+export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = false }: Props) {
   const { t } = useI18n();
-  const [minHops, setMinHops] = useState<number | "">(2);
-  const [maxHops, setMaxHops] = useState<number | "">(5);
+  const [minHops, setMinHops] = useState<number | "">(params.route_min_hops ?? 2);
+  const [maxHops, setMaxHops] = useState<number | "">(params.route_max_hops ?? 5);
   const [results, setResults] = useState<RouteResult[]>([]);
 
   // Accept externally loaded results (from history)
@@ -45,12 +46,54 @@ export function RouteBuilder({ params, loadedResults, isLoggedIn = false }: Prop
       setResults(loadedResults);
     }
   }, [loadedResults]);
+
+  useEffect(() => {
+    setMinHops(params.route_min_hops ?? 2);
+  }, [params.route_min_hops]);
+
+  useEffect(() => {
+    setMaxHops(params.route_max_hops ?? 5);
+  }, [params.route_max_hops]);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState("");
   const [selectedRoute, setSelectedRoute] = useState<RouteResult | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("profit");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const abortRef = useRef<AbortController | null>(null);
+
+  const applyHopParams = useCallback(
+    (nextMin: number, nextMax: number) => {
+      if (!onChange) return;
+      onChange({
+        ...params,
+        route_min_hops: nextMin,
+        route_max_hops: nextMax,
+      });
+    },
+    [onChange, params],
+  );
+
+  const handleMinHopsChange = useCallback(
+    (value: number) => {
+      const boundedMin = Math.max(1, Math.min(25, value));
+      const currentMax = typeof maxHops === "number" ? maxHops : 5;
+      const boundedMax = Math.max(boundedMin, Math.min(25, currentMax));
+      setMinHops(boundedMin);
+      setMaxHops(boundedMax);
+      applyHopParams(boundedMin, boundedMax);
+    },
+    [maxHops, applyHopParams],
+  );
+
+  const handleMaxHopsChange = useCallback(
+    (value: number) => {
+      const currentMin = typeof minHops === "number" ? minHops : 2;
+      const boundedMax = Math.max(currentMin, Math.min(25, value));
+      setMaxHops(boundedMax);
+      applyHopParams(currentMin, boundedMax);
+    },
+    [minHops, applyHopParams],
+  );
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -87,7 +130,9 @@ export function RouteBuilder({ params, loadedResults, isLoggedIn = false }: Prop
     setSelectedRoute(null);
 
     try {
-      const res = await findRoutes(params, minHops || 2, maxHops || 5, setProgress, controller.signal);
+      const searchMinHops = typeof minHops === "number" ? minHops : 2;
+      const searchMaxHops = typeof maxHops === "number" ? maxHops : 5;
+      const res = await findRoutes(params, searchMinHops, searchMaxHops, setProgress, controller.signal);
       setResults(res);
     } catch (e: unknown) {
       if (e instanceof Error && e.name !== "AbortError") {
@@ -121,7 +166,7 @@ export function RouteBuilder({ params, loadedResults, isLoggedIn = false }: Prop
               <SettingsField label={t("routeMinHops")}>
                 <SettingsNumberInput
                   value={typeof minHops === "number" ? minHops : 2}
-                  onChange={(v) => setMinHops(v)}
+                  onChange={handleMinHopsChange}
                   min={1}
                   max={25}
                 />
@@ -129,7 +174,7 @@ export function RouteBuilder({ params, loadedResults, isLoggedIn = false }: Prop
               <SettingsField label={t("routeMaxHops")}>
                 <SettingsNumberInput
                   value={typeof maxHops === "number" ? maxHops : 5}
-                  onChange={(v) => setMaxHops(v)}
+                  onChange={handleMaxHopsChange}
                   min={typeof minHops === "number" ? minHops : 1}
                   max={25}
                 />

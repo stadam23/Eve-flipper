@@ -127,6 +127,11 @@ func (d *DB) migrate() error {
 				carry_cost REAL NOT NULL DEFAULT 0,
 				volume          REAL,
 				station_name    TEXT,
+				system_name     TEXT NOT NULL DEFAULT '',
+				region_name     TEXT NOT NULL DEFAULT '',
+				liquidation_system_name TEXT NOT NULL DEFAULT '',
+				liquidation_region_name TEXT NOT NULL DEFAULT '',
+				liquidation_jumps INTEGER NOT NULL DEFAULT 0,
 				item_count      INTEGER,
 				jumps           INTEGER,
 				profit_per_jump REAL
@@ -754,6 +759,134 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("migration v18: %w", err)
 		}
 		logger.Info("DB", "Applied migration v18 (station_results full metric persistence)")
+	}
+
+	if version < 19 {
+		contractCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "system_name", def: "TEXT NOT NULL DEFAULT ''"},
+			{name: "region_name", def: "TEXT NOT NULL DEFAULT ''"},
+		}
+		contractResultsExists, err := d.tableExists("contract_results")
+		if err != nil {
+			return fmt.Errorf("migration v19 check contract_results exists: %w", err)
+		}
+		if contractResultsExists {
+			for _, c := range contractCols {
+				if err := d.ensureTableColumn("contract_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v19 add contract_results.%s: %w", c.name, err)
+				}
+			}
+		}
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (19);`); err != nil {
+			return fmt.Errorf("migration v19: %w", err)
+		}
+		logger.Info("DB", "Applied migration v19 (contract system/region persistence)")
+	}
+
+	if version < 20 {
+		flipCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "best_ask_price", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "best_bid_price", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "best_ask_qty", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "best_bid_qty", def: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		flipResultsExists, err := d.tableExists("flip_results")
+		if err != nil {
+			return fmt.Errorf("migration v20 check flip_results exists: %w", err)
+		}
+		if flipResultsExists {
+			for _, c := range flipCols {
+				if err := d.ensureTableColumn("flip_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v20 add flip_results.%s: %w", c.name, err)
+				}
+			}
+		}
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (20);`); err != nil {
+			return fmt.Errorf("migration v20: %w", err)
+		}
+		logger.Info("DB", "Applied migration v20 (flip_results L1 price/qty fields)")
+	}
+
+	if version < 21 {
+		contractCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "liquidation_system_name", def: "TEXT NOT NULL DEFAULT ''"},
+			{name: "liquidation_region_name", def: "TEXT NOT NULL DEFAULT ''"},
+			{name: "liquidation_jumps", def: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		contractResultsExists, err := d.tableExists("contract_results")
+		if err != nil {
+			return fmt.Errorf("migration v21 check contract_results exists: %w", err)
+		}
+		if contractResultsExists {
+			for _, c := range contractCols {
+				if err := d.ensureTableColumn("contract_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v21 add contract_results.%s: %w", c.name, err)
+				}
+			}
+		}
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (21);`); err != nil {
+			return fmt.Errorf("migration v21: %w", err)
+		}
+		logger.Info("DB", "Applied migration v21 (contract liquidation destination persistence)")
+	}
+
+	if version < 22 {
+		stationCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "system_id", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "region_id", def: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		stationResultsExists, err := d.tableExists("station_results")
+		if err != nil {
+			return fmt.Errorf("migration v22 check station_results exists: %w", err)
+		}
+		if stationResultsExists {
+			for _, c := range stationCols {
+				if err := d.ensureTableColumn("station_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v22 add station_results.%s: %w", c.name, err)
+				}
+			}
+		}
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (22);`); err != nil {
+			return fmt.Errorf("migration v22: %w", err)
+		}
+		logger.Info("DB", "Applied migration v22 (station_results system/region persistence)")
+	}
+
+	if version < 23 {
+		stationCols := []struct {
+			name string
+			def  string
+		}{
+			{name: "daily_volume", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "item_volume_m3", def: "REAL NOT NULL DEFAULT 0"},
+		}
+		stationResultsExists, err := d.tableExists("station_results")
+		if err != nil {
+			return fmt.Errorf("migration v23 check station_results exists: %w", err)
+		}
+		if stationResultsExists {
+			for _, c := range stationCols {
+				if err := d.ensureTableColumn("station_results", c.name, c.def); err != nil {
+					return fmt.Errorf("migration v23 add station_results.%s: %w", c.name, err)
+				}
+			}
+		}
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (23);`); err != nil {
+			return fmt.Errorf("migration v23: %w", err)
+		}
+		logger.Info("DB", "Applied migration v23 (station_results daily volume/item volume split)")
 	}
 
 	return nil

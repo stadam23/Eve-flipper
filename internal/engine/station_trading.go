@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -17,6 +18,39 @@ const (
 	stationVolatilityWindowDays = 30
 	// Cap returned station rows to keep hosted UI responsive on large hubs.
 	maxStationReturnedResults = 1500
+)
+
+var (
+	stationFetchRegionOrders = func(c *esi.Client, regionID int32, orderType string) ([]esi.MarketOrder, error) {
+		if c == nil {
+			return nil, fmt.Errorf("nil ESI client")
+		}
+		return c.FetchRegionOrders(regionID, orderType)
+	}
+	stationFetchMarketHistory = func(c *esi.Client, regionID int32, typeID int32) ([]esi.HistoryEntry, error) {
+		if c == nil {
+			return nil, fmt.Errorf("nil ESI client")
+		}
+		return c.FetchMarketHistory(regionID, typeID)
+	}
+	stationPrefetchNPCNames = func(c *esi.Client, ids map[int64]bool) {
+		if c == nil {
+			return
+		}
+		c.PrefetchStationNames(ids)
+	}
+	stationPrefetchStructureNames = func(c *esi.Client, ids map[int64]bool, accessToken string) {
+		if c == nil {
+			return
+		}
+		c.PrefetchStructureNames(ids, accessToken)
+	}
+	stationResolveName = func(c *esi.Client, stationID int64) string {
+		if c == nil {
+			return ""
+		}
+		return c.StationName(stationID)
+	}
 )
 
 // StationTrade represents a same-station flip opportunity (buy via buy order, sell via sell order).
@@ -53,6 +87,8 @@ type StationTrade struct {
 	ROI              float64 `json:"ROI"` // profit / investment * 100
 	StationName      string  `json:"StationName"`
 	StationID        int64   `json:"StationID"`
+	SystemID         int32   `json:"SystemID,omitempty"`
+	RegionID         int32   `json:"RegionID,omitempty"`
 
 	// --- EVE Guru style metrics ---
 	CapitalRequired float64 `json:"CapitalRequired"` // Cycle capital: effectiveBuy * tradableUnits
@@ -321,6 +357,7 @@ func resetExecutionDerivedFields(r *StationTrade) {
 // StationTradeParams holds input parameters for station trading scan.
 type StationTradeParams struct {
 	StationIDs      map[int64]bool // nil or empty = all stations in region
+	AllowedSystems  map[int32]bool // optional: extra system scope for implicit structure inclusion
 	RegionID        int32
 	MinMargin       float64
 	SalesTaxPercent float64
@@ -355,6 +392,12 @@ type StationTradeParams struct {
 
 	// --- Authentication ---
 	AccessToken string // For resolving player structure names (optional)
+
+	// IncludeStructures controls whether player-owned structures are considered.
+	IncludeStructures bool
+
+	// Ctx allows cooperative cancellation for long-running station scans.
+	Ctx context.Context
 }
 
 // ScanStationTrades finds profitable same-station trading opportunities.
@@ -365,40 +408,76 @@ func isPlayerStructureID(id int64) bool {
 }
 
 func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(string)) ([]StationTrade, error) {
+	checkCanceled := func() error {
+		if params.Ctx == nil {
+			return nil
+		}
+		if err := params.Ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := checkCanceled(); err != nil {
+		return nil, err
+	}
+
 	progress("Fetching all region orders...")
 
 	// Fetch all orders for the region
-	allOrders, err := s.ESI.FetchRegionOrders(params.RegionID, "all")
+	allOrders, err := stationFetchRegionOrders(s.ESI, params.RegionID, "all")
 	if err != nil {
 		return nil, fmt.Errorf("fetch orders: %w", err)
+	}
+	if err := checkCanceled(); err != nil {
+		return nil, err
 	}
 
 	progress(fmt.Sprintf("Processing %d orders...", len(allOrders)))
 
 	// Group orders by (locationID, typeID) — supports multi-station scan
 	groups := make(map[stationTypeKey]*orderGroup)
-	// Depth denominator for station-share scaling, scoped to the same
-	// order universe we actually scan (respects StationIDs/structure mode).
-	regionDepthByType := make(map[int32]int64)
+	// Region-wide depth denominator for station-share scaling.
+	// This is intentionally computed from the full region order universe
+	// (excluding only market-disabled types), before station filtering.
+	fullRegionDepthByType := make(map[int32]int64)
 
 	filterStations := len(params.StationIDs) > 0
 
-	for _, o := range allOrders {
-		// Filter to allowed stations (if specified)
+	for idx, o := range allOrders {
+		if idx%4096 == 0 {
+			if err := checkCanceled(); err != nil {
+				return nil, err
+			}
+		}
+		if isMarketDisabledType(o.TypeID) {
+			continue
+		}
+		fullRegionDepthByType[o.TypeID] += int64(o.VolumeRemain)
+
+		// Filter to allowed stations (if specified).
 		if filterStations {
-			if _, ok := params.StationIDs[o.LocationID]; !ok {
-				continue
+			if _, ok := params.StationIDs[o.LocationID]; ok {
+				// Even explicit station filters should honor IncludeStructures=false.
+				if isPlayerStructureID(o.LocationID) && !params.IncludeStructures {
+					continue
+				}
+			} else {
+				// In scoped scans (e.g. radius), include all structures from
+				// the allowed systems even when structure IDs were not preloaded.
+				if !(params.IncludeStructures &&
+					isPlayerStructureID(o.LocationID) &&
+					len(params.AllowedSystems) > 0 &&
+					params.AllowedSystems[o.SystemID]) {
+					continue
+				}
 			}
 		} else {
-			// In "all stations in region" mode, skip player structures
-			// unless they were explicitly included via StationIDs.
-			// This prevents processing hundreds of thousands of structure
-			// orders that would be filtered out later anyway.
-			if isPlayerStructureID(o.LocationID) {
+			// In "all stations in region" mode, include structures only when requested.
+			if isPlayerStructureID(o.LocationID) && !params.IncludeStructures {
 				continue
 			}
 		}
-		regionDepthByType[o.TypeID] += int64(o.VolumeRemain)
+
 		key := stationTypeKey{o.LocationID, o.TypeID}
 		g, ok := groups[key]
 		if !ok {
@@ -431,6 +510,9 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 	orderGroups := make(map[stationTypeKey]*orderGroup)
 
 	for key, g := range groups {
+		if err := checkCanceled(); err != nil {
+			return nil, err
+		}
 		typeID := key.typeID
 		if len(g.buyOrders) == 0 || len(g.sellOrders) == 0 {
 			continue
@@ -519,6 +601,10 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 		}
 		ci := CalcCI(append(g.buyOrders, g.sellOrders...))
 		obds := CalcOBDS(g.buyOrders, g.sellOrders, obdsCapital)
+		systemID := highestBuy.SystemID
+		if systemID == 0 {
+			systemID = lowestSell.SystemID
+		}
 
 		results = append(results, StationTrade{
 			TypeID:          typeID,
@@ -535,6 +621,8 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 			SellVolume:      totalSellVol,
 			ROI:             sanitizeFloat(margin),
 			StationID:       key.locationID,
+			SystemID:        systemID,
+			RegionID:        params.RegionID,
 			CapitalRequired: sanitizeFloat(capitalRequired),
 			NowROI:          sanitizeFloat(margin), // initial fallback; refined from execution plans below
 			CI:              ci,
@@ -610,19 +698,19 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 
 		// Prefetch NPC station names
 		if len(npcStationIDs) > 0 {
-			s.ESI.PrefetchStationNames(npcStationIDs)
+			stationPrefetchNPCNames(s.ESI, npcStationIDs)
 		}
 
 		// Prefetch player structure names (requires auth token)
 		if len(structureIDs) > 0 && params.AccessToken != "" {
-			s.ESI.PrefetchStructureNames(structureIDs, params.AccessToken)
+			stationPrefetchStructureNames(s.ESI, structureIDs, params.AccessToken)
 		}
 
 		// Resolve all station names and filter out inaccessible structures
 		filtered := make([]StationTrade, 0, len(results))
 		skippedCount := 0
 		for i := range results {
-			results[i].StationName = s.ESI.StationName(results[i].StationID)
+			results[i].StationName = stationResolveName(s.ESI, results[i].StationID)
 			// Skip player structures that couldn't be resolved (no access + not in EVERef)
 			if isPlayerStructureID(results[i].StationID) &&
 				(results[i].StationName == "" ||
@@ -641,7 +729,7 @@ func (s *Scanner) ScanStationTrades(params StationTradeParams, progress func(str
 	}
 
 	// Enrich with market history and calculate advanced metrics
-	s.enrichStationWithHistory(results, params.RegionID, orderGroups, params, regionDepthByType, progress)
+	s.enrichStationWithHistory(results, params.RegionID, orderGroups, params, fullRegionDepthByType, progress)
 
 	// Apply post-history filters
 	results = applyStationTradeFilters(results, params)
@@ -777,9 +865,16 @@ func applyStationTradeFilters(results []StationTrade, params StationTradeParams)
 }
 
 // enrichStationWithHistory fetches market history and calculates advanced metrics.
-// regionDepthByType holds region-wide order depth per typeID for station share estimation.
-func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int32, orderGroups map[stationTypeKey]*orderGroup, params StationTradeParams, regionDepthByType map[int32]int64, progress func(string)) {
+// fullRegionDepthByType holds full region-wide order depth per typeID for station share estimation.
+func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int32, orderGroups map[stationTypeKey]*orderGroup, params StationTradeParams, fullRegionDepthByType map[int32]int64, progress func(string)) {
 	if s.History == nil || len(results) == 0 {
+		return
+	}
+
+	checkCanceled := func() bool {
+		return params.Ctx != nil && params.Ctx.Err() != nil
+	}
+	if checkCanceled() {
 		return
 	}
 
@@ -825,10 +920,14 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 			sem <- struct{}{}
 			go func(typeID int32) {
 				defer func() { <-sem }()
+				if checkCanceled() {
+					fetchCh <- fetchResult{typeID, historyData{}}
+					return
+				}
 				entries, ok := s.History.GetMarketHistory(regionID, typeID)
 				if !ok {
 					var err error
-					entries, err = s.ESI.FetchMarketHistory(regionID, typeID)
+					entries, err = stationFetchMarketHistory(s.ESI, regionID, typeID)
 					if err != nil {
 						fetchCh <- fetchResult{typeID, historyData{}}
 						return
@@ -847,6 +946,9 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 	progress("Calculating advanced metrics...")
 
 	for idx := range results {
+		if checkCanceled() {
+			return
+		}
 		hd := histByType[results[idx].TypeID]
 		if hd == nil {
 			hd = &historyData{}
@@ -873,7 +975,7 @@ func (s *Scanner) enrichStationWithHistory(results []StationTrade, regionID int3
 		// get inflated volume/profit estimates.
 		stationShare := 1.0
 		stationDepth := results[idx].BuyVolume + results[idx].SellVolume
-		if rd := regionDepthByType[results[idx].TypeID]; rd > 0 && stationDepth > 0 {
+		if rd := fullRegionDepthByType[results[idx].TypeID]; rd > 0 && stationDepth > 0 {
 			stationShare = float64(stationDepth) / float64(rd)
 			if stationShare > 1.0 {
 				stationShare = 1.0

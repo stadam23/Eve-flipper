@@ -15,6 +15,7 @@ interface Props {
   results: ContractResult[];
   scanning: boolean;
   progress: string;
+  excludeRigPriceIfShip?: boolean;
   /** When 0 results, show these filter hints (e.g. "Min price: 10M", "Max margin: 100%") */
   filterHints?: string[];
   isLoggedIn?: boolean;
@@ -33,6 +34,7 @@ const columnDefs: { key: SortKey; labelKey: TranslationKey; width: string; numer
   { key: "StationName", labelKey: "colStation", width: "min-w-[180px]", numeric: false },
   { key: "SystemName", labelKey: "colContractSystem", width: "min-w-[120px]", numeric: false },
   { key: "RegionName", labelKey: "colContractRegion", width: "min-w-[120px]", numeric: false },
+  { key: "LiquidationSystemName", labelKey: "colContractLiqSystem", width: "min-w-[140px]", numeric: false },
   { key: "ItemCount", labelKey: "colItems", width: "min-w-[70px]", numeric: true },
   { key: "ProfitPerJump", labelKey: "colContractPPJ", width: "min-w-[110px]", numeric: true },
   { key: "Jumps", labelKey: "colContractJumps", width: "min-w-[60px]", numeric: true },
@@ -42,7 +44,21 @@ function rowKey(row: ContractResult) {
   return `contract-${row.ContractID}`;
 }
 
-export function ContractResultsTable({ results, scanning, progress, filterHints, isLoggedIn = false }: Props) {
+function numericCellValue(row: ContractResult, key: SortKey): number {
+  if (key === "MarginPercent") return row.ExpectedMarginPercent ?? row.MarginPercent ?? 0;
+  if (key === "ExpectedProfit") return row.ExpectedProfit ?? row.Profit ?? 0;
+  const val = row[key];
+  return typeof val === "number" ? val : 0;
+}
+
+export function ContractResultsTable({
+  results,
+  scanning,
+  progress,
+  excludeRigPriceIfShip = true,
+  filterHints,
+  isLoggedIn = false,
+}: Props) {
   const { t } = useI18n();
   const { addToast } = useGlobalToast();
   const emptyReason: EmptyReason = (results.length === 0 && filterHints && filterHints.length > 0)
@@ -98,7 +114,7 @@ export function ContractResultsTable({ results, scanning, progress, filterHints,
         const cellVal = row[col.key];
         if (col.numeric) {
           // Support filters: "100-500" (range), ">100", ">=100", "<500", "<=500", "=100" (exact), or plain number (>= threshold)
-          const num = cellVal as number;
+          const num = numericCellValue(row, col.key);
           const trimmed = fval.trim();
           if (trimmed.includes("-") && !trimmed.startsWith("-")) {
             // Range: "100-500"
@@ -143,8 +159,8 @@ export function ContractResultsTable({ results, scanning, progress, filterHints,
       const av = a[sortKey];
       const bv = b[sortKey];
       if (numericSort) {
-        const an = typeof av === "number" ? av : 0;
-        const bn = typeof bv === "number" ? bv : 0;
+        const an = numericCellValue(a, sortKey);
+        const bn = numericCellValue(b, sortKey);
         return sortDir === "asc" ? an - bn : bn - an;
       }
       return sortDir === "asc"
@@ -197,7 +213,8 @@ export function ContractResultsTable({ results, scanning, progress, filterHints,
     const header = columnDefs.map((c) => t(c.labelKey)).join(",");
     const csvRows = sorted.map((row) =>
       columnDefs.map((col) => {
-        const str = String(row[col.key]);
+        const val = col.numeric ? numericCellValue(row, col.key) : row[col.key];
+        const str = String(val);
         return str.includes(",") ? `"${str}"` : str;
       }).join(",")
     );
@@ -394,6 +411,17 @@ export function ContractResultsTable({ results, scanning, progress, filterHints,
         contractID={selectedContract?.ContractID ?? 0}
         contractTitle={selectedContract?.Title ?? ""}
         contractPrice={selectedContract?.Price ?? 0}
+        contractMarketValue={selectedContract?.MarketValue}
+        contractProfit={selectedContract?.Profit}
+        excludeRigPriceIfShip={excludeRigPriceIfShip}
+        pickupStationName={selectedContract?.StationName ?? ""}
+        pickupSystemName={selectedContract?.SystemName ?? ""}
+        pickupRegionName={selectedContract?.RegionName ?? ""}
+        liquidationSystemName={selectedContract?.LiquidationSystemName ?? ""}
+        liquidationRegionName={selectedContract?.LiquidationRegionName ?? ""}
+        liquidationJumps={selectedContract?.LiquidationJumps}
+        totalJumps={selectedContract?.Jumps}
+        isLoggedIn={isLoggedIn}
         onClose={() => setSelectedContract(null)}
       />
     </div>

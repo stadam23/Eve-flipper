@@ -37,7 +37,6 @@ export function PlexTab() {
   const [salesTax, setSalesTax] = useState(3.6);
   const [brokerFee, setBrokerFee] = useState(1.0);
   const [nesExtractor, setNesExtractor] = useState(293);
-  const [nesMPTC, setNesMPTC] = useState(485);
   const [nesOmega, setNesOmega] = useState(500);
   const [omegaUSD, setOmegaUSD] = useState(14.99);
   const [showNES, setShowNES] = useState(false);
@@ -60,7 +59,7 @@ export function PlexTab() {
     try {
       const params: PLEXDashboardParams = {
         salesTax, brokerFee,
-        nesExtractor, nesMPTC, nesOmega, omegaUSD,
+        nesExtractor, nesOmega, omegaUSD,
       };
       const data = await getPLEXDashboard(params, controller.signal);
       setDashboard(data);
@@ -70,7 +69,7 @@ export function PlexTab() {
     } finally {
       setLoading(false);
     }
-  }, [salesTax, brokerFee, nesExtractor, nesMPTC, nesOmega, omegaUSD]);
+  }, [salesTax, brokerFee, nesExtractor, nesOmega, omegaUSD]);
 
   // Fetch on mount
   useEffect(() => {
@@ -204,12 +203,6 @@ export function PlexTab() {
           <div className="flex items-center gap-1.5 text-xs">
             <label className="text-eve-dim">Extractor</label>
             <input type="number" min="1" value={nesExtractor} onChange={(e) => setNesExtractor(parseInt(e.target.value) || 0)}
-              className="w-16 px-1.5 py-0.5 bg-eve-input border border-eve-border rounded-sm text-xs text-eve-text font-mono" />
-            <span className="text-eve-dim text-[10px]">PLEX</span>
-          </div>
-          <div className="flex items-center gap-1.5 text-xs">
-            <label className="text-eve-dim">MPTC</label>
-            <input type="number" min="1" value={nesMPTC} onChange={(e) => setNesMPTC(parseInt(e.target.value) || 0)}
               className="w-16 px-1.5 py-0.5 bg-eve-input border border-eve-border rounded-sm text-xs text-eve-text font-mono" />
             <span className="text-eve-dim text-[10px]">PLEX</span>
           </div>

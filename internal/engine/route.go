@@ -81,6 +81,9 @@ func buildOrderIndex(sellOrders, buyOrders []esi.MarketOrder) *orderIndex {
 	}
 
 	for _, o := range sellOrders {
+		if isMarketDisabledType(o.TypeID) {
+			continue
+		}
 		byType, ok := idx.cheapestSell[o.SystemID]
 		if !ok {
 			byType = make(map[int32]orderEntry)
@@ -92,6 +95,9 @@ func buildOrderIndex(sellOrders, buyOrders []esi.MarketOrder) *orderIndex {
 	}
 
 	for _, o := range buyOrders {
+		if isMarketDisabledType(o.TypeID) {
+			continue
+		}
 		byType, ok := idx.highestBuy[o.SystemID]
 		if !ok {
 			byType = make(map[int32]orderEntry)
@@ -130,6 +136,9 @@ func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params Rou
 	var candidates []candidate
 
 	for typeID, sell := range sellsHere {
+		if isMarketDisabledType(typeID) {
+			continue
+		}
 		itemType, ok := s.SDE.Types[typeID]
 		if !ok || itemType.Volume <= 0 {
 			continue

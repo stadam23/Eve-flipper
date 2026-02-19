@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+
+	"eve-flipper/internal/engine"
 )
 
 // ContractItemResponse represents a contract item in the API response
@@ -14,6 +16,11 @@ type ContractItemResponse struct {
 	Quantity           int32   `json:"quantity"`
 	IsIncluded         bool    `json:"is_included"`
 	IsBlueprintCopy    bool    `json:"is_blueprint_copy"`
+	GroupID            int32   `json:"group_id,omitempty"`
+	GroupName          string  `json:"group_name,omitempty"`
+	CategoryID         int32   `json:"category_id,omitempty"`
+	IsShip             bool    `json:"is_ship,omitempty"`
+	IsRig              bool    `json:"is_rig,omitempty"`
 	RecordID           int64   `json:"record_id"`
 	ItemID             int64   `json:"item_id"`
 	MaterialEfficiency int     `json:"material_efficiency,omitempty"`
@@ -52,9 +59,25 @@ func (s *Server) handleGetContractItems(w http.ResponseWriter, r *http.Request) 
 	// Convert to response format with type names
 	responseItems := make([]ContractItemResponse, 0, len(items))
 	for _, item := range items {
+		if item.Quantity > 0 && engine.IsMarketDisabledTypeID(item.TypeID) {
+			continue
+		}
 		typeName := ""
+		groupID := int32(0)
+		groupName := ""
+		categoryID := int32(0)
+		isShip := false
+		isRig := false
 		if t, ok := s.sdeData.Types[item.TypeID]; ok {
 			typeName = t.Name
+			groupID = t.GroupID
+			categoryID = t.CategoryID
+			isShip = t.CategoryID == 6
+			isRig = t.IsRig
+			if g, ok := s.sdeData.Groups[t.GroupID]; ok {
+				groupName = g.Name
+				isRig = g.IsRig
+			}
 		}
 
 		resp := ContractItemResponse{
@@ -63,6 +86,11 @@ func (s *Server) handleGetContractItems(w http.ResponseWriter, r *http.Request) 
 			Quantity:        item.Quantity,
 			IsIncluded:      item.IsIncluded,
 			IsBlueprintCopy: item.IsBlueprintCopy,
+			GroupID:         groupID,
+			GroupName:       groupName,
+			CategoryID:      categoryID,
+			IsShip:          isShip,
+			IsRig:           isRig,
 			RecordID:        item.RecordID,
 			ItemID:          item.ItemID,
 		}

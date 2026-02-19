@@ -155,6 +155,14 @@ function stationDailyProfit(row: StationTrade): number {
   );
 }
 
+function rowRegionID(row: StationTrade, fallbackRegionID: number): number {
+  return row.RegionID && row.RegionID > 0 ? row.RegionID : fallbackRegionID;
+}
+
+function rowSystemID(row: StationTrade, fallbackSystemID: number): number {
+  return row.SystemID && row.SystemID > 0 ? row.SystemID : fallbackSystemID;
+}
+
 function normalizeStationResults(rows: StationTrade[]): StationTrade[] {
   return rows.map((r) => ({
     ...r,
@@ -296,6 +304,9 @@ export function StationTrading({
   // Current settings object for preset system
   const stationSettings = useMemo<StationTradingSettings>(
     () => ({
+      systemName: params.system_name,
+      selectedStationId,
+      includeStructures,
       minMargin,
       brokerFee,
       salesTaxPercent,
@@ -320,6 +331,9 @@ export function StationTrading({
       flagExtremePrices,
     }),
     [
+      params.system_name,
+      selectedStationId,
+      includeStructures,
       minMargin,
       brokerFee,
       salesTaxPercent,
@@ -348,6 +362,17 @@ export function StationTrading({
   const handlePresetApply = useCallback((s: Record<string, any>) => {
     // eslint-disable-line @typescript-eslint/no-explicit-any
     const st = s as StationTradingSettings;
+    const nextSystemName = typeof st.systemName === "string" ? st.systemName.trim() : "";
+    const systemChanged = Boolean(nextSystemName) && nextSystemName !== params.system_name;
+    if (systemChanged) {
+      onChange?.({ ...params, system_name: nextSystemName });
+    }
+    if (st.selectedStationId !== undefined && !systemChanged) {
+      setSelectedStationId(st.selectedStationId);
+    }
+    if (st.includeStructures !== undefined) {
+      setIncludeStructures(st.includeStructures);
+    }
     if (st.minMargin !== undefined) setMinMargin(st.minMargin);
     if (st.brokerFee !== undefined) setBrokerFee(st.brokerFee);
     if (st.salesTaxPercent !== undefined)
@@ -384,7 +409,7 @@ export function StationTrading({
       setLimitBuyToPriceLow(st.limitBuyToPriceLow);
     if (st.flagExtremePrices !== undefined)
       setFlagExtremePrices(st.flagExtremePrices);
-  }, []);
+  }, [onChange, params]);
 
   // Keep station sales-tax aligned with global params.
   useEffect(() => {
@@ -448,6 +473,14 @@ export function StationTrading({
     }
     return stations;
   }, [stations, structureStations, includeStructures]);
+
+  // If structure view is turned off, keep selection within NPC station scope.
+  useEffect(() => {
+    if (includeStructures || selectedStationId === ALL_STATIONS_ID) return;
+    if (!stations.some((st) => st.id === selectedStationId)) {
+      setSelectedStationId(ALL_STATIONS_ID);
+    }
+  }, [includeStructures, selectedStationId, stations]);
 
   // Region ID comes from system metadata, not from stations
   const regionId = systemRegionId;
@@ -557,10 +590,13 @@ export function StationTrading({
         scanParams.region_id = regionId;
       }
 
-      // Include player structures if toggle is on
-      if (includeStructures && structureStations.length > 0) {
+      const singleStationMode = radius === 0 && selectedStationId !== ALL_STATIONS_ID;
+      // Include structures for radius/all scans. Single-station mode stays strictly row-scoped.
+      if (includeStructures && !singleStationMode) {
         scanParams.include_structures = true;
-        scanParams.structure_ids = structureStations.map((s) => s.id);
+        if (structureStations.length > 0) {
+          scanParams.structure_ids = structureStations.map((s) => s.id);
+        }
       }
 
       const res = await scanStation(scanParams, setProgress, controller.signal);
@@ -1227,7 +1263,7 @@ export function StationTrading({
                       : ""}
                 </td>
                 <td className="px-1 py-1 text-center">
-                  {regionId > 0 && (
+                  {rowRegionID(row, regionId) > 0 && (
                     <button
                       type="button"
                       onClick={() => setExecPlanRow(row)}
@@ -1401,7 +1437,7 @@ export function StationTrading({
                 setContextMenu(null);
               }}
             />
-            {regionId > 0 && (
+            {rowRegionID(contextMenu.row, regionId) > 0 && (
               <ContextItem
                 label={t("placeDraft")}
                 onClick={() => {
@@ -1431,7 +1467,9 @@ export function StationTrading({
                   label={`🎯 ${t("setDestination")}`}
                   onClick={async () => {
                     try {
-                      await setWaypointInGame(systemId);
+                      await setWaypointInGame(
+                        rowSystemID(contextMenu.row, systemId),
+                      );
                       addToast(t("actionSuccess"), "success", 2000);
                     } catch (err: any) {
                       const { messageKey, duration } = handleEveUIError(err);
@@ -1463,7 +1501,7 @@ export function StationTrading({
         onClose={() => setExecPlanRow(null)}
         typeID={execPlanRow?.TypeID ?? 0}
         typeName={execPlanRow?.TypeName ?? ""}
-        regionID={regionId}
+        regionID={execPlanRow ? rowRegionID(execPlanRow, regionId) : regionId}
         stationID={execPlanRow?.StationID ?? 0}
         defaultQuantity={100}
         brokerFeePercent={splitTradeFees ? undefined : brokerFee}

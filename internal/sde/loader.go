@@ -25,6 +25,7 @@ type Data struct {
 	Regions      map[int32]*Region      // regionID -> region
 	RegionByName map[string]int32       // lowercase name -> regionID
 	Types        map[int32]*ItemType    // typeID -> type
+	Groups       map[int32]*ItemGroup   // groupID -> group metadata
 	Stations     map[int64]*Station     // stationID -> station
 	Universe     *graph.Universe
 	Industry     *IndustryData // blueprints, reprocessing, etc.
@@ -51,6 +52,15 @@ type ItemType struct {
 	Volume     float64 // packaged volume in m³
 	GroupID    int32   // item group (for categorization: rigs, ships, modules, etc.)
 	CategoryID int32   // item category (6=Ships, 7=Modules, 20=Implants, etc.)
+	IsRig      bool    // derived from group metadata
+}
+
+// ItemGroup represents group-level SDE metadata used for type classification.
+type ItemGroup struct {
+	ID         int32
+	Name       string
+	CategoryID int32
+	IsRig      bool
 }
 
 // Station represents an NPC station from the SDE.
@@ -82,6 +92,7 @@ func Load(dataDir string) (*Data, error) {
 		Regions:      make(map[int32]*Region),
 		RegionByName: make(map[string]int32),
 		Types:        make(map[int32]*ItemType),
+		Groups:       make(map[int32]*ItemGroup),
 		Stations:     make(map[int64]*Station),
 		Universe:     graph.NewUniverse(),
 	}
@@ -199,17 +210,27 @@ func (d *Data) loadSystems(dir string) error {
 }
 
 func (d *Data) loadTypes(dir string) error {
-	// First load groups to get CategoryID mapping
+	// First load groups to get category mapping and data-driven rig classification.
 	groupCategories := make(map[int32]int32) // groupID -> categoryID
+	groupRig := make(map[int32]bool)         // groupID -> is rig group
 	err := readJSONL(dir, "groups", func(raw json.RawMessage) error {
 		var g struct {
-			Key        int32 `json:"_key"`
-			CategoryID int32 `json:"categoryID"`
+			Key        int32             `json:"_key"`
+			Name       map[string]string `json:"name"`
+			CategoryID int32             `json:"categoryID"`
 		}
 		if err := json.Unmarshal(raw, &g); err != nil {
 			return err
 		}
+		nameEN := strings.TrimSpace(g.Name["en"])
 		groupCategories[g.Key] = g.CategoryID
+		groupRig[g.Key] = isRigGroupName(g.CategoryID, nameEN)
+		d.Groups[g.Key] = &ItemGroup{
+			ID:         g.Key,
+			Name:       nameEN,
+			CategoryID: g.CategoryID,
+			IsRig:      groupRig[g.Key],
+		}
 		return nil
 	})
 	if err != nil {
@@ -247,9 +268,19 @@ func (d *Data) loadTypes(dir string) error {
 			Volume:     vol,
 			GroupID:    t.GroupID,
 			CategoryID: groupCategories[t.GroupID],
+			IsRig:      groupRig[t.GroupID],
 		}
 		return nil
 	})
+}
+
+func isRigGroupName(categoryID int32, groupName string) bool {
+	if categoryID != 7 {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSpace(groupName))
+	// In SDE, rig groups in category Modules are consistently prefixed with "Rig".
+	return strings.HasPrefix(name, "rig")
 }
 
 func (d *Data) loadStations(dir string) error {

@@ -64,7 +64,8 @@ func TestDB_FlipResultsRoundTrip(t *testing.T) {
 	results := []engine.FlipResult{
 		{
 			TypeID: 100, TypeName: "Test Item",
-			BuyPrice: 90, SellPrice: 100,
+			BuyPrice: 90, BestAskPrice: 90, BestAskQty: 15,
+			SellPrice: 100, BestBidPrice: 100, BestBidQty: 25,
 			ProfitPerUnit: 10, MarginPercent: 11.11,
 			UnitsToBuy: 50, TotalProfit: 500,
 			DailyVolume: 1000, S2BPerDay: 520, BfSPerDay: 480, S2BBfSRatio: 1.0833,
@@ -93,6 +94,12 @@ func TestDB_FlipResultsRoundTrip(t *testing.T) {
 	if r.BuyPrice != 90 || r.SellPrice != 100 {
 		t.Errorf("Buy/Sell = %v/%v", r.BuyPrice, r.SellPrice)
 	}
+	if r.BestAskPrice != 90 || r.BestBidPrice != 100 {
+		t.Errorf("BestAsk/BestBid = %v/%v", r.BestAskPrice, r.BestBidPrice)
+	}
+	if r.BestAskQty != 15 || r.BestBidQty != 25 {
+		t.Errorf("BestAskQty/BestBidQty = %d/%d", r.BestAskQty, r.BestBidQty)
+	}
 	if r.ProfitPerUnit != 10 || r.TotalProfit != 500 {
 		t.Errorf("ProfitPerUnit/TotalProfit = %v/%v", r.ProfitPerUnit, r.TotalProfit)
 	}
@@ -120,6 +127,7 @@ func TestDB_StationResultsRoundTrip_WithExecutionFields(t *testing.T) {
 		{
 			TypeID:            34,
 			TypeName:          "Tritanium",
+			Volume:            0.01,
 			BuyPrice:          5.0,
 			SellPrice:         5.4,
 			Spread:            0.4,
@@ -128,6 +136,8 @@ func TestDB_StationResultsRoundTrip_WithExecutionFields(t *testing.T) {
 			BuyVolume:         80000,
 			SellVolume:        90000,
 			StationID:         60003760,
+			SystemID:          30000142,
+			RegionID:          10000002,
 			StationName:       "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
 			CTS:               62.3,
 			SDS:               12,
@@ -158,6 +168,15 @@ func TestDB_StationResultsRoundTrip_WithExecutionFields(t *testing.T) {
 	r := got[0]
 	if r.DailyProfit != in[0].DailyProfit {
 		t.Errorf("DailyProfit = %v, want %v", r.DailyProfit, in[0].DailyProfit)
+	}
+	if r.DailyVolume != in[0].DailyVolume {
+		t.Errorf("DailyVolume = %d, want %d", r.DailyVolume, in[0].DailyVolume)
+	}
+	if r.Volume != in[0].Volume {
+		t.Errorf("Volume(m3) = %v, want %v", r.Volume, in[0].Volume)
+	}
+	if r.SystemID != in[0].SystemID || r.RegionID != in[0].RegionID {
+		t.Errorf("SystemID/RegionID = %d/%d, want %d/%d", r.SystemID, r.RegionID, in[0].SystemID, in[0].RegionID)
 	}
 	if r.RealProfit != in[0].RealProfit {
 		t.Errorf("RealProfit = %v, want %v", r.RealProfit, in[0].RealProfit)
@@ -210,6 +229,10 @@ func TestDB_Migrate_StationResultsHasExecutionColumns(t *testing.T) {
 		"bfs_per_day",
 		"s2b_bfs_ratio",
 		"history_available",
+		"system_id",
+		"region_id",
+		"daily_volume",
+		"item_volume_m3",
 	}
 	for _, col := range wantCols {
 		if !have[col] {
@@ -258,6 +281,10 @@ func TestDB_Migrate_FlipResultsHasLiquidityAndExecutionColumns(t *testing.T) {
 		"slippage_buy_pct",
 		"slippage_sell_pct",
 		"history_available",
+		"best_ask_price",
+		"best_bid_price",
+		"best_ask_qty",
+		"best_bid_qty",
 	}
 	for _, col := range wantCols {
 		if !have[col] {
@@ -287,7 +314,12 @@ func TestDB_ContractResultsRoundTrip_WithLongHorizonFields(t *testing.T) {
 			CarryCost:             7_000_000,
 			Volume:                12000,
 			StationName:           "Jita IV - Moon 4",
+			SystemName:            "Jita",
+			RegionName:            "The Forge",
+			LiquidationSystemName: "Perimeter",
+			LiquidationRegionName: "The Forge",
 			ItemCount:             12,
+			LiquidationJumps:      1,
 			Jumps:                 0,
 			ProfitPerJump:         0,
 		},
@@ -306,6 +338,21 @@ func TestDB_ContractResultsRoundTrip_WithLongHorizonFields(t *testing.T) {
 	}
 	if r.EstLiquidationDays != in[0].EstLiquidationDays {
 		t.Errorf("EstLiquidationDays = %v, want %v", r.EstLiquidationDays, in[0].EstLiquidationDays)
+	}
+	if r.SystemName != in[0].SystemName {
+		t.Errorf("SystemName = %q, want %q", r.SystemName, in[0].SystemName)
+	}
+	if r.RegionName != in[0].RegionName {
+		t.Errorf("RegionName = %q, want %q", r.RegionName, in[0].RegionName)
+	}
+	if r.LiquidationSystemName != in[0].LiquidationSystemName {
+		t.Errorf("LiquidationSystemName = %q, want %q", r.LiquidationSystemName, in[0].LiquidationSystemName)
+	}
+	if r.LiquidationRegionName != in[0].LiquidationRegionName {
+		t.Errorf("LiquidationRegionName = %q, want %q", r.LiquidationRegionName, in[0].LiquidationRegionName)
+	}
+	if r.LiquidationJumps != in[0].LiquidationJumps {
+		t.Errorf("LiquidationJumps = %d, want %d", r.LiquidationJumps, in[0].LiquidationJumps)
 	}
 }
 
@@ -338,6 +385,11 @@ func TestDB_Migrate_ContractResultsHasLongHorizonColumns(t *testing.T) {
 		"est_liquidation_days",
 		"conservative_value",
 		"carry_cost",
+		"system_name",
+		"region_name",
+		"liquidation_system_name",
+		"liquidation_region_name",
+		"liquidation_jumps",
 	}
 	for _, col := range wantCols {
 		if !have[col] {

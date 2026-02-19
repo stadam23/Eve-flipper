@@ -639,7 +639,6 @@ export interface PLEXDashboardParams {
   salesTax?: number;
   brokerFee?: number;
   nesExtractor?: number;
-  nesMPTC?: number;
   nesOmega?: number;
   omegaUSD?: number;
 }
@@ -649,7 +648,6 @@ export async function getPLEXDashboard(p?: PLEXDashboardParams, signal?: AbortSi
   if (p?.salesTax != null) params.set("sales_tax", p.salesTax.toString());
   if (p?.brokerFee != null) params.set("broker_fee", p.brokerFee.toString());
   if (p?.nesExtractor != null && p.nesExtractor > 0) params.set("nes_extractor", p.nesExtractor.toString());
-  if (p?.nesMPTC != null && p.nesMPTC > 0) params.set("nes_mptc", p.nesMPTC.toString());
   if (p?.nesOmega != null && p.nesOmega > 0) params.set("nes_omega", p.nesOmega.toString());
   if (p?.omegaUSD != null && p.omegaUSD > 0) params.set("omega_usd", p.omegaUSD.toString());
   const qs = params.toString();

@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"eve-flipper/internal/esi"
 )
@@ -38,30 +40,6 @@ const (
 	// Public ESI does not reliably expose fitted-state metadata for all items.
 	ContractShipModuleValueFactor = 0.55
 )
-
-// Rig GroupIDs from EVE SDE (categoryID 1111 - Ship Modifications)
-// Source: https://everef.net/market/1111
-var rigGroupIDs = map[int32]bool{
-	28:  true, // Small rigs
-	54:  true, // Medium rigs
-	80:  true, // Large rigs
-	106: true, // Capital rigs
-	132: true, // Armor rigs
-	158: true, // Shield rigs
-	184: true, // Astronautic rigs
-	210: true, // Projectile weapon rigs
-	236: true, // Drone rigs
-	262: true, // Launcher rigs
-	289: true, // Energy weapon rigs
-	290: true, // Hybrid weapon rigs
-	291: true, // Electronic superiority rigs
-}
-
-// isRig returns true if the item's groupID indicates it's a ship rig.
-// Rigs are destroyed when removed from a ship, so they have no separate market value.
-func isRig(groupID int32) bool {
-	return rigGroupIDs[groupID]
-}
 
 // getRigSizeClass returns the size class of a rig: 1=Small, 2=Medium, 3=Large/Capital, 0=Unknown.
 // Checks item name for size keywords (since some rig groups are type-based, not size-based).
@@ -234,6 +212,187 @@ func contractCarryDays(holdDays int, estLiqDays float64) float64 {
 	return carryDays
 }
 
+func checkContextCanceled(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+func isLikelyFittedRig(item esi.ContractItem) bool {
+	if item.Singleton {
+		return true
+	}
+	// ESI flags for rig slots in inventory APIs can vary by endpoint/client.
+	// Keep both known ranges to avoid valuing non-removable fitted rigs.
+	if item.Flag >= 92 && item.Flag <= 99 {
+		return true
+	}
+	if item.Flag >= 46 && item.Flag <= 53 {
+		return true
+	}
+	return false
+}
+
+func shouldExcludeRigWithShip(item esi.ContractItem, rigName string, shipSizeClass int, forceExclude bool) bool {
+	if shipSizeClass == 0 {
+		return false
+	}
+	if forceExclude || isLikelyFittedRig(item) {
+		return true
+	}
+	rigSize := getRigSizeClass(rigName)
+	return rigSize > 0 && rigSize == shipSizeClass
+}
+
+func blockedContractTypeID(items []esi.ContractItem) int32 {
+	for _, item := range items {
+		if item.Quantity <= 0 {
+			continue
+		}
+		if isMarketDisabledType(item.TypeID) {
+			return item.TypeID
+		}
+	}
+	return 0
+}
+
+type instantValuationItem struct {
+	TypeID      int32
+	Quantity    int32
+	Label       string
+	ValueFactor float64
+}
+
+type instantLiquidationChoice struct {
+	SystemID    int32
+	MarketValue float64
+	PricedCount int
+	ItemCount   int32
+	TopItems    []string
+}
+
+func (s *Scanner) contractItemLabel(typeID int32, resolvedTypeNames map[int32]string) string {
+	if s != nil && s.SDE != nil {
+		if typeInfo, ok := s.SDE.Types[typeID]; ok {
+			if name := strings.TrimSpace(typeInfo.Name); name != "" {
+				return name
+			}
+		}
+	}
+	if resolvedTypeNames != nil {
+		if name, ok := resolvedTypeNames[typeID]; ok && strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
+	name := ""
+	if s != nil && s.ESI != nil {
+		name = strings.TrimSpace(s.ESI.TypeName(typeID))
+	}
+	if name == "" {
+		name = fmt.Sprintf("Type %d", typeID)
+	}
+	if resolvedTypeNames != nil {
+		resolvedTypeNames[typeID] = name
+	}
+	return name
+}
+
+// selectInstantLiquidationSystem chooses a single liquidation system where all
+// contract items can be sold with available buy-book depth.
+func selectInstantLiquidationSystem(
+	items []instantValuationItem,
+	buyBooksByTypeBySystem map[int32]map[int32][]esi.MarketOrder,
+) (instantLiquidationChoice, bool) {
+	if len(items) == 0 {
+		return instantLiquidationChoice{}, false
+	}
+
+	candidates := make(map[int32]bool)
+	firstType := true
+	plansByTypeBySystem := make(map[int32]map[int32]ExecutionPlanResult, len(items))
+
+	for _, item := range items {
+		typeBooks := buyBooksByTypeBySystem[item.TypeID]
+		if len(typeBooks) == 0 {
+			return instantLiquidationChoice{}, false
+		}
+
+		plans := make(map[int32]ExecutionPlanResult, len(typeBooks))
+		for systemID, book := range typeBooks {
+			plan := ComputeExecutionPlan(book, item.Quantity, false)
+			if !plan.CanFill || plan.ExpectedPrice <= 0 {
+				continue
+			}
+			plans[systemID] = plan
+		}
+		if len(plans) == 0 {
+			return instantLiquidationChoice{}, false
+		}
+		plansByTypeBySystem[item.TypeID] = plans
+
+		if firstType {
+			for systemID := range plans {
+				candidates[systemID] = true
+			}
+			firstType = false
+			continue
+		}
+		for systemID := range candidates {
+			if _, ok := plans[systemID]; !ok {
+				delete(candidates, systemID)
+			}
+		}
+		if len(candidates) == 0 {
+			return instantLiquidationChoice{}, false
+		}
+	}
+
+	best := instantLiquidationChoice{MarketValue: -1}
+	for systemID := range candidates {
+		value := 0.0
+		itemCount := int32(0)
+		topItems := make([]string, 0, len(items))
+
+		for _, item := range items {
+			plan, ok := plansByTypeBySystem[item.TypeID][systemID]
+			if !ok || plan.ExpectedPrice <= 0 {
+				value = -1
+				break
+			}
+			value += plan.ExpectedPrice * float64(item.Quantity) * item.ValueFactor
+			itemCount += item.Quantity
+			if item.Quantity > 1 {
+				topItems = append(topItems, fmt.Sprintf("%dx %s", item.Quantity, item.Label))
+			} else {
+				topItems = append(topItems, item.Label)
+			}
+		}
+		if value < 0 {
+			continue
+		}
+		if value > best.MarketValue || (value == best.MarketValue && (best.SystemID == 0 || systemID < best.SystemID)) {
+			best = instantLiquidationChoice{
+				SystemID:    systemID,
+				MarketValue: value,
+				PricedCount: len(items),
+				ItemCount:   itemCount,
+				TopItems:    topItems,
+			}
+		}
+	}
+
+	if best.SystemID == 0 || best.PricedCount == 0 || best.MarketValue <= 0 {
+		return instantLiquidationChoice{}, false
+	}
+	return best, true
+}
+
 // itemPriceData holds market data for an item type.
 type itemPriceData struct {
 	MinSellPrice float64 // Cheapest sell order price
@@ -246,10 +405,31 @@ type itemPriceData struct {
 
 // ScanContracts finds profitable public contracts by comparing contract price to market value.
 func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]ContractResult, error) {
+	return s.ScanContractsWithContext(context.Background(), params, progress)
+}
+
+// ScanContractsWithContext is cancellation-aware variant of ScanContracts.
+func (s *Scanner) ScanContractsWithContext(ctx context.Context, params ScanParams, progress func(string)) ([]ContractResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := checkContextCanceled(ctx); err != nil {
+		return nil, err
+	}
+	emitProgress := func(msg string) {
+		if progress == nil {
+			return
+		}
+		if checkContextCanceled(ctx) != nil {
+			return
+		}
+		progress(msg)
+	}
+
 	// Get effective filter values
 	minContractPrice, maxContractMargin, minPricedRatio := getContractFilters(params)
 
-	progress("Finding systems within radius...")
+	emitProgress("Finding systems within radius...")
 	var buySystems map[int32]int
 	if params.MinRouteSecurity > 0 {
 		buySystems = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, params.MinRouteSecurity)
@@ -279,8 +459,9 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	var allContracts []esi.PublicContract
 	var contractsMu sync.Mutex
 	var wg sync.WaitGroup
+	var failedContractRegions int32
 
-	progress(fmt.Sprintf("Fetching market orders + contracts from %d regions...", len(buyRegions)))
+	emitProgress(fmt.Sprintf("Fetching market orders + contracts from %d regions...", len(buyRegions)))
 
 	wg.Add(2)
 	go func() {
@@ -304,6 +485,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 				defer contractsWg.Done()
 				contracts, err := s.ESI.FetchRegionContractsCached(s.ContractsCache, regionID)
 				if err != nil {
+					atomic.AddInt32(&failedContractRegions, 1)
 					log.Printf("[DEBUG] failed to fetch contracts for region %d: %v", regionID, err)
 					return
 				}
@@ -314,11 +496,23 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		}
 		contractsWg.Wait()
 	}()
-	wg.Wait()
+	fetchDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(fetchDone)
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-fetchDone:
+	}
 
 	log.Printf("[DEBUG] ScanContracts: %d sell orders, %d contracts total", len(sellOrders), len(allContracts))
 	if contractInstant {
 		log.Printf("[DEBUG] ScanContracts: instant liquidation enabled, %d buy orders in sell radius", len(buyOrdersForLiquidation))
+	}
+	if failed := atomic.LoadInt32(&failedContractRegions); failed > 0 {
+		emitProgress(fmt.Sprintf("Warning: contracts missing in %d regions due to ESI errors", failed))
 	}
 
 	// Build location -> system map from market orders (covers player structures
@@ -341,11 +535,19 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		}
 	}
 
-	// Instant liquidation pricing input: buy-book depth by type (sell radius).
-	buyOrdersByType := make(map[int32][]esi.MarketOrder)
+	// Instant liquidation pricing input: buy-book depth by type and system.
+	buyOrdersByTypeBySystem := make(map[int32]map[int32][]esi.MarketOrder)
 	if contractInstant {
 		for _, o := range buyOrdersForLiquidation {
-			buyOrdersByType[o.TypeID] = append(buyOrdersByType[o.TypeID], o)
+			if o.SystemID == 0 {
+				continue
+			}
+			bySystem, ok := buyOrdersByTypeBySystem[o.TypeID]
+			if !ok {
+				bySystem = make(map[int32][]esi.MarketOrder)
+				buyOrdersByTypeBySystem[o.TypeID] = bySystem
+			}
+			bySystem[o.SystemID] = append(bySystem[o.SystemID], o)
 		}
 	}
 
@@ -387,6 +589,9 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	// Filter contracts: only item_exchange, not expired, price > threshold, reachable location
 	var candidates []esi.PublicContract
 	for _, c := range allContracts {
+		if err := checkContextCanceled(ctx); err != nil {
+			return nil, err
+		}
 		if c.Type != "item_exchange" {
 			continue
 		}
@@ -409,7 +614,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	}
 
 	log.Printf("[DEBUG] ScanContracts: %d item_exchange candidates after filtering (location + price)", len(candidates))
-	progress(fmt.Sprintf("Evaluating %d contracts...", len(candidates)))
+	emitProgress(fmt.Sprintf("Evaluating %d contracts...", len(candidates)))
 
 	if len(candidates) == 0 {
 		return nil, nil
@@ -421,11 +626,24 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		contractIDs[i] = c.ContractID
 	}
 
-	contractItems := s.ESI.FetchContractItemsBatch(contractIDs, s.ContractItemsCache, func(done, total int) {
-		progress(fmt.Sprintf("Fetching contract items %d/%d...", done, total))
-	})
+	contractItemsCh := make(chan map[int32][]esi.ContractItem, 1)
+	go func() {
+		contractItemsCh <- s.ESI.FetchContractItemsBatch(contractIDs, s.ContractItemsCache, func(done, total int) {
+			emitProgress(fmt.Sprintf("Fetching contract items %d/%d...", done, total))
+		})
+	}()
+
+	var contractItems map[int32][]esi.ContractItem
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case contractItems = <-contractItemsCh:
+	}
 
 	log.Printf("[DEBUG] ScanContracts: fetched items for %d contracts", len(contractItems))
+	if missing := len(candidates) - len(contractItems); missing > 0 {
+		emitProgress(fmt.Sprintf("Warning: missing contract items for %d contracts; results may be incomplete", missing))
+	}
 
 	// Collect unique type IDs that need history lookup (estimate mode only).
 	if !contractInstant {
@@ -444,8 +662,17 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		primaryRegion := bestHubRegion(buyRegions)
 
 		if s.History != nil && len(typeIDsNeedHistory) > 0 {
-			progress(fmt.Sprintf("Fetching market history for %d item types...", len(typeIDsNeedHistory)))
-			s.fetchContractItemsHistory(typeIDsNeedHistory, priceData, primaryRegion)
+			emitProgress(fmt.Sprintf("Fetching market history for %d item types...", len(typeIDsNeedHistory)))
+			historyDone := make(chan struct{})
+			go func() {
+				s.fetchContractItemsHistory(typeIDsNeedHistory, priceData, primaryRegion)
+				close(historyDone)
+			}()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-historyDone:
+			}
 		}
 
 		log.Printf("[DEBUG] ScanContracts: enriched %d types with history", len(typeIDsNeedHistory))
@@ -455,12 +682,21 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 	sellValueMult := contractSellValueMultiplier(params)
 	holdDays := contractHoldDays(params)
 	targetConfidence := contractTargetConfidence(params)
+	resolvedTypeNames := make(map[int32]string)
 
 	var results []ContractResult
 
 	for _, contract := range candidates {
+		if err := checkContextCanceled(ctx); err != nil {
+			return nil, err
+		}
 		items, ok := contractItems[contract.ContractID]
 		if !ok || len(items) == 0 {
+			continue
+		}
+		blockedTypeID := blockedContractTypeID(items)
+		if blockedTypeID != 0 {
+			log.Printf("[DEBUG] Contract %d: skipping - contains market-disabled type %d", contract.ContractID, blockedTypeID)
 			continue
 		}
 
@@ -478,6 +714,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		var unpricedAdditionalItems int // items buyer must provide that we couldn't price
 		includedQtyByType := make(map[int32]int32)
 		additionalQtyByType := make(map[int32]int32)
+		liquidationSystemID := int32(0)
 
 		// FIRST PASS: detect ship presence for fitted-risk handling.
 		shipSizeClass := 0 // 0=no ship, 1=small, 2=medium, 3=large
@@ -525,14 +762,8 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 					continue
 				}
 				// Rig handling (fitted-risk control).
-				if isRig(typeInfo.GroupID) {
-					if params.ExcludeRigsWithShip && shipSizeClass > 0 {
-						continue
-					}
-					rigSize := getRigSizeClass(typeInfo.Name)
-					if shipSizeClass > 0 && rigSize == shipSizeClass {
-						continue
-					}
+				if typeInfo.IsRig && shouldExcludeRigWithShip(item, typeInfo.Name, shipSizeClass, params.ExcludeRigsWithShip) {
+					continue
 				}
 			}
 
@@ -559,11 +790,7 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			} else {
 				pd, ok := priceData[typeID]
 				if ok && pd.MinSellPrice > 0 && pd.MinSellPrice != math.MaxFloat64 {
-					price := pd.MinSellPrice
-					if pd.TotalSellVol < MinSellOrderVolume {
-						price = price * 1.5
-					}
-					itemCost = price * float64(qty)
+					itemCost = pd.MinSellPrice * float64(qty)
 					couldPrice = true
 				}
 			}
@@ -576,40 +803,25 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		}
 
 		// Price included items once per type (aggregated quantity).
+		instantItems := make([]instantValuationItem, 0, len(includedQtyByType))
 		for typeID, qty := range includedQtyByType {
 			typeInfo, hasTypeInfo := s.SDE.Types[typeID]
-			itemLabel := fmt.Sprintf("Type %d", typeID)
-			if hasTypeInfo && strings.TrimSpace(typeInfo.Name) != "" {
-				itemLabel = typeInfo.Name
-			}
+			itemLabel := s.contractItemLabel(typeID, resolvedTypeNames)
 
 			valueFactor := 1.0
 			// Conservative haircut: when a ship is present, module value is uncertain
 			// because public ESI lacks reliable fitted-state flags for all cases.
-			if shipSizeClass > 0 && hasTypeInfo && typeInfo.CategoryID == 7 && !isRig(typeInfo.GroupID) {
+			if shipSizeClass > 0 && hasTypeInfo && typeInfo.CategoryID == 7 && !typeInfo.IsRig {
 				valueFactor = ContractShipModuleValueFactor
 			}
 
 			if contractInstant {
-				book := buyOrdersByType[typeID]
-				if len(book) == 0 {
-					continue
-				}
-				plan := ComputeExecutionPlan(book, qty, false)
-				if !plan.CanFill || plan.ExpectedPrice <= 0 {
-					continue
-				}
-
-				pricedCount++
-				itemValue := plan.ExpectedPrice * float64(qty) * valueFactor
-				marketValue += itemValue
-				itemCount += qty
-
-				if qty > 1 {
-					topItems = append(topItems, fmt.Sprintf("%dx %s", qty, itemLabel))
-				} else {
-					topItems = append(topItems, itemLabel)
-				}
+				instantItems = append(instantItems, instantValuationItem{
+					TypeID:      typeID,
+					Quantity:    qty,
+					Label:       itemLabel,
+					ValueFactor: valueFactor,
+				})
 				continue
 			}
 
@@ -660,6 +872,17 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			} else {
 				topItems = append(topItems, itemLabel)
 			}
+		}
+		if contractInstant {
+			choice, ok := selectInstantLiquidationSystem(instantItems, buyOrdersByTypeBySystem)
+			if !ok {
+				continue
+			}
+			liquidationSystemID = choice.SystemID
+			marketValue = choice.MarketValue
+			pricedCount = choice.PricedCount
+			itemCount = choice.ItemCount
+			topItems = append(topItems, choice.TopItems...)
 		}
 
 		// Skip contracts that are purely BPOs — unreliable market pricing
@@ -748,10 +971,18 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		sysID := s.locationToSystem(contract.StartLocationID, marketLocationSystems)
 		sysName := ""
 		regionName := ""
+		liquidationSystemName := ""
+		liquidationRegionName := ""
 		if sysID != 0 {
 			sysName = s.systemName(sysID)
 			if sys, ok := s.SDE.Systems[sysID]; ok {
 				regionName = s.regionName(sys.RegionID)
+			}
+		}
+		if contractInstant && liquidationSystemID != 0 {
+			liquidationSystemName = s.systemName(liquidationSystemID)
+			if liqSys, ok := s.SDE.Systems[liquidationSystemID]; ok {
+				liquidationRegionName = s.regionName(liqSys.RegionID)
 			}
 		}
 		if strings.HasPrefix(stationName, "Location ") || strings.HasPrefix(stationName, "Structure ") {
@@ -762,13 +993,22 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			}
 		}
 
-		jumps := 0
+		pickupJumps := 0
 		if sysID != 0 {
 			if d, ok := buySystems[sysID]; ok {
-				jumps = d
+				pickupJumps = d
 			} else {
-				jumps = s.jumpsBetweenWithSecurity(params.CurrentSystemID, sysID, params.MinRouteSecurity)
+				pickupJumps = s.jumpsBetweenWithSecurity(params.CurrentSystemID, sysID, params.MinRouteSecurity)
 			}
+		}
+		jumps := pickupJumps
+		liquidationJumps := 0
+		if contractInstant && sysID != 0 && liquidationSystemID != 0 {
+			liquidationJumps = s.jumpsBetweenWithSecurity(sysID, liquidationSystemID, params.MinRouteSecurity)
+			if liquidationJumps >= UnreachableJumps {
+				continue
+			}
+			jumps += liquidationJumps
 		}
 
 		kpiProfit := profit
@@ -797,7 +1037,10 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 			StationName:           stationName,
 			SystemName:            sysName,
 			RegionName:            regionName,
+			LiquidationSystemName: liquidationSystemName,
+			LiquidationRegionName: liquidationRegionName,
 			ItemCount:             itemCount,
+			LiquidationJumps:      liquidationJumps,
 			Jumps:                 jumps,
 			ProfitPerJump:         sanitizeFloat(profitPerJump),
 		})
@@ -822,7 +1065,10 @@ func (s *Scanner) ScanContracts(params ScanParams, progress func(string)) ([]Con
 		results = results[:MaxUnlimitedResults]
 	}
 
-	progress(fmt.Sprintf("Found %d profitable contracts", len(results)))
+	if err := checkContextCanceled(ctx); err != nil {
+		return nil, err
+	}
+	emitProgress(fmt.Sprintf("Found %d profitable contracts", len(results)))
 	return results, nil
 }
 

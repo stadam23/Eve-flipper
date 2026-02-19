@@ -20,7 +20,6 @@ export function ArbHistoryChart({ data, themeKey }: { data: ArbHistoryData; them
 
     const hasData = (data.extractor_nes?.length ?? 0) > 0 ||
                     (data.sp_chain_nes?.length ?? 0) > 0 ||
-                    (data.mptc_nes?.length ?? 0) > 0 ||
                     (data.sp_farm_profit?.length ?? 0) > 0;
     if (!hasData) return;
 
@@ -60,12 +59,6 @@ export function ArbHistoryChart({ data, themeKey }: { data: ArbHistoryData; them
       s.setData(toLD(data.sp_chain_nes));
     }
 
-    // MPTC — orange
-    if (data.mptc_nes?.length) {
-      const s = chart.addSeries(LineSeries, { color: "#d29922", lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: true });
-      s.setData(toLD(data.mptc_nes));
-    }
-
     // SP Farm monthly — green (thicker, most important)
     if (data.sp_farm_profit?.length) {
       const s = chart.addSeries(LineSeries, { color: "#3fb950", lineWidth: 2, priceLineVisible: true, lastValueVisible: true, crosshairMarkerVisible: true });
@@ -94,7 +87,6 @@ export function ArbHistoryChart({ data, themeKey }: { data: ArbHistoryData; them
       <div className="flex items-center gap-3 mb-2 flex-wrap">
         <LegendDot color="#56d4dd" label={t("plexArbHistNES")} />
         <LegendDot color="#bc8cff" label={t("plexArbHistSP")} />
-        <LegendDot color="#d29922" label={t("plexArbHistMPTC")} />
         <LegendDot color="#3fb950" label={t("plexArbHistSPFarm")} />
       </div>
       <div ref={containerRef} className="w-full rounded-sm h-[150px] sm:h-[180px] lg:h-[200px]" />

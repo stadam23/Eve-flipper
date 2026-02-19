@@ -559,9 +559,14 @@ func TestComputePLEXDashboard_Integration(t *testing.T) {
 		t.Errorf("SellPrice = %f, want 5000000", dash.PLEXPrice.SellPrice)
 	}
 
-	// Should have 8 arbitrage paths (4 NES/market + 4 spread)
-	if len(dash.Arbitrage) != 8 {
-		t.Errorf("expected 8 arbitrage paths, got %d", len(dash.Arbitrage))
+	// Should have 6 arbitrage paths (MPTC market-disabled paths are excluded).
+	if len(dash.Arbitrage) != 6 {
+		t.Errorf("expected 6 arbitrage paths, got %d", len(dash.Arbitrage))
+	}
+	for _, arb := range dash.Arbitrage {
+		if arb.Name == "MPTC (NES → Sell)" || arb.Name == "MPTC Spread (Market Make)" {
+			t.Errorf("unexpected market-disabled MPTC path present: %q", arb.Name)
+		}
 	}
 
 	// All arbitrage paths should have data
@@ -603,7 +608,11 @@ func TestComputePLEXDashboard_Integration(t *testing.T) {
 	if dash.SPFarm.StartupTrainDays <= 0 {
 		t.Error("StartupTrainDays should be > 0")
 	}
-	if dash.SPFarm.MPTCCostISK <= 0 {
+	if isMarketDisabledType(MPTCTypeID) {
+		if dash.SPFarm.MPTCCostISK != 0 {
+			t.Errorf("MPTCCostISK = %f, want 0 for market-disabled MPTC", dash.SPFarm.MPTCCostISK)
+		}
+	} else if dash.SPFarm.MPTCCostISK <= 0 {
 		t.Error("MPTCCostISK should be > 0")
 	}
 	if dash.SPFarm.OmegaISKValue <= 0 {
@@ -845,6 +854,25 @@ func TestComputeCrossHubArbitrage_UsesJitaBuyAndSalesTaxOnly(t *testing.T) {
 	}
 	if !got.Viable {
 		t.Error("expected viable cross-hub trade")
+	}
+}
+
+func TestComputeCrossHubArbitrage_SkipsMarketDisabledTypes(t *testing.T) {
+	cross := map[int32]map[int32][]esi.MarketOrder{
+		MPTCTypeID: {
+			JitaRegionID: {
+				{Price: 200, IsBuyOrder: false},
+				{Price: 150, IsBuyOrder: true},
+			},
+			10000043: { // Amarr
+				{Price: 100, IsBuyOrder: false},
+			},
+		},
+	}
+
+	items := computeCrossHubArbitrage(cross, 0.9)
+	if len(items) != 0 {
+		t.Fatalf("expected no cross-hub results for market-disabled MPTC, got %d", len(items))
 	}
 }
 

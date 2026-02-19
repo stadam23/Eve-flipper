@@ -75,6 +75,9 @@ function App() {
     sell_sales_tax_percent: 8,
     contract_hold_days: 7,
     contract_target_confidence: 80,
+    exclude_rigs_with_ship: true,
+    route_min_hops: 2,
+    route_max_hops: 5,
   });
   const configLoadedRef = useRef(false);
 
@@ -950,6 +953,7 @@ function App() {
               results={contractResults}
               scanning={scanning && tab === "contracts"}
               progress={tab === "contracts" ? progress : ""}
+              excludeRigPriceIfShip={params.exclude_rigs_with_ship ?? true}
               filterHints={contractFilterHints}
               isLoggedIn={authStatus.logged_in}
             />
@@ -969,6 +973,7 @@ function App() {
           >
             <RouteBuilder
               params={params}
+              onChange={setParams}
               loadedResults={routeLoadedResults}
               isLoggedIn={authStatus.logged_in}
             />
@@ -1072,10 +1077,12 @@ function App() {
                 "buy_sales_tax_percent",
                 "sell_sales_tax_percent",
                 "min_daily_volume",
+                "max_investment",
                 "min_s2b_per_day",
                 "min_bfs_per_day",
                 "min_s2b_bfs_ratio",
                 "max_s2b_bfs_ratio",
+                "min_route_security",
                 "min_contract_price",
                 "max_contract_margin",
                 "min_priced_ratio",
@@ -1083,11 +1090,22 @@ function App() {
                 "contract_instant_liquidation",
                 "contract_hold_days",
                 "contract_target_confidence",
+                "exclude_rigs_with_ship",
                 "target_region",
+                "include_structures",
+                "route_min_hops",
+                "route_max_hops",
               ];
               const filtered: Record<string, unknown> = {};
               for (const k of safeKeys) {
                 if (k in loadedParams) filtered[k] = loadedParams[k];
+              }
+              // Backward compatibility: older route history stores min_hops/max_hops.
+              if (!("route_min_hops" in filtered) && "min_hops" in loadedParams) {
+                filtered.route_min_hops = loadedParams.min_hops;
+              }
+              if (!("route_max_hops" in filtered) && "max_hops" in loadedParams) {
+                filtered.route_max_hops = loadedParams.max_hops;
               }
               if (Object.keys(filtered).length > 0) {
                 setParams((p) => ({

@@ -6,6 +6,8 @@ type FlipResult struct {
 	TypeName        string
 	Volume          float64
 	BuyPrice        float64
+	BestAskPrice    float64 `json:"BestAskPrice,omitempty"` // Explicit L1 best ask price at buy location (same level as BuyPrice)
+	BestAskQty      int32   `json:"BestAskQty,omitempty"`   // Quantity available strictly at BestAskPrice
 	BuyStation      string
 	BuySystemName   string
 	BuySystemID     int32
@@ -13,6 +15,8 @@ type FlipResult struct {
 	BuyRegionName   string `json:"BuyRegionName,omitempty"`
 	BuyLocationID   int64  `json:"BuyLocationID,omitempty"`
 	SellPrice       float64
+	BestBidPrice    float64 `json:"BestBidPrice,omitempty"` // Explicit L1 best bid price at sell location (same level as SellPrice)
+	BestBidQty      int32   `json:"BestBidQty,omitempty"`   // Quantity available strictly at BestBidPrice
 	SellStation     string
 	SellSystemName  string
 	SellSystemID    int32
@@ -71,7 +75,10 @@ type ContractResult struct {
 	StationName           string
 	SystemName            string `json:"SystemName,omitempty"`
 	RegionName            string `json:"RegionName,omitempty"`
+	LiquidationSystemName string `json:"LiquidationSystemName,omitempty"` // instant mode: chosen sell system inside sell radius
+	LiquidationRegionName string `json:"LiquidationRegionName,omitempty"` // region of chosen liquidation system
 	ItemCount             int32
+	LiquidationJumps      int // jumps from pickup system to liquidation system (instant mode)
 	Jumps                 int
 	ProfitPerJump         float64
 }

@@ -121,8 +121,8 @@ type PLEXDashboard struct {
 
 // OmegaComparison compares PLEX-based Omega cost vs real-money cost.
 type OmegaComparison struct {
-	PLEXNeeded int     `json:"plex_needed"` // 500
-	TotalISK   float64 `json:"total_isk"`   // 500 * plex sell price
+	PLEXNeeded   int     `json:"plex_needed"`    // 500
+	TotalISK     float64 `json:"total_isk"`      // 500 * plex sell price
 	RealMoneyUSD float64 `json:"real_money_usd"` // user-provided $ price
 	ISKPerUSD    float64 `json:"isk_per_usd"`    // total_isk / real_money_usd
 }
@@ -204,13 +204,13 @@ type OverlayPoint struct {
 
 // PLEXGlobalPrice holds pricing from the Global PLEX Market (region 19000001).
 type PLEXGlobalPrice struct {
-	BuyPrice      float64 `json:"buy_price"`      // highest buy order
-	SellPrice     float64 `json:"sell_price"`      // lowest sell order
-	Spread        float64 `json:"spread"`          // sell - buy
-	SpreadPct     float64 `json:"spread_pct"`      // (sell - buy) / buy * 100
+	BuyPrice      float64 `json:"buy_price"`  // highest buy order
+	SellPrice     float64 `json:"sell_price"` // lowest sell order
+	Spread        float64 `json:"spread"`     // sell - buy
+	SpreadPct     float64 `json:"spread_pct"` // (sell - buy) / buy * 100
 	Volume24h     int64   `json:"volume_24h"`
-	BuyOrders     int     `json:"buy_orders"`      // total buy order count
-	SellOrders    int     `json:"sell_orders"`      // total sell order count
+	BuyOrders     int     `json:"buy_orders"`     // total buy order count
+	SellOrders    int     `json:"sell_orders"`    // total sell order count
 	Percentile90d float64 `json:"percentile_90d"` // what % of 90d prices are below current
 }
 
@@ -307,7 +307,7 @@ type PLEXIndicators struct {
 
 	// Volatility index (20-day annualized)
 	Volatility20d float64 `json:"volatility_20d"` // annualized 20-day log-return vol
-	VolRegime     string  `json:"vol_regime"`      // "low", "medium", "high"
+	VolRegime     string  `json:"vol_regime"`     // "low", "medium", "high"
 }
 
 // PLEXSignal is the BUY/SELL/HOLD recommendation.
@@ -349,6 +349,9 @@ func ComputePLEXDashboard(
 		brokerFeePct = 1.0 // Broker Relations V
 	}
 	nesExtractor, nesMPTC, nesOmega := nes.Resolve()
+	if isMarketDisabledType(MPTCTypeID) {
+		nesMPTC = 0
+	}
 
 	// Sort history chronologically once; pass sorted slice to all sub-functions.
 	sortedHist := sortHistory(history)
@@ -372,6 +375,10 @@ func ComputePLEXDashboard(
 	injectorBuy := bestBuyPrice(scopedRelatedOrders[LargeSkillInjTypeID])
 	mptcSell := bestSellPrice(scopedRelatedOrders[MPTCTypeID])
 	mptcBuy := bestBuyPrice(scopedRelatedOrders[MPTCTypeID])
+	if isMarketDisabledType(MPTCTypeID) {
+		mptcSell = 0
+		mptcBuy = 0
+	}
 
 	// Net revenue multiplier: in EVE, broker fee and sales tax are both
 	// percentage deductions from the order price.
@@ -445,7 +452,7 @@ func ComputePLEXDashboard(
 	}
 
 	// Path 3: NES MPTC → Sell
-	{
+	if !isMarketDisabledType(MPTCTypeID) {
 		cost := float64(nesMPTC) * plexPrice
 		noData := mptcSell <= 0
 		revenue := mptcSell * netMult
@@ -565,7 +572,7 @@ func ComputePLEXDashboard(
 	}
 
 	// Path 8: MPTC Spread
-	{
+	if !isMarketDisabledType(MPTCTypeID) {
 		cost := mptcBuy * buyBrokerMult
 		noData := mptcBuy <= 0 || mptcSell <= 0
 		revenue := mptcSell * netMult
@@ -607,15 +614,6 @@ func ComputePLEXDashboard(
 		case arb.Type == "nes_process":
 			// Sell 1 injector: walk buy orders
 			plan := ComputeExecutionPlan(scopedRelatedOrders[LargeSkillInjTypeID], 1, false)
-			arb.SlippagePct = plan.SlippagePercent
-			adjRev := plan.ExpectedPrice * salesTaxOnly
-			if adjRev <= 0 {
-				adjRev = arb.RevenueISK
-			}
-			arb.AdjustedProfitISK = adjRev - arb.CostISK
-		case arb.Type == "nes_sell" && arb.Name == "MPTC (NES → Sell)":
-			// Sell 1 MPTC: walk buy orders
-			plan := ComputeExecutionPlan(scopedRelatedOrders[MPTCTypeID], 1, false)
 			arb.SlippagePct = plan.SlippagePercent
 			adjRev := plan.ExpectedPrice * salesTaxOnly
 			if adjRev <= 0 {
@@ -1236,7 +1234,7 @@ func computeArbHistory(
 		}
 
 		// MPTC
-		if mptcSell > 0 {
+		if !isMarketDisabledType(MPTCTypeID) && mptcSell > 0 {
 			mptcCost := float64(nesMPTC) * plexPrice
 			mptcProfit := mptcRevenue - mptcCost
 			mptcArr = append(mptcArr, ArbHistoryPoint{
@@ -1287,14 +1285,18 @@ func computeMarketDepth(
 	md.InjectorSellQty = totalSellVolume(relatedOrders[LargeSkillInjTypeID])
 	md.InjectorBuyQty = totalBuyVolume(relatedOrders[LargeSkillInjTypeID])
 
-	// MPTC
-	md.MPTCSellQty = totalSellVolume(relatedOrders[MPTCTypeID])
-	md.MPTCBuyQty = totalBuyVolume(relatedOrders[MPTCTypeID])
+	// MPTC (if market-enabled)
+	if !isMarketDisabledType(MPTCTypeID) {
+		md.MPTCSellQty = totalSellVolume(relatedOrders[MPTCTypeID])
+		md.MPTCBuyQty = totalBuyVolume(relatedOrders[MPTCTypeID])
+	}
 
 	// Time-to-fill estimates (hours to sell quantity based on avg daily volume)
 	md.ExtractorFillHours = estimateFillHours(relatedHistory[SkillExtractorTypeID], 1)
 	md.InjectorFillHours = estimateFillHours(relatedHistory[LargeSkillInjTypeID], 1)
-	md.MPTCFillHours = estimateFillHours(relatedHistory[MPTCTypeID], 1)
+	if !isMarketDisabledType(MPTCTypeID) {
+		md.MPTCFillHours = estimateFillHours(relatedHistory[MPTCTypeID], 1)
+	}
 	md.PLEXFillHours = estimateFillHours(plexHistory, 100)
 
 	return md
@@ -1599,7 +1601,6 @@ var crossHubItems = []struct {
 }{
 	{SkillExtractorTypeID, "Skill Extractor"},
 	{LargeSkillInjTypeID, "Large Skill Injector"},
-	{MPTCTypeID, "MPTC"},
 }
 
 // computeCrossHubArbitrage compares sell prices across 4 hubs for SP-related items.

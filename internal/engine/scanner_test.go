@@ -239,6 +239,109 @@ func TestFindSafeExecutionQuantity_NoProfitableQty(t *testing.T) {
 	}
 }
 
+func TestCalculateResults_TracksBestLevelPriceAndQty(t *testing.T) {
+	u := graph.NewUniverse()
+	u.SetRegion(1, 10000002)
+	u.SetRegion(2, 10000002)
+	u.SetSecurity(1, 0.9)
+	u.SetSecurity(2, 0.9)
+	u.AddGate(1, 2)
+	u.AddGate(2, 1)
+
+	scanner := &Scanner{
+		SDE: &sde.Data{
+			Universe: u,
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Alpha", RegionID: 10000002},
+				2: {ID: 2, Name: "Beta", RegionID: 10000002},
+			},
+			Types: map[int32]*sde.ItemType{
+				34: {ID: 34, Name: "Tritanium", Volume: 0.01},
+			},
+		},
+		ESI: esi.NewClient(nil),
+	}
+
+	const (
+		typeID       = int32(34)
+		buyLocID     = int64(100000000001)
+		sellLocID    = int64(100000000002)
+		currentSys   = int32(1)
+		buySystemID  = int32(1)
+		sellSystemID = int32(2)
+	)
+
+	asks := []esi.MarketOrder{
+		{TypeID: typeID, LocationID: buyLocID, SystemID: buySystemID, Price: 10, VolumeRemain: 5},
+		{TypeID: typeID, LocationID: buyLocID, SystemID: buySystemID, Price: 10, VolumeRemain: 7},
+		{TypeID: typeID, LocationID: buyLocID, SystemID: buySystemID, Price: 11, VolumeRemain: 20},
+	}
+	bids := []esi.MarketOrder{
+		{TypeID: typeID, LocationID: sellLocID, SystemID: sellSystemID, Price: 15, VolumeRemain: 4, IsBuyOrder: true},
+		{TypeID: typeID, LocationID: sellLocID, SystemID: sellSystemID, Price: 15, VolumeRemain: 6, IsBuyOrder: true},
+		{TypeID: typeID, LocationID: sellLocID, SystemID: sellSystemID, Price: 14, VolumeRemain: 50, IsBuyOrder: true},
+	}
+
+	idx := &scanIndex{
+		sellByType: map[int32][]sellInfo{
+			typeID: {
+				{Price: 10, VolumeRemain: 5, LocationID: buyLocID, SystemID: buySystemID},
+				{Price: 10, VolumeRemain: 7, LocationID: buyLocID, SystemID: buySystemID},
+				{Price: 11, VolumeRemain: 20, LocationID: buyLocID, SystemID: buySystemID},
+			},
+		},
+		buyByType: map[int32][]buyInfo{
+			typeID: {
+				{Price: 15, VolumeRemain: 4, LocationID: sellLocID, SystemID: sellSystemID},
+				{Price: 15, VolumeRemain: 6, LocationID: sellLocID, SystemID: sellSystemID},
+				{Price: 14, VolumeRemain: 50, LocationID: sellLocID, SystemID: sellSystemID},
+			},
+		},
+		sellOrders: asks,
+		buyOrders:  bids,
+		sellSideBuyDepthByType: map[int32]int64{
+			typeID: 60,
+		},
+		sellSideSellDepthByType: map[int32]int64{
+			typeID: 32,
+		},
+	}
+
+	params := ScanParams{
+		CurrentSystemID: currentSys,
+		CargoCapacity:   1_000_000,
+		MinMargin:       0.1,
+	}
+	bfs := map[int32]int{
+		currentSys: 0,
+	}
+
+	results, err := scanner.calculateResults(params, idx, bfs, func(string) {})
+	if err != nil {
+		t.Fatalf("calculateResults error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+
+	r := results[0]
+	if r.BuyPrice != 10 || r.BestAskPrice != 10 {
+		t.Fatalf("BuyPrice/BestAskPrice = %v/%v, want 10/10", r.BuyPrice, r.BestAskPrice)
+	}
+	if r.SellPrice != 15 || r.BestBidPrice != 15 {
+		t.Fatalf("SellPrice/BestBidPrice = %v/%v, want 15/15", r.SellPrice, r.BestBidPrice)
+	}
+	if r.BestAskQty != 12 {
+		t.Fatalf("BestAskQty = %d, want 12", r.BestAskQty)
+	}
+	if r.BestBidQty != 10 {
+		t.Fatalf("BestBidQty = %d, want 10", r.BestBidQty)
+	}
+	if r.FilledQty <= 0 || r.RealProfit <= 0 {
+		t.Fatalf("expected depth-aware execution fields to be populated, got FilledQty=%d RealProfit=%f", r.FilledQty, r.RealProfit)
+	}
+}
+
 func TestHarmonicDailyShare_MonotoneAndBounded(t *testing.T) {
 	const daily = int64(10_000)
 	if got := harmonicDailyShare(0, 5); got != 0 {
@@ -251,13 +354,20 @@ func TestHarmonicDailyShare_MonotoneAndBounded(t *testing.T) {
 	}
 	for competitors := 1; competitors <= 200; competitors++ {
 		got := harmonicDailyShare(daily, competitors)
-		if got <= 0 || got > daily {
-			t.Fatalf("competitors=%d: share=%d out of bounds [1,%d]", competitors, got, daily)
+		if got < 0 || got > daily {
+			t.Fatalf("competitors=%d: share=%d out of bounds [0,%d]", competitors, got, daily)
 		}
 		if got > prev {
 			t.Fatalf("non-monotone share: competitors=%d share=%d > previous=%d", competitors, got, prev)
 		}
 		prev = got
+	}
+}
+
+func TestHarmonicDailyShare_ThinLiquidityCanRoundToZero(t *testing.T) {
+	got := harmonicDailyShare(1, 200)
+	if got != 0 {
+		t.Fatalf("harmonicDailyShare(1, 200) = %d, want 0", got)
 	}
 }
 
@@ -275,8 +385,8 @@ func TestHarmonicDailyShare_SumOfSharesLEVolume(t *testing.T) {
 		for pos := 1; pos <= n; pos++ {
 			share := float64(daily) * (1.0 / float64(pos)) / hn
 			rounded := int64(math.Round(share))
-			if rounded < 1 {
-				rounded = 1
+			if rounded < 0 {
+				rounded = 0
 			}
 			roundedTotal += rounded
 		}
@@ -293,8 +403,8 @@ func TestHarmonicDailyShare_SumOfSharesLEVolume(t *testing.T) {
 		got := harmonicDailyShare(daily, n-1)
 		medianPos := (n + 1) / 2
 		expected := int64(math.Round(float64(daily) * (1.0 / float64(medianPos)) / hn))
-		if expected < 1 {
-			expected = 1
+		if expected < 0 {
+			expected = 0
 		}
 		if got != expected {
 			t.Fatalf("n=%d: harmonicDailyShare=%d, expected median share=%d", n, got, expected)

@@ -1,23 +1,79 @@
 import { useEffect, useState } from "react";
 import { Modal } from "./Modal";
-import { getContractDetails } from "../lib/api";
+import { getContractDetails, openContractInGame } from "../lib/api";
 import type { ContractDetails, ContractItem } from "../lib/types";
 import { useI18n } from "../lib/i18n";
 import { formatISK } from "../lib/format";
+import { useGlobalToast } from "./Toast";
+import { handleEveUIError } from "../lib/handleEveUIError";
 
 interface ContractDetailsPopupProps {
   open: boolean;
   contractID: number;
   contractTitle: string;
   contractPrice: number;
+  contractMarketValue?: number;
+  contractProfit?: number;
+  excludeRigPriceIfShip?: boolean;
+  pickupStationName?: string;
+  pickupSystemName?: string;
+  pickupRegionName?: string;
+  liquidationSystemName?: string;
+  liquidationRegionName?: string;
+  liquidationJumps?: number;
+  totalJumps?: number;
+  isLoggedIn?: boolean;
   onClose: () => void;
 }
 
-export function ContractDetailsPopup({ open, contractID, contractTitle, contractPrice, onClose }: ContractDetailsPopupProps) {
+function formatLocation(parts: Array<string | undefined>): string {
+  const normalized = parts
+    .map((part) => (part ?? "").trim())
+    .filter((part) => part.length > 0);
+  return normalized.length > 0 ? normalized.join(" • ") : "\u2014";
+}
+
+function isShipItem(item: ContractItem): boolean {
+  return item.is_ship === true || item.category_id === 6;
+}
+
+function isRigItem(item: ContractItem): boolean {
+  if (item.is_rig === true) return true;
+  const groupName = (item.group_name ?? "").trim().toLowerCase();
+  return item.category_id === 7 && groupName.startsWith("rig");
+}
+
+function formatSignedISK(value: number): string {
+  if (value > 0) return `+${formatISK(value)}`;
+  return formatISK(value);
+}
+
+export function ContractDetailsPopup({
+  open,
+  contractID,
+  contractTitle,
+  contractPrice,
+  contractMarketValue,
+  contractProfit,
+  excludeRigPriceIfShip = true,
+  pickupStationName,
+  pickupSystemName,
+  pickupRegionName,
+  liquidationSystemName,
+  liquidationRegionName,
+  liquidationJumps,
+  totalJumps,
+  isLoggedIn = false,
+  onClose,
+}: ContractDetailsPopupProps) {
   const { t } = useI18n();
+  const { addToast } = useGlobalToast();
   const [details, setDetails] = useState<ContractDetails | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const pickupLocation = formatLocation([pickupStationName, pickupSystemName, pickupRegionName]);
+  const liquidationLocation = formatLocation([liquidationSystemName, liquidationRegionName]);
+  const hasLiquidationPoint = liquidationLocation !== "\u2014";
 
   useEffect(() => {
     if (!open) return;
@@ -37,18 +93,67 @@ export function ContractDetailsPopup({ open, contractID, contractTitle, contract
   // Keep raw rows to preserve risk signals (damage/fitted-like markers/BP params).
   const includedItems = details?.items.filter((item) => item.is_included) || [];
   const requestedItems = details?.items.filter((item) => !item.is_included) || [];
+  const hasShipInContract = includedItems.some(isShipItem);
+  const rigItemsInContract = includedItems.filter(isRigItem);
+  const rigItemsTotalQty = rigItemsInContract.reduce((sum, item) => sum + item.quantity, 0);
+  const rigExclusionApplied = excludeRigPriceIfShip && hasShipInContract && rigItemsInContract.length > 0;
+  const scanSpread = typeof contractMarketValue === "number" ? contractMarketValue - contractPrice : null;
+  const handleOpenContract = async () => {
+    try {
+      await openContractInGame(contractID);
+      addToast(t("actionSuccess"), "success", 2000);
+    } catch (err: any) {
+      const { messageKey, duration } = handleEveUIError(err);
+      addToast(t(messageKey), "error", duration);
+    }
+  };
 
   return (
     <Modal open={open} onClose={onClose} title={`${t("contractDetails")} #${contractID}`}>
       <div className="p-4 flex flex-col gap-4">
         {/* Contract info */}
         <div className="border border-eve-border rounded-sm p-3 bg-eve-panel">
-          <div className="text-sm text-eve-text">
-            <span className="text-eve-dim">{t("colTitle")}:</span> {contractTitle}
+          <div className="flex items-start justify-between gap-3">
+            <div className="text-sm text-eve-text flex-1">
+              <span className="text-eve-dim">{t("colTitle")}:</span> {contractTitle}
+            </div>
+            {isLoggedIn && (
+              <button
+                onClick={handleOpenContract}
+                className="px-2.5 py-1 rounded-sm border border-eve-border text-eve-dim hover:text-eve-accent hover:border-eve-accent/40 transition-colors text-xs whitespace-nowrap"
+              >
+                🎮 {t("openContract")}
+              </button>
+            )}
           </div>
           <div className="text-sm text-eve-accent font-mono mt-1">
             <span className="text-eve-dim">{t("iskPrice")}:</span> {formatISK(contractPrice)}
           </div>
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+            <div>
+              <div className="text-eve-dim uppercase tracking-wider">{t("contractPickupPoint")}</div>
+              <div className="text-eve-text mt-1">{pickupLocation}</div>
+            </div>
+            <div>
+              <div className="text-eve-dim uppercase tracking-wider">{t("contractLiquidationPoint")}</div>
+              <div className={`mt-1 ${hasLiquidationPoint ? "text-eve-success" : "text-eve-dim"}`}>
+                {liquidationLocation}
+              </div>
+            </div>
+          </div>
+          {hasLiquidationPoint && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <span className="px-2 py-0.5 rounded-sm border border-eve-border text-eve-dim">
+                {t("contractRouteLabel")}: {(pickupSystemName || pickupStationName || "\u2014")} {"\u2192"} {liquidationSystemName}
+              </span>
+              <span className="px-2 py-0.5 rounded-sm border border-eve-border text-eve-dim">
+                {t("contractLiqJumps")}: {typeof liquidationJumps === "number" ? liquidationJumps : "\u2014"}
+              </span>
+              <span className="px-2 py-0.5 rounded-sm border border-eve-border text-eve-dim">
+                {t("colContractJumps")}: {typeof totalJumps === "number" ? totalJumps : "\u2014"}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Warning about damage and fitted items */}
@@ -80,6 +185,45 @@ export function ContractDetailsPopup({ open, contractID, contractTitle, contract
 
         {!loading && !error && details && (
           <>
+            {excludeRigPriceIfShip && (
+              <div className="border border-yellow-700/50 bg-yellow-950/20 rounded-sm p-3">
+                <div className="text-xs font-semibold uppercase tracking-wider text-yellow-300">
+                  {t("contractRigCheckoutTitle")}
+                </div>
+                <div className="text-xs text-yellow-200/90 mt-1">
+                  {rigExclusionApplied ? t("contractRigCheckoutAppliedHint") : t("contractRigCheckoutNoRigHint")}
+                </div>
+                <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-eve-dim">{t("iskPrice")}</div>
+                    <div className="mt-1 text-sm font-mono text-eve-accent">{formatISK(contractPrice)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-eve-dim">
+                      {t("contractRigCheckoutValueLabel")}
+                    </div>
+                    <div className="mt-1 text-sm font-mono text-eve-success">
+                      {typeof contractMarketValue === "number" ? formatISK(contractMarketValue) : "\u2014"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-eve-dim">
+                      {t("contractRigCheckoutSpreadLabel")}
+                    </div>
+                    <div className={`mt-1 text-sm font-mono ${scanSpread != null && scanSpread >= 0 ? "text-eve-success" : "text-eve-error"}`}>
+                      {scanSpread != null ? formatSignedISK(scanSpread) : "\u2014"}
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-2 text-[11px] text-eve-dim">
+                  {t("contractRigDetectedRows")}: {rigItemsInContract.length} · {t("contractRigDetectedQty")}: {rigItemsTotalQty.toLocaleString()}
+                  {typeof contractProfit === "number" && (
+                    <> · {t("colContractProfit")}: {formatSignedISK(contractProfit)}</>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Items included (seller provides) */}
             {includedItems.length > 0 && (
               <div className="border border-eve-border rounded-sm overflow-hidden">
@@ -96,7 +240,11 @@ export function ContractDetailsPopup({ open, contractID, contractTitle, contract
                   </thead>
                   <tbody className="text-eve-text">
                     {includedItems.map((item, idx) => (
-                      <ItemRow key={`${item.record_id}-${item.item_id}-${idx}`} item={item} />
+                      <ItemRow
+                        key={`${item.record_id}-${item.item_id}-${idx}`}
+                        item={item}
+                        highlightRig={rigExclusionApplied && isRigItem(item)}
+                      />
                     ))}
                   </tbody>
                 </table>
@@ -132,7 +280,7 @@ export function ContractDetailsPopup({ open, contractID, contractTitle, contract
   );
 }
 
-function ItemRow({ item }: { item: ContractItem }) {
+function ItemRow({ item, highlightRig = false }: { item: ContractItem; highlightRig?: boolean }) {
   const { t } = useI18n();
 
   let typeLabel = t("colItem");
@@ -149,7 +297,7 @@ function ItemRow({ item }: { item: ContractItem }) {
   const damagePercent = item.damage ? Math.round(item.damage * 100) : 0;
 
   return (
-    <tr className="border-b border-eve-border last:border-b-0">
+    <tr className={`border-b border-eve-border last:border-b-0 ${highlightRig ? "bg-yellow-900/20" : ""}`}>
       <td className="px-3 py-1.5">
         <div className="flex items-center gap-2">
           <img
@@ -162,7 +310,14 @@ function ItemRow({ item }: { item: ContractItem }) {
             }}
           />
           <div className="flex-1">
-            <div className="text-eve-text">{item.type_name || `Type ${item.type_id}`}</div>
+            <div className="text-eve-text flex items-center gap-2">
+              <span>{item.type_name || `Type ${item.type_id}`}</span>
+              {highlightRig && (
+                <span className="px-1.5 py-0.5 rounded-sm border border-yellow-600/70 text-[10px] uppercase tracking-wider text-yellow-300">
+                  {t("contractRigExcludedTag")}
+                </span>
+              )}
+            </div>
             {damagePercent > 0 && (
               <div className="text-xs text-red-400">⚠ Damaged {damagePercent}%</div>
             )}

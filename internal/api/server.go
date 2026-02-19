@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -60,7 +61,7 @@ type Server struct {
 	plexCacheMu    sync.RWMutex
 	plexCache      *engine.PLEXDashboard
 	plexCacheTime  time.Time
-	plexCacheKey   string // "salesTax_brokerFee_nesE_nesM_nesO"
+	plexCacheKey   string // "salesTax_brokerFee_nesE_nesO_omegaUSD"
 	plexBuildGroup singleflight.Group
 	plexBuildSem   chan struct{} // global limiter for heavy PLEX refreshes
 
@@ -588,6 +589,20 @@ func filterFlipResultsExcludeStructures(results []engine.FlipResult) []engine.Fl
 	return filtered
 }
 
+func filterFlipResultsMarketDisabled(results []engine.FlipResult) []engine.FlipResult {
+	if len(results) == 0 {
+		return results
+	}
+	filtered := results[:0]
+	for _, r := range results {
+		if engine.IsMarketDisabledTypeID(r.TypeID) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
+}
+
 func flipResultKPIProfit(r engine.FlipResult) float64 {
 	if r.RealProfit > 0 {
 		return r.RealProfit
@@ -636,6 +651,27 @@ func filterRouteResultsExcludeStructures(results []engine.RouteResult) []engine.
 	return filtered
 }
 
+func filterRouteResultsMarketDisabled(results []engine.RouteResult) []engine.RouteResult {
+	if len(results) == 0 {
+		return results
+	}
+	filtered := results[:0]
+	for _, route := range results {
+		blocked := false
+		for _, hop := range route.Hops {
+			if engine.IsMarketDisabledTypeID(hop.TypeID) {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		filtered = append(filtered, route)
+	}
+	return filtered
+}
+
 func filterStationTradesExcludeStructures(results []engine.StationTrade) []engine.StationTrade {
 	if len(results) == 0 {
 		return results
@@ -646,6 +682,77 @@ func filterStationTradesExcludeStructures(results []engine.StationTrade) []engin
 			continue
 		}
 		filtered = append(filtered, r)
+	}
+	return filtered
+}
+
+func filterStationTradesMarketDisabled(results []engine.StationTrade) []engine.StationTrade {
+	if len(results) == 0 {
+		return results
+	}
+	filtered := results[:0]
+	for _, r := range results {
+		if engine.IsMarketDisabledTypeID(r.TypeID) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
+}
+
+// filterContractResultsMarketDisabled is a defense-in-depth guard:
+// even if upstream scan/history contained unsafe contracts, drop ones that include
+// market-disabled types (e.g. MPTC) before returning to UI.
+func (s *Server) filterContractResultsMarketDisabled(results []engine.ContractResult) []engine.ContractResult {
+	if len(results) == 0 {
+		return results
+	}
+	s.mu.RLock()
+	scanner := s.scanner
+	s.mu.RUnlock()
+	if scanner == nil {
+		return results
+	}
+
+	contractIDs := make([]int32, 0, len(results))
+	for _, r := range results {
+		if r.ContractID > 0 {
+			contractIDs = append(contractIDs, r.ContractID)
+		}
+	}
+	if len(contractIDs) == 0 {
+		return results
+	}
+
+	// Prefer fail-closed for this risk class: if contract items cannot be verified,
+	// do not surface the result to avoid ghost-market losses.
+	itemsByContract := s.esi.FetchContractItemsBatch(contractIDs, scanner.ContractItemsCache, func(done, total int) {})
+	filtered := results[:0]
+	dropped := 0
+
+	for _, r := range results {
+		items, ok := itemsByContract[r.ContractID]
+		if !ok {
+			dropped++
+			continue
+		}
+
+		blocked := false
+		for _, item := range items {
+			if item.Quantity > 0 && engine.IsMarketDisabledTypeID(item.TypeID) {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			dropped++
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+
+	if dropped > 0 {
+		log.Printf("[API] Contracts post-filter: dropped %d/%d results (market-disabled types or unverifiable items)", dropped, len(results))
 	}
 	return filtered
 }
@@ -1273,6 +1380,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	} else {
 		results = filterFlipResultsExcludeStructures(results)
 	}
+	results = filterFlipResultsMarketDisabled(results)
 
 	topProfit := 0.0
 	totalProfit := 0.0
@@ -1358,6 +1466,7 @@ func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
 	} else {
 		results = filterFlipResultsExcludeStructures(results)
 	}
+	results = filterFlipResultsMarketDisabled(results)
 
 	topProfit := 0.0
 	totalProfit := 0.0
@@ -1416,22 +1525,36 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API] ScanContracts starting: system=%d, buyR=%d, margin=%.1f, tax=%.1f",
 		params.CurrentSystemID, params.BuyRadius, params.MinMargin, params.SalesTaxPercent)
 
+	ctx := r.Context()
 	startTime := time.Now()
 
-	results, err := scanner.ScanContracts(params, func(msg string) {
+	results, err := scanner.ScanContractsWithContext(ctx, params, func(msg string) {
+		if ctx.Err() != nil {
+			return
+		}
 		line, _ := json.Marshal(map[string]string{"type": "progress", "message": msg})
-		fmt.Fprintf(w, "%s\n", line)
+		if _, writeErr := fmt.Fprintf(w, "%s\n", line); writeErr != nil {
+			return
+		}
 		flusher.Flush()
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("[API] ScanContracts canceled: %v", err)
+			return
+		}
 		log.Printf("[API] ScanContracts error: %v", err)
 		line, _ := json.Marshal(map[string]string{"type": "error", "message": err.Error()})
 		fmt.Fprintf(w, "%s\n", line)
 		flusher.Flush()
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 
 	durationMs := time.Since(startTime).Milliseconds()
+	results = s.filterContractResultsMarketDisabled(results)
 	log.Printf("[API] ScanContracts complete: %d results in %dms", len(results), durationMs)
 
 	topProfit := 0.0
@@ -1444,7 +1567,9 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 		totalProfit += kpiProfit
 	}
 	scanID := s.db.InsertHistoryFull("contracts", req.SystemName, len(results), topProfit, totalProfit, durationMs, req)
-	go s.db.InsertContractResults(scanID, results)
+	if ctx.Err() == nil {
+		go s.db.InsertContractResults(scanID, results)
+	}
 
 	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
 	if marshalErr != nil {
@@ -1452,6 +1577,9 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 		errLine, _ := json.Marshal(map[string]string{"type": "error", "message": "JSON: " + marshalErr.Error()})
 		fmt.Fprintf(w, "%s\n", errLine)
 		flusher.Flush()
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	fmt.Fprintf(w, "%s\n", line)
@@ -1549,6 +1677,7 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 	} else {
 		results = filterRouteResultsExcludeStructures(results)
 	}
+	results = filterRouteResultsMarketDisabled(results)
 
 	var topProfit, totalProfit float64
 	for _, r := range results {
@@ -1577,7 +1706,15 @@ func (s *Server) handleRouteFind(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetWatchlist(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromRequest(r)
-	writeJSON(w, s.db.GetWatchlistForUser(userID))
+	items := s.db.GetWatchlistForUser(userID)
+	filtered := make([]config.WatchlistItem, 0, len(items))
+	for _, it := range items {
+		if engine.IsMarketDisabledTypeID(it.TypeID) {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	writeJSON(w, filtered)
 }
 
 func (s *Server) handleAddWatchlist(w http.ResponseWriter, r *http.Request) {
@@ -1610,6 +1747,10 @@ func (s *Server) handleAddWatchlist(w http.ResponseWriter, r *http.Request) {
 	if item.AlertThreshold <= 0 && item.AlertMinMargin > 0 {
 		item.AlertThreshold = item.AlertMinMargin
 	}
+	if engine.IsMarketDisabledTypeID(item.TypeID) {
+		writeError(w, 400, "type_id is market-disabled")
+		return
+	}
 	if item.AlertThreshold > 0 && !item.AlertEnabled {
 		item.AlertEnabled = true
 	}
@@ -1621,8 +1762,16 @@ func (s *Server) handleAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		Items    []config.WatchlistItem `json:"items"`
 		Inserted bool                   `json:"inserted"`
 	}
+	items := s.db.GetWatchlistForUser(userID)
+	filtered := make([]config.WatchlistItem, 0, len(items))
+	for _, it := range items {
+		if engine.IsMarketDisabledTypeID(it.TypeID) {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
 	writeJSON(w, addResponse{
-		Items:    s.db.GetWatchlistForUser(userID),
+		Items:    filtered,
 		Inserted: inserted,
 	})
 }
@@ -1637,7 +1786,15 @@ func (s *Server) handleDeleteWatchlist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.db.DeleteWatchlistItemForUser(userID, int32(id))
-	writeJSON(w, s.db.GetWatchlistForUser(userID))
+	items := s.db.GetWatchlistForUser(userID)
+	filtered := make([]config.WatchlistItem, 0, len(items))
+	for _, it := range items {
+		if engine.IsMarketDisabledTypeID(it.TypeID) {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	writeJSON(w, filtered)
 }
 
 func (s *Server) handleUpdateWatchlist(w http.ResponseWriter, r *http.Request) {
@@ -1687,7 +1844,15 @@ func (s *Server) handleUpdateWatchlist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.db.UpdateWatchlistItemForUser(userID, int32(id), body.AlertMinMargin, alertEnabled, alertMetric, alertThreshold)
-	writeJSON(w, s.db.GetWatchlistForUser(userID))
+	items := s.db.GetWatchlistForUser(userID)
+	filtered := make([]config.WatchlistItem, 0, len(items))
+	for _, it := range items {
+		if engine.IsMarketDisabledTypeID(it.TypeID) {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	writeJSON(w, filtered)
 }
 
 func (s *Server) handleGetAlertHistory(w http.ResponseWriter, r *http.Request) {
@@ -1801,9 +1966,20 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	scanner := s.scanner
 	s.mu.RUnlock()
 
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	streamAlive := true
 	progressFn := func(msg string) {
+		if !streamAlive || ctx.Err() != nil {
+			streamAlive = false
+			return
+		}
 		line, _ := json.Marshal(map[string]string{"type": "progress", "message": msg})
-		fmt.Fprintf(w, "%s\n", line)
+		if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
+			streamAlive = false
+			cancel()
+			return
+		}
 		flusher.Flush()
 	}
 
@@ -1814,9 +1990,13 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 
 	stationIDs := make(map[int64]bool)
 	regionIDs := make(map[int32]bool)
+	allowedSystemsByRegion := make(map[int32]map[int32]bool)
 	historyLabel := ""
+	radiusMode := req.Radius > 0 && req.SystemName != ""
+	singleStationMode := !radiusMode && req.StationID > 0
+	allStationsMode := !radiusMode && !singleStationMode
 
-	if req.Radius > 0 && req.SystemName != "" {
+	if radiusMode {
 		// Radius-based scan: find all systems within radius, collect their stations
 		systemID, ok := sdeData.SystemByName[strings.ToLower(req.SystemName)]
 		if !ok {
@@ -1832,10 +2012,16 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 		for sysID := range systems {
 			if sys, ok2 := sdeData.Systems[sysID]; ok2 {
 				regionIDs[sys.RegionID] = true
+				sysSet, exists := allowedSystemsByRegion[sys.RegionID]
+				if !exists {
+					sysSet = make(map[int32]bool)
+					allowedSystemsByRegion[sys.RegionID] = sysSet
+				}
+				sysSet[sysID] = true
 			}
 		}
 		historyLabel = fmt.Sprintf("%s +%d jumps", req.SystemName, req.Radius)
-	} else if req.StationID > 0 {
+	} else if singleStationMode {
 		// Single station (NPC or structure)
 		stationIDs[req.StationID] = true
 		regionIDs[req.RegionID] = true
@@ -1844,20 +2030,10 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 		// All stations in region
 		regionIDs[req.RegionID] = true
 		historyLabel = fmt.Sprintf("Region %d (all)", req.RegionID)
-
-		// If including structures, populate stationIDs with all NPC stations in region
-		// so the engine processes both NPC stations AND structures
-		if req.IncludeStructures && len(req.StructureIDs) > 0 {
-			for _, st := range sdeData.Stations {
-				if sys, ok := sdeData.Systems[st.SystemID]; ok && sys.RegionID == req.RegionID {
-					stationIDs[st.ID] = true
-				}
-			}
-		}
 	}
 
-	// Merge player structure IDs if requested
-	if req.IncludeStructures && len(req.StructureIDs) > 0 {
+	// Merge explicit player structure IDs when scan mode is station-scoped.
+	if req.IncludeStructures && len(req.StructureIDs) > 0 && !allStationsMode {
 		for _, sid := range req.StructureIDs {
 			stationIDs[sid] = true
 		}
@@ -1879,8 +2055,12 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	// Scan each region and merge results
 	var allResults []engine.StationTrade
 	for regionID := range regionIDs {
+		if ctx.Err() != nil || !streamAlive {
+			return
+		}
 		params := engine.StationTradeParams{
 			StationIDs:           stationIDs,
+			AllowedSystems:       allowedSystemsByRegion[regionID],
 			RegionID:             regionID,
 			MinMargin:            req.MinMargin,
 			SalesTaxPercent:      req.SalesTaxPercent,
@@ -1905,22 +2085,32 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 			LimitBuyToPriceLow:   req.LimitBuyToPriceLow,
 			FlagExtremePrices:    req.FlagExtremePrices,
 			AccessToken:          accessToken,
+			IncludeStructures:    req.IncludeStructures,
+			Ctx:                  ctx,
 		}
-		// For "all stations in region" mode WITHOUT structures, pass nil StationIDs
-		// (when structures are included, stationIDs contains both NPC stations and structures)
-		if req.StationID == 0 && req.Radius == 0 && !req.IncludeStructures {
+		// In all-stations mode keep StationIDs nil so the engine evaluates full region scope.
+		if allStationsMode {
 			params.StationIDs = nil
 		}
 
 		results, err := scanner.ScanStationTrades(params, progressFn)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil || !streamAlive {
+				return
+			}
 			log.Printf("[API] ScanStation error (region %d): %v", regionID, err)
 			line, _ := json.Marshal(map[string]string{"type": "error", "message": err.Error()})
-			fmt.Fprintf(w, "%s\n", line)
+			_, _ = fmt.Fprintf(w, "%s\n", line)
 			flusher.Flush()
 			return
 		}
+		if ctx.Err() != nil || !streamAlive {
+			return
+		}
 		allResults = append(allResults, results...)
+	}
+	if ctx.Err() != nil || !streamAlive {
+		return
 	}
 
 	durationMs := time.Since(startTime).Milliseconds()
@@ -1931,6 +2121,7 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	if !req.IncludeStructures {
 		allResults = filterStationTradesExcludeStructures(allResults)
 	}
+	allResults = filterStationTradesMarketDisabled(allResults)
 
 	// Calculate totals
 	topProfit := 0.0
@@ -2219,13 +2410,14 @@ func (s *Server) handleGetHistoryResults(w http.ResponseWriter, r *http.Request)
 	var results interface{}
 	switch record.Tab {
 	case "station":
-		results = s.db.GetStationResults(id)
+		results = filterStationTradesMarketDisabled(s.db.GetStationResults(id))
 	case "contracts":
-		results = s.db.GetContractResults(id)
+		contractResults := s.db.GetContractResults(id)
+		results = s.filterContractResultsMarketDisabled(contractResults)
 	case "route":
-		results = s.db.GetRouteResults(id)
+		results = filterRouteResultsMarketDisabled(s.db.GetRouteResults(id))
 	default:
-		results = s.db.GetFlipResults(id)
+		results = filterFlipResultsMarketDisabled(s.db.GetFlipResults(id))
 	}
 
 	writeJSON(w, map[string]interface{}{
@@ -3934,8 +4126,9 @@ func (s *Server) buildPLEXDashboard(salesTax, brokerFee float64, nes engine.NESP
 		log.Printf("[PLEX] Failed to fetch global PLEX orders: %v", plexErr)
 	}
 
-	// 2) Related items (Extractor, Injector, MPTC) from Jita
-	relatedTypes := []int32{engine.SkillExtractorTypeID, engine.LargeSkillInjTypeID, engine.MPTCTypeID}
+	// 2) Related items (Extractor, Injector) from Jita
+	// MPTC market is disabled by CCP, so we do not build tradable-market paths for it.
+	relatedTypes := []int32{engine.SkillExtractorTypeID, engine.LargeSkillInjTypeID}
 	relatedOrders := make(map[int32][]esi.MarketOrder, len(relatedTypes))
 	for _, tid := range relatedTypes {
 		orders, err := s.esi.FetchRegionOrdersByType(engine.JitaRegionID, tid)
@@ -3953,7 +4146,6 @@ func (s *Server) buildPLEXDashboard(salesTax, brokerFee float64, nes engine.NESP
 	}
 
 	// 4) Related item histories for fill-time estimation
-	// MPTC (34133) is not tradable on the regular market → ESI returns 400 for history.
 	historyTypes := []int32{engine.SkillExtractorTypeID, engine.LargeSkillInjTypeID}
 	relatedHistory := make(map[int32][]esi.HistoryEntry, len(historyTypes))
 	for _, tid := range historyTypes {
@@ -3965,7 +4157,7 @@ func (s *Server) buildPLEXDashboard(salesTax, brokerFee float64, nes engine.NESP
 		relatedHistory[tid] = entries
 	}
 
-	// 5) Cross-hub orders: 3 items × 3 non-Jita regions
+	// 5) Cross-hub orders: 2 items × 3 non-Jita regions
 	// Jita orders are already in relatedOrders, so we only need Amarr, Dodixie, Rens.
 	crossHubRegions := []int32{10000043, 10000032, 10000030} // Amarr, Dodixie, Rens
 	crossHubOrders := make(map[int32]map[int32][]esi.MarketOrder, len(relatedTypes))
@@ -4024,9 +4216,6 @@ func (s *Server) handlePLEXDashboard(w http.ResponseWriter, r *http.Request) {
 	if v, err := strconv.Atoi(q.Get("nes_extractor")); err == nil && v > 0 {
 		nes.ExtractorPLEX = v
 	}
-	if v, err := strconv.Atoi(q.Get("nes_mptc")); err == nil && v > 0 {
-		nes.MPTCPLEX = v
-	}
 	if v, err := strconv.Atoi(q.Get("nes_omega")); err == nil && v > 0 {
 		nes.OmegaPLEX = v
 	}
@@ -4040,7 +4229,7 @@ func (s *Server) handlePLEXDashboard(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API] PLEX Dashboard: salesTax=%.1f, brokerFee=%.1f, nes=%+v, omegaUSD=%.2f", salesTax, brokerFee, nes, omegaUSD)
 
 	// Check cache (5 min TTL, keyed by user params)
-	cacheKey := fmt.Sprintf("%.2f_%.2f_%d_%d_%d_%.2f", salesTax, brokerFee, nes.ExtractorPLEX, nes.MPTCPLEX, nes.OmegaPLEX, omegaUSD)
+	cacheKey := fmt.Sprintf("%.2f_%.2f_%d_%d_%.2f", salesTax, brokerFee, nes.ExtractorPLEX, nes.OmegaPLEX, omegaUSD)
 	if cached, ok := s.getPLEXCache(cacheKey, plexCacheTTL); ok {
 		log.Printf("[PLEX] Serving fresh cache")
 		writeJSON(w, cached)

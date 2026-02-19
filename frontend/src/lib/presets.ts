@@ -1,6 +1,14 @@
 const STORAGE_KEY = "eve-flipper-presets";
 
-export type PresetTab = "flipper" | "region" | "contracts" | "route" | "station";
+export type PresetTab =
+  | "flipper"
+  | "region"
+  | "contracts"
+  | "route"
+  | "station"
+  | "industry"
+  | "demand"
+  | "plex";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export interface SavedPreset {
@@ -22,6 +30,9 @@ export interface BuiltinPreset {
 // ── Station Trading Settings ──
 
 export interface StationTradingSettings {
+  systemName?: string;
+  selectedStationId?: number;
+  includeStructures?: boolean;
   minMargin: number;
   brokerFee: number;
   salesTaxPercent: number;
@@ -46,6 +57,54 @@ export interface StationTradingSettings {
   flagExtremePrices: boolean;
 }
 
+const PRESET_TAB_SET = new Set<PresetTab>([
+  "flipper",
+  "region",
+  "contracts",
+  "route",
+  "station",
+  "industry",
+  "demand",
+  "plex",
+]);
+
+function isPresetTab(value: unknown): value is PresetTab {
+  return typeof value === "string" && PRESET_TAB_SET.has(value as PresetTab);
+}
+
+const defaultScanPresetParams = {
+  cargo_capacity: 5000,
+  buy_radius: 5,
+  sell_radius: 10,
+  min_margin: 5,
+  sales_tax_percent: 8,
+  broker_fee_percent: 3,
+  split_trade_fees: false,
+  buy_broker_fee_percent: 3,
+  sell_broker_fee_percent: 3,
+  buy_sales_tax_percent: 0,
+  sell_sales_tax_percent: 8,
+  min_daily_volume: 0,
+  max_investment: 0,
+  min_s2b_per_day: 0,
+  min_bfs_per_day: 0,
+  min_s2b_bfs_ratio: 0,
+  max_s2b_bfs_ratio: 0,
+  min_route_security: 0,
+  target_region: "",
+  min_contract_price: 10_000_000,
+  max_contract_margin: 100,
+  min_priced_ratio: 0.8,
+  require_history: false,
+  contract_instant_liquidation: false,
+  contract_hold_days: 7,
+  contract_target_confidence: 80,
+  exclude_rigs_with_ship: true,
+  include_structures: false,
+  route_min_hops: 2,
+  route_max_hops: 5,
+};
+
 export const BUILTIN_PRESETS: BuiltinPreset[] = [
   // ── Flipper ──
   {
@@ -53,13 +112,12 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetConservative",
     tab: "flipper",
     params: {
+      ...defaultScanPresetParams,
       min_margin: 15,
       buy_radius: 5,
       sell_radius: 5,
       min_daily_volume: 10,
-      sales_tax_percent: 8,
-      broker_fee_percent: 3,
-      split_trade_fees: false,
+      min_route_security: 0.45,
     },
   },
   {
@@ -67,13 +125,10 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetNormal",
     tab: "flipper",
     params: {
+      ...defaultScanPresetParams,
       min_margin: 5,
       buy_radius: 10,
       sell_radius: 10,
-      min_daily_volume: 0,
-      sales_tax_percent: 8,
-      broker_fee_percent: 3,
-      split_trade_fees: false,
     },
   },
   {
@@ -81,13 +136,12 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetAggressive",
     tab: "flipper",
     params: {
+      ...defaultScanPresetParams,
       min_margin: 2,
       buy_radius: 20,
       sell_radius: 20,
-      min_daily_volume: 0,
-      sales_tax_percent: 8,
-      broker_fee_percent: 3,
-      split_trade_fees: false,
+      min_route_security: 0,
+      include_structures: true,
     },
   },
 
@@ -97,12 +151,12 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetRegionQuick",
     tab: "region",
     params: {
+      ...defaultScanPresetParams,
       min_margin: 10,
       buy_radius: 5,
       cargo_capacity: 5000,
-      sales_tax_percent: 8,
-      broker_fee_percent: 3,
-      split_trade_fees: false,
+      min_route_security: 0.45,
+      target_region: "",
     },
   },
   {
@@ -110,12 +164,13 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetRegionDeep",
     tab: "region",
     params: {
+      ...defaultScanPresetParams,
       min_margin: 3,
       buy_radius: 20,
       cargo_capacity: 60000,
-      sales_tax_percent: 8,
-      broker_fee_percent: 3,
-      split_trade_fees: false,
+      sell_radius: 20,
+      min_route_security: 0,
+      target_region: "",
     },
   },
 
@@ -125,10 +180,19 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetContractSafe",
     tab: "contracts",
     params: {
+      ...defaultScanPresetParams,
       min_contract_price: 50_000_000,
       max_contract_margin: 60,
       min_priced_ratio: 0.95,
       require_history: true,
+      contract_instant_liquidation: true,
+      contract_hold_days: 7,
+      contract_target_confidence: 90,
+      exclude_rigs_with_ship: true,
+      min_margin: 12,
+      buy_radius: 15,
+      sell_radius: 10,
+      min_route_security: 0.45,
     },
   },
   {
@@ -136,10 +200,18 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetContractNormal",
     tab: "contracts",
     params: {
+      ...defaultScanPresetParams,
       min_contract_price: 10_000_000,
       max_contract_margin: 100,
       min_priced_ratio: 0.8,
       require_history: false,
+      contract_instant_liquidation: false,
+      contract_hold_days: 7,
+      contract_target_confidence: 80,
+      exclude_rigs_with_ship: true,
+      min_margin: 5,
+      buy_radius: 10,
+      sell_radius: 10,
     },
   },
   {
@@ -147,10 +219,18 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetContractRisky",
     tab: "contracts",
     params: {
+      ...defaultScanPresetParams,
       min_contract_price: 1_000_000,
       max_contract_margin: 200,
       min_priced_ratio: 0.7,
       require_history: false,
+      contract_instant_liquidation: false,
+      contract_hold_days: 10,
+      contract_target_confidence: 70,
+      exclude_rigs_with_ship: true,
+      min_margin: 3,
+      buy_radius: 20,
+      sell_radius: 20,
     },
   },
 
@@ -160,9 +240,12 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetRouteHighsec",
     tab: "route",
     params: {
+      ...defaultScanPresetParams,
       min_route_security: 0.45,
       min_margin: 5,
       cargo_capacity: 5000,
+      route_min_hops: 2,
+      route_max_hops: 5,
     },
   },
   {
@@ -170,9 +253,12 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetRouteAllSpace",
     tab: "route",
     params: {
+      ...defaultScanPresetParams,
       min_route_security: 0,
       min_margin: 2,
       cargo_capacity: 60000,
+      route_min_hops: 2,
+      route_max_hops: 7,
     },
   },
 ];
@@ -185,18 +271,29 @@ export const STATION_BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetStConservative",
     tab: "station",
     params: {
+      selectedStationId: 0,
+      includeStructures: false,
       minMargin: 10,
       brokerFee: 3,
       salesTaxPercent: 8,
       splitTradeFees: false,
+      buyBrokerFeePercent: 3,
+      sellBrokerFeePercent: 3,
+      buySalesTaxPercent: 0,
+      sellSalesTaxPercent: 8,
       ctsProfile: "defensive",
+      radius: 0,
       minDailyVolume: 10,
       minItemProfit: 500_000,
       minDemandPerDay: 5,
+      minBfSPerDay: 0,
       avgPricePeriod: 90,
       minPeriodROI: 5,
+      bvsRatioMin: 0,
+      bvsRatioMax: 0,
       maxPVI: 30,
       maxSDS: 30,
+      limitBuyToPriceLow: false,
       flagExtremePrices: true,
     } satisfies Partial<StationTradingSettings>,
   },
@@ -205,18 +302,29 @@ export const STATION_BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetStNormal",
     tab: "station",
     params: {
+      selectedStationId: 0,
+      includeStructures: false,
       minMargin: 5,
       brokerFee: 3,
       salesTaxPercent: 8,
       splitTradeFees: false,
+      buyBrokerFeePercent: 3,
+      sellBrokerFeePercent: 3,
+      buySalesTaxPercent: 0,
+      sellSalesTaxPercent: 8,
       ctsProfile: "balanced",
+      radius: 0,
       minDailyVolume: 5,
       minItemProfit: 0,
       minDemandPerDay: 1,
+      minBfSPerDay: 0,
       avgPricePeriod: 90,
       minPeriodROI: 0,
+      bvsRatioMin: 0,
+      bvsRatioMax: 0,
       maxPVI: 0,
       maxSDS: 50,
+      limitBuyToPriceLow: false,
       flagExtremePrices: true,
     } satisfies Partial<StationTradingSettings>,
   },
@@ -225,18 +333,29 @@ export const STATION_BUILTIN_PRESETS: BuiltinPreset[] = [
     nameKey: "presetStAggressive",
     tab: "station",
     params: {
+      selectedStationId: 0,
+      includeStructures: false,
       minMargin: 2,
       brokerFee: 3,
       salesTaxPercent: 8,
       splitTradeFees: false,
+      buyBrokerFeePercent: 3,
+      sellBrokerFeePercent: 3,
+      buySalesTaxPercent: 0,
+      sellSalesTaxPercent: 8,
       ctsProfile: "aggressive",
+      radius: 0,
       minDailyVolume: 0,
       minItemProfit: 0,
       minDemandPerDay: 0,
+      minBfSPerDay: 0,
       avgPricePeriod: 30,
       minPeriodROI: 0,
+      bvsRatioMin: 0,
+      bvsRatioMax: 0,
       maxPVI: 0,
       maxSDS: 100,
+      limitBuyToPriceLow: false,
       flagExtremePrices: false,
     } satisfies Partial<StationTradingSettings>,
   },
@@ -250,6 +369,9 @@ const TAB_MAP: Record<string, PresetTab> = {
   contracts: "contracts",
   route: "route",
   station: "station",
+  industry: "industry",
+  demand: "demand",
+  plex: "plex",
 };
 
 export function mapTabToPresetTab(tab: string): PresetTab {
@@ -266,8 +388,47 @@ function loadAllCustomPresets(): SavedPreset[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw) as SavedPreset[];
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    let changed = false;
+    const normalized: SavedPreset[] = [];
+
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") {
+        changed = true;
+        continue;
+      }
+      const id = typeof item.id === "string" ? item.id.trim() : "";
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      const params =
+        item.params && typeof item.params === "object" && !Array.isArray(item.params)
+          ? { ...item.params }
+          : null;
+      if (!id || !name || !params) {
+        changed = true;
+        continue;
+      }
+
+      let tab: PresetTab = "flipper";
+      if (isPresetTab(item.tab)) {
+        tab = item.tab;
+      } else {
+        changed = true;
+      }
+
+      const createdAt =
+        typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+          ? item.createdAt
+          : undefined;
+
+      normalized.push({ id, name, tab, params, createdAt });
+    }
+
+    if (changed) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    }
+    return normalized;
   } catch {
     return [];
   }
@@ -277,8 +438,7 @@ export function loadCustomPresets(tab?: string): SavedPreset[] {
   const all = loadAllCustomPresets();
   if (!tab) return all;
   const presetTab = mapTabToPresetTab(tab);
-  // Show presets for this tab + legacy presets (those saved before tab-awareness)
-  return all.filter((p) => p.tab === presetTab || !p.tab);
+  return all.filter((p) => p.tab === presetTab);
 }
 
 export function saveCustomPreset(preset: SavedPreset): void {
@@ -320,12 +480,28 @@ export function importPresets(
     const existingIds = new Set(existing.map((p) => p.id));
     let imported = 0;
     for (const item of parsed) {
-      if (!item.id || !item.name || !item.params) continue;
-      if (existingIds.has(item.id)) {
-        const idx = existing.findIndex((p) => p.id === item.id);
-        if (idx >= 0) existing[idx] = item;
+      if (!item || typeof item !== "object") continue;
+      const id = typeof item.id === "string" ? item.id.trim() : "";
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      const params =
+        item.params && typeof item.params === "object" && !Array.isArray(item.params)
+          ? { ...item.params }
+          : null;
+      if (!id || !name || !params) continue;
+
+      const tab: PresetTab = isPresetTab(item.tab) ? item.tab : "flipper";
+      const createdAt =
+        typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+          ? item.createdAt
+          : undefined;
+      const normalized: SavedPreset = { id, name, tab, params, createdAt };
+
+      if (existingIds.has(id)) {
+        const idx = existing.findIndex((p) => p.id === id);
+        if (idx >= 0) existing[idx] = normalized;
       } else {
-        existing.push(item);
+        existing.push(normalized);
+        existingIds.add(id);
       }
       imported++;
     }

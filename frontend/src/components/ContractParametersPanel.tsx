@@ -94,7 +94,7 @@ export function ContractParametersPanel({ params, onChange }: Props) {
 
         <SettingsField label={t("excludeRigsWithShip")}>
           <SettingsCheckbox
-            checked={params.exclude_rigs_with_ship ?? false}
+            checked={params.exclude_rigs_with_ship ?? true}
             onChange={(v) => set("exclude_rigs_with_ship", v)}
           />
         </SettingsField>
