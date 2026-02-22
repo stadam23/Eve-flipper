@@ -335,6 +335,40 @@
   scroll-behavior: smooth;
 }
 
+/* Explicit themed scrollbar for inner panels/tables (Windows-friendly). */
+.eve-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--eve-scrollbar-thumb) var(--eve-scrollbar-track);
+}
+
+.eve-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.eve-scrollbar::-webkit-scrollbar-track {
+  background: var(--eve-scrollbar-track);
+  border-left: 1px solid rgb(var(--eve-border));
+}
+
+.eve-scrollbar::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    var(--eve-scrollbar-thumb) 0%,
+    var(--eve-scrollbar-thumb-hover) 100%
+  );
+  border: 2px solid var(--eve-scrollbar-track);
+  border-radius: 6px;
+}
+
+.eve-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--eve-scrollbar-thumb-hover);
+}
+
+.eve-scrollbar::-webkit-scrollbar-corner {
+  background: var(--eve-scrollbar-track);
+}
+
 /* Gradient fade on right edge to hint horizontal scroll */
 .table-scroll-wrapper::after {
   content: "";
@@ -393,4 +427,293 @@
 
 .discord-icon-animated {
   animation: discord-pulse 360s ease-in-out infinite;
+}
+
+/* ===================================================================
+   Station AI chat surface (visually separated from dashboard)
+   =================================================================== */
+
+.ai-chat-window {
+  border-color: rgb(var(--eve-accent) / 0.36);
+  background:
+    radial-gradient(circle at 16% -4%, rgb(var(--eve-accent) / 0.18), transparent 42%),
+    linear-gradient(180deg, rgb(var(--eve-panel) / 0.98), rgb(var(--eve-dark) / 0.96));
+  box-shadow:
+    0 22px 46px rgb(0 0 0 / 0.46),
+    0 0 0 1px rgb(var(--eve-border-light) / 0.64),
+    inset 0 1px 0 rgb(var(--eve-border-light) / 0.2);
+}
+
+.ai-chat-header {
+  border-bottom-color: rgb(var(--eve-accent) / 0.28);
+  background:
+    linear-gradient(180deg, rgb(var(--eve-panel-hover) / 0.92), rgb(var(--eve-panel) / 0.82));
+}
+
+.ai-chat-sidebar {
+  border-color: rgb(var(--eve-border-light) / 0.58);
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.78), rgb(var(--eve-panel) / 0.56));
+}
+
+.ai-chat-main {
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.64), rgb(var(--eve-panel) / 0.5));
+}
+
+.ai-chat-context-strip {
+  border-bottom-color: rgb(var(--eve-border-light) / 0.54);
+  background: rgb(var(--eve-dark) / 0.46);
+}
+
+.ai-chat-progress-panel {
+  border-bottom-color: rgb(var(--eve-border-light) / 0.5);
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.54), rgb(var(--eve-dark) / 0.34));
+}
+
+.ai-chat-thread {
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.26), rgb(var(--eve-dark) / 0.14));
+}
+
+.ai-chat-bubble {
+  box-shadow:
+    inset 0 1px 0 rgb(var(--eve-border-light) / 0.08);
+}
+
+.ai-chat-bubble--assistant {
+  border-color: rgb(var(--eve-accent) / 0.52);
+  background:
+    linear-gradient(
+      180deg,
+      rgb(var(--eve-accent) / 0.16),
+      rgb(var(--eve-accent-dim) / 0.08)
+    );
+}
+
+.ai-chat-bubble--user {
+  border-color: rgb(var(--eve-border-light) / 0.66);
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.82), rgb(var(--eve-panel) / 0.66));
+}
+
+.ai-chat-footer {
+  border-top-color: rgb(var(--eve-border-light) / 0.58);
+  background: rgb(var(--eve-dark) / 0.42);
+}
+
+.ai-chat-composer-shell {
+  border-color: rgb(var(--eve-border-light) / 0.64);
+  background:
+    linear-gradient(180deg, rgb(var(--eve-panel) / 0.78), rgb(var(--eve-dark) / 0.62));
+}
+
+.ai-chat-input {
+  border-color: rgb(var(--eve-border-light) / 0.72);
+  background: rgb(var(--eve-input) / 0.84);
+}
+
+.ai-chat-input:focus {
+  border-color: rgb(var(--eve-accent) / 0.68);
+  box-shadow:
+    0 0 0 1px rgb(var(--eve-accent) / 0.36),
+    0 0 18px rgb(var(--eve-accent) / 0.14);
+}
+
+.ai-chat-tools-popover {
+  border-color: rgb(var(--eve-accent) / 0.38);
+  background:
+    linear-gradient(180deg, rgb(var(--eve-panel) / 0.98), rgb(var(--eve-dark) / 0.92));
+  box-shadow:
+    0 16px 30px rgb(0 0 0 / 0.44),
+    0 0 0 1px rgb(var(--eve-border-light) / 0.5);
+}
+
+[data-mode="light"] .ai-chat-window {
+  box-shadow:
+    0 16px 36px rgb(20 22 28 / 0.22),
+    0 0 0 1px rgb(var(--eve-border-light) / 0.7),
+    inset 0 1px 0 rgb(255 255 255 / 0.74);
+}
+
+[data-mode="light"] .ai-chat-thread {
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.58), rgb(var(--eve-dark) / 0.4));
+}
+
+[data-mode="light"] .ai-chat-bubble--user {
+  background:
+    linear-gradient(180deg, rgb(var(--eve-dark) / 0.74), rgb(var(--eve-dark) / 0.58));
+}
+
+/* ===================================================================
+   Ivy AI mascot (pixel-art header sprite)
+   =================================================================== */
+
+.ai-ivy-mascot {
+  --ivy-pixel-size: 3px;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  border: 1px solid rgb(var(--eve-border-light));
+  background:
+    radial-gradient(circle at 35% 25%, rgb(var(--eve-accent) / 0.22), transparent 56%),
+    linear-gradient(180deg, rgb(var(--eve-panel-hover)), rgb(var(--eve-dark)));
+  box-shadow:
+    inset 0 0 0 1px rgb(var(--eve-border) / 0.75),
+    0 0 14px rgb(var(--eve-accent) / 0.18);
+  animation: ivy-float 2.3s steps(2, end) infinite;
+  transition: filter 140ms linear, box-shadow 140ms linear;
+}
+
+.ai-ivy-mascot--thinking {
+  animation-duration: 1.2s;
+  box-shadow:
+    inset 0 0 0 1px rgb(var(--eve-border) / 0.75),
+    0 0 16px rgb(var(--eve-accent) / 0.25);
+}
+
+.ai-ivy-mascot-grid {
+  width: calc(var(--ivy-pixel-size) * 12);
+  height: calc(var(--ivy-pixel-size) * 12);
+  display: grid;
+  grid-template-columns: repeat(12, var(--ivy-pixel-size));
+  grid-template-rows: repeat(12, var(--ivy-pixel-size));
+  image-rendering: pixelated;
+}
+
+.ai-ivy-pixel {
+  width: var(--ivy-pixel-size);
+  height: var(--ivy-pixel-size);
+}
+
+.ai-ivy-pixel--o {
+  background: rgb(var(--eve-border-light));
+}
+
+.ai-ivy-pixel--b {
+  background: rgb(var(--eve-accent-dim));
+}
+
+.ai-ivy-pixel--g {
+  background: rgb(var(--eve-accent));
+}
+
+.ai-ivy-pixel--a {
+  background: rgb(var(--eve-accent-hover));
+}
+
+.ai-ivy-pixel--e {
+  background: rgb(var(--eve-dark));
+}
+
+.ai-ivy-pixel--eye {
+  transform-origin: center;
+  animation: ivy-blink 4.4s steps(1, end) infinite;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .ai-ivy-mascot:hover {
+    filter: saturate(1.25);
+    box-shadow:
+      inset 0 0 0 1px rgb(var(--eve-border) / 0.75),
+      0 0 18px rgb(var(--eve-accent) / 0.35);
+    animation: ivy-hover-bob 0.55s steps(2, end) infinite;
+  }
+
+  .ai-ivy-mascot:hover .ai-ivy-mascot-grid {
+    animation: ivy-hover-jitter 460ms steps(2, end) infinite;
+  }
+
+  .ai-ivy-mascot:hover .ai-ivy-pixel--eye {
+    animation: ivy-eye-dart 720ms steps(2, end) infinite;
+  }
+
+  .ai-ivy-mascot:hover .ai-ivy-pixel--mouth {
+    animation: ivy-mouth-talk 380ms steps(2, end) infinite;
+  }
+}
+
+@keyframes ivy-float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes ivy-blink {
+  0%, 92%, 100% {
+    transform: scaleY(1);
+  }
+  94%, 96% {
+    transform: scaleY(0.2);
+  }
+}
+
+@keyframes ivy-hover-bob {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes ivy-hover-jitter {
+  0%, 100% {
+    transform: translate(0, 0);
+  }
+  25% {
+    transform: translate(1px, 0);
+  }
+  50% {
+    transform: translate(0, -1px);
+  }
+  75% {
+    transform: translate(-1px, 0);
+  }
+}
+
+@keyframes ivy-eye-dart {
+  0%, 100% {
+    transform: scaleY(1) translateX(0);
+  }
+  20% {
+    transform: scaleY(1) translateX(-1px);
+  }
+  40% {
+    transform: scaleY(1) translateX(1px);
+  }
+  60% {
+    transform: scaleY(0.2);
+  }
+  80% {
+    transform: scaleY(1) translateX(0);
+  }
+}
+
+@keyframes ivy-mouth-talk {
+  0%, 100% {
+    transform: scaleY(1);
+    filter: brightness(1);
+  }
+  50% {
+    transform: scaleY(0.35);
+    filter: brightness(1.45);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-ivy-mascot,
+  .ai-ivy-pixel--eye,
+  .ai-ivy-pixel--mouth,
+  .ai-ivy-mascot-grid {
+    animation: none;
+  }
 }

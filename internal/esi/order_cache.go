@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type orderCacheEntry struct {
 	orders  []MarketOrder
 	etag    string    // ETag from ESI response (page 1)
 	expires time.Time // parsed Expires header
+	updated time.Time // when entry was last refreshed (MISS or 304)
 }
 
 // OrderCache is a thread-safe in-memory cache for region market orders.
@@ -32,11 +34,36 @@ type OrderCache struct {
 	group   singleflight.Group
 }
 
+// OrderCacheWindow describes freshness bounds for a set of region cache entries.
+type OrderCacheWindow struct {
+	CurrentRevision int64
+	LastRefreshAt   time.Time
+	NextExpiryAt    time.Time
+	MinTTLSeconds   int64
+	MaxTTLSeconds   int64
+	Regions         int
+	Entries         int
+	Stale           bool
+}
+
 // NewOrderCache creates an empty order cache.
 func NewOrderCache() *OrderCache {
 	return &OrderCache{
 		entries: make(map[orderCacheKey]*orderCacheEntry),
 	}
+}
+
+// Clear removes all cached region order entries.
+// Returns number of entries removed.
+func (oc *OrderCache) Clear() int {
+	if oc == nil {
+		return 0
+	}
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
+	n := len(oc.entries)
+	oc.entries = make(map[orderCacheKey]*orderCacheEntry)
+	return n
 }
 
 // EvictExpired removes all cache entries whose Expires time has passed.
@@ -97,6 +124,7 @@ func (oc *OrderCache) Put(regionID int32, orderType string, orders []MarketOrder
 		orders:  orders,
 		etag:    etag,
 		expires: expires,
+		updated: time.Now().UTC(),
 	}
 }
 
@@ -108,7 +136,99 @@ func (oc *OrderCache) Touch(regionID int32, orderType string, expires time.Time)
 	key := orderCacheKey{regionID, orderType}
 	if e, ok := oc.entries[key]; ok {
 		e.expires = expires
+		e.updated = time.Now().UTC()
 	}
+}
+
+// WindowForRegions returns cache freshness bounds for the provided region IDs.
+func (oc *OrderCache) WindowForRegions(regionIDs []int32, orderType string) OrderCacheWindow {
+	window := OrderCacheWindow{
+		Regions: len(regionIDs),
+	}
+	if len(regionIDs) == 0 {
+		return window
+	}
+	orderType = strings.ToLower(strings.TrimSpace(orderType))
+	orderTypes := []string{orderType}
+	if orderType == "" || orderType == "all" {
+		orderTypes = []string{"sell", "buy"}
+	}
+
+	now := time.Now()
+	oc.mu.RLock()
+	defer oc.mu.RUnlock()
+
+	seen := make(map[int32]bool, len(regionIDs))
+	found := false
+	var maxExpiry time.Time
+	for _, regionID := range regionIDs {
+		if seen[regionID] {
+			continue
+		}
+		seen[regionID] = true
+		for _, ot := range orderTypes {
+			entry, ok := oc.entries[orderCacheKey{RegionID: regionID, OrderType: ot}]
+			if !ok || entry == nil {
+				continue
+			}
+			window.Entries++
+			if !found {
+				found = true
+				window.NextExpiryAt = entry.expires
+				window.LastRefreshAt = entry.updated
+				maxExpiry = entry.expires
+				continue
+			}
+			if entry.expires.Before(window.NextExpiryAt) {
+				window.NextExpiryAt = entry.expires
+			}
+			if entry.expires.After(maxExpiry) {
+				maxExpiry = entry.expires
+			}
+			if entry.updated.After(window.LastRefreshAt) {
+				window.LastRefreshAt = entry.updated
+			}
+		}
+	}
+
+	if !found || window.NextExpiryAt.IsZero() {
+		return window
+	}
+	if maxExpiry.IsZero() {
+		maxExpiry = window.NextExpiryAt
+	}
+
+	minTTL := int64(time.Until(window.NextExpiryAt).Seconds())
+	maxTTL := int64(time.Until(maxExpiry).Seconds())
+	if minTTL < 0 {
+		minTTL = 0
+	}
+	if maxTTL < 0 {
+		maxTTL = 0
+	}
+
+	window.MinTTLSeconds = minTTL
+	window.MaxTTLSeconds = maxTTL
+	window.CurrentRevision = window.NextExpiryAt.Unix()
+	window.Stale = now.After(window.NextExpiryAt)
+	return window
+}
+
+// OrderCacheWindow returns cache freshness bounds for regions/order type.
+func (c *Client) OrderCacheWindow(regionIDs []int32, orderType string) OrderCacheWindow {
+	if c == nil || c.orderCache == nil {
+		return OrderCacheWindow{Regions: len(regionIDs)}
+	}
+	return c.orderCache.WindowForRegions(regionIDs, orderType)
+}
+
+// ClearOrderCache clears all region order cache entries.
+// Returns number of entries removed.
+func (c *Client) ClearOrderCache() int {
+	if c == nil || c.orderCache == nil {
+		return 0
+	}
+	return c.orderCache.Clear()
 }
 
 // FetchRegionOrdersCached fetches region orders with full caching support:

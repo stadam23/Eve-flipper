@@ -1,4 +1,4 @@
-import type { AlertHistoryEntry, AppConfig, AppStatus, AuthStatus, CharacterInfo, CharacterRoles, ContractDetails, ContractResult, CorpDashboard, CorpIndustryJob, CorpJournalEntry, CorpMarketOrderDetail, CorpMember, CorpMiningEntry, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, OptimizerDiagnostic, OrderDeskResponse, PLEXDashboard, PortfolioPnL, PortfolioOptimization, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationInfo, StationsResponse, StationTrade, UndercutStatus, WatchlistItem } from "./types";
+import type { AlertHistoryEntry, AppConfig, AppStatus, AuthStatus, CharacterInfo, CharacterRoles, ContractDetails, ContractResult, CorpDashboard, CorpIndustryJob, CorpJournalEntry, CorpMarketOrderDetail, CorpMember, CorpMiningEntry, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, OptimizerDiagnostic, OrderDeskResponse, PLEXDashboard, PortfolioPnL, PortfolioOptimization, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationAIChatRequest, StationAIChatResponse, StationAIStreamMessage, StationCacheMeta, StationCommandResponse, StationInfo, StationsResponse, StationTrade, StationTradeState, StationTradeStateMode, UndercutStatus, WatchlistItem } from "./types";
 
 const BASE = import.meta.env.VITE_API_URL || "";
 
@@ -20,7 +20,7 @@ async function handleResponse<T>(res: Response): Promise<T> {
 // Generic NDJSON message type
 type NdjsonGenericMessage<T> =
   | { type: "progress"; message: string }
-  | { type: "result"; data: T[]; count?: number }
+  | { type: "result"; data: T[]; count?: number; scan_id?: number; cache_meta?: StationCacheMeta }
   | { type: "error"; message: string };
 
 // Generic NDJSON streaming helper to eliminate code duplication
@@ -29,7 +29,8 @@ async function streamNdjson<T>(
   body: object,
   onProgress: (msg: string) => void,
   signal?: AbortSignal,
-  errorMessage = "Request failed"
+  errorMessage = "Request failed",
+  onResult?: (msg: Extract<NdjsonGenericMessage<T>, { type: "result" }>) => void
 ): Promise<T[]> {
   const res = await fetch(url, {
     method: "POST",
@@ -72,6 +73,7 @@ async function streamNdjson<T>(
         onProgress(msg.message);
       } else if (msg.type === "result") {
         results = msg.data ?? [];
+        onResult?.(msg);
       } else if (msg.type === "error") {
         throw new Error(msg.message);
       }
@@ -81,7 +83,10 @@ async function streamNdjson<T>(
   // Handle remaining buffer
   if (buffer.trim()) {
     const msg = JSON.parse(buffer) as NdjsonGenericMessage<T>;
-    if (msg.type === "result") results = msg.data ?? [];
+    if (msg.type === "result") {
+      results = msg.data ?? [];
+      onResult?.(msg);
+    }
     else if (msg.type === "error") throw new Error(msg.message);
   }
 
@@ -131,25 +136,49 @@ export async function autocompleteRegion(query: string): Promise<string[]> {
 export async function scan(
   params: ScanParams,
   onProgress: (msg: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onMeta?: (meta: StationCacheMeta | undefined) => void
 ): Promise<FlipResult[]> {
-  return streamNdjson<FlipResult>(`${BASE}/api/scan`, params, onProgress, signal, "Scan failed");
+  return streamNdjson<FlipResult>(
+    `${BASE}/api/scan`,
+    params,
+    onProgress,
+    signal,
+    "Scan failed",
+    (msg) => onMeta?.(msg.cache_meta),
+  );
 }
 
 export async function scanMultiRegion(
   params: ScanParams,
   onProgress: (msg: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onMeta?: (meta: StationCacheMeta | undefined) => void
 ): Promise<FlipResult[]> {
-  return streamNdjson<FlipResult>(`${BASE}/api/scan/multi-region`, params, onProgress, signal, "Multi-region scan failed");
+  return streamNdjson<FlipResult>(
+    `${BASE}/api/scan/multi-region`,
+    params,
+    onProgress,
+    signal,
+    "Multi-region scan failed",
+    (msg) => onMeta?.(msg.cache_meta),
+  );
 }
 
 export async function scanContracts(
   params: ScanParams,
   onProgress: (msg: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onMeta?: (meta: StationCacheMeta | undefined) => void
 ): Promise<ContractResult[]> {
-  return streamNdjson<ContractResult>(`${BASE}/api/scan/contracts`, params, onProgress, signal, "Contract scan failed");
+  return streamNdjson<ContractResult>(
+    `${BASE}/api/scan/contracts`,
+    params,
+    onProgress,
+    signal,
+    "Contract scan failed",
+    (msg) => onMeta?.(msg.cache_meta),
+  );
 }
 
 export async function findRoutes(
@@ -313,9 +342,200 @@ export async function scanStation(
     structure_ids?: number[];
   },
   onProgress: (msg: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onMeta?: (meta: StationCacheMeta | undefined) => void
 ): Promise<StationTrade[]> {
-  return streamNdjson<StationTrade>(`${BASE}/api/scan/station`, params, onProgress, signal, "Station scan failed");
+  return streamNdjson<StationTrade>(
+    `${BASE}/api/scan/station`,
+    params,
+    onProgress,
+    signal,
+    "Station scan failed",
+    (msg) => onMeta?.(msg.cache_meta),
+  );
+}
+
+export interface StationTradeStatesResponse {
+  tab: string;
+  pruned?: number;
+  states: StationTradeState[];
+}
+
+export async function getStationTradeStates(params?: {
+  tab?: string;
+  currentRevision?: number;
+}): Promise<StationTradeStatesResponse> {
+  const qp = new URLSearchParams();
+  if (params?.tab) qp.set("tab", params.tab);
+  if (params?.currentRevision != null) {
+    qp.set("current_revision", String(params.currentRevision));
+  }
+  const qs = qp.toString();
+  const res = await fetch(`${BASE}/api/auth/station/trade-states${qs ? `?${qs}` : ""}`);
+  const data = await handleResponse<StationTradeStatesResponse>(res);
+  return {
+    ...data,
+    states: Array.isArray(data.states) ? data.states : [],
+  };
+}
+
+export async function setStationTradeState(params: {
+  tab?: string;
+  type_id: number;
+  station_id: number;
+  region_id?: number;
+  mode: StationTradeStateMode;
+  until_revision?: number;
+}): Promise<{ ok: boolean }> {
+  const res = await fetch(`${BASE}/api/auth/station/trade-states/set`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  return handleResponse<{ ok: boolean }>(res);
+}
+
+export async function deleteStationTradeStates(params: {
+  tab?: string;
+  keys: Array<{
+    type_id: number;
+    station_id: number;
+    region_id?: number;
+  }>;
+}): Promise<{ ok: boolean; deleted: number }> {
+  const res = await fetch(`${BASE}/api/auth/station/trade-states/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  return handleResponse<{ ok: boolean; deleted: number }>(res);
+}
+
+export async function clearStationTradeStates(params?: {
+  tab?: string;
+  mode?: StationTradeStateMode;
+}): Promise<{ ok: boolean; deleted: number }> {
+  const res = await fetch(`${BASE}/api/auth/station/trade-states/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params ?? {}),
+  });
+  return handleResponse<{ ok: boolean; deleted: number }>(res);
+}
+
+export async function rebootStationCache(): Promise<{
+  ok: boolean;
+  cleared: number;
+  rebooted_at?: string;
+}> {
+  const res = await fetch(`${BASE}/api/auth/station/cache/reboot`, {
+    method: "POST",
+  });
+  return handleResponse<{ ok: boolean; cleared: number; rebooted_at?: string }>(res);
+}
+
+export async function stationAIChat(
+  payload: StationAIChatRequest,
+): Promise<StationAIChatResponse> {
+  const res = await fetch(`${BASE}/api/auth/station/ai/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<StationAIChatResponse>(res);
+}
+
+export async function stationAIChatStream(
+  payload: StationAIChatRequest,
+  handlers: {
+    onProgress?: (msg: Extract<StationAIStreamMessage, { type: "progress" }>) => void;
+    onDelta?: (msg: Extract<StationAIStreamMessage, { type: "delta" }>) => void;
+    onUsage?: (msg: Extract<StationAIStreamMessage, { type: "usage" }>) => void;
+    onResult?: (msg: Extract<StationAIStreamMessage, { type: "result" }>) => void;
+  },
+  signal?: AbortSignal,
+): Promise<StationAIChatResponse> {
+  const res = await fetch(`${BASE}/api/auth/station/ai/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!res.ok) {
+    let errMsg = "Station AI stream failed";
+    try {
+      const err = await res.json();
+      errMsg = err.error || err.message || errMsg;
+    } catch {
+      // ignore non-json error body
+    }
+    throw new Error(errMsg);
+  }
+  if (!res.body) {
+    throw new Error("Response body is null");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResult: StationAIChatResponse | null = null;
+
+  const handleLine = (line: string) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line) as StationAIStreamMessage;
+    if (msg.type === "progress") {
+      handlers.onProgress?.(msg);
+      return;
+    }
+    if (msg.type === "delta") {
+      handlers.onDelta?.(msg);
+      return;
+    }
+    if (msg.type === "usage") {
+      handlers.onUsage?.(msg);
+      return;
+    }
+    if (msg.type === "result") {
+      handlers.onResult?.(msg);
+      finalResult = {
+        answer: msg.answer,
+        provider: msg.provider,
+        model: msg.model,
+        assistant: msg.assistant,
+        intent: msg.intent,
+        pipeline: msg.pipeline,
+        warnings: msg.warnings,
+        provider_id: msg.provider_id,
+        provider_usage: msg.provider_usage,
+        usage: msg.usage,
+      };
+      return;
+    }
+    if (msg.type === "error") {
+      throw new Error(msg.message || "Station AI stream failed");
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      handleLine(line);
+    }
+  }
+
+  if (buffer.trim()) {
+    handleLine(buffer);
+  }
+  if (!finalResult) {
+    throw new Error("AI stream finished without final result");
+  }
+  return finalResult;
 }
 
 // --- Scan History ---
@@ -441,6 +661,54 @@ export async function getOrderDesk(params?: OrderDeskParams): Promise<OrderDeskR
   const qs = qp.toString();
   const res = await fetch(`${BASE}/api/auth/orders/desk${qs ? `?${qs}` : ""}`);
   return handleResponse<OrderDeskResponse>(res);
+}
+
+export interface StationCommandParams {
+  station_id?: number;
+  region_id?: number;
+  system_name?: string;
+  radius?: number;
+  min_margin?: number;
+  sales_tax_percent?: number;
+  broker_fee?: number;
+  cts_profile?: string;
+  split_trade_fees?: boolean;
+  buy_broker_fee_percent?: number;
+  sell_broker_fee_percent?: number;
+  buy_sales_tax_percent?: number;
+  sell_sales_tax_percent?: number;
+  min_daily_volume?: number;
+  min_item_profit?: number;
+  min_demand_per_day?: number;
+  min_s2b_per_day?: number;
+  min_bfs_per_day?: number;
+  avg_price_period?: number;
+  min_period_roi?: number;
+  bvs_ratio_min?: number;
+  bvs_ratio_max?: number;
+  max_pvi?: number;
+  max_sds?: number;
+  limit_buy_to_price_low?: boolean;
+  flag_extreme_prices?: boolean;
+  include_structures?: boolean;
+  structure_ids?: number[];
+  target_eta_days?: number;
+  lookback_days?: number;
+  max_results?: number;
+  characterId?: CharacterScope;
+}
+
+export async function getStationCommand(params: StationCommandParams): Promise<StationCommandResponse> {
+  const { characterId, ...body } = params;
+  const qp = new URLSearchParams();
+  appendCharacterScope(qp, characterId);
+  const qs = qp.toString();
+  const res = await fetch(`${BASE}/api/auth/station/command${qs ? `?${qs}` : ""}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<StationCommandResponse>(res);
 }
 
 export interface PortfolioPnLParams {

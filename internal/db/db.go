@@ -889,6 +889,29 @@ func (d *DB) migrate() error {
 		logger.Info("DB", "Applied migration v23 (station_results daily volume/item volume split)")
 	}
 
+	if version < 24 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS user_trade_state (
+				user_id        TEXT NOT NULL,
+				tab            TEXT NOT NULL,
+				type_id        INTEGER NOT NULL,
+				station_id     INTEGER NOT NULL,
+				region_id      INTEGER NOT NULL DEFAULT 0,
+				mode           TEXT NOT NULL,
+				until_revision INTEGER NOT NULL DEFAULT 0,
+				updated_at     TEXT NOT NULL,
+				PRIMARY KEY (user_id, tab, type_id, station_id, region_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_trade_state_user_tab ON user_trade_state(user_id, tab, updated_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_trade_state_user_mode ON user_trade_state(user_id, tab, mode, updated_at DESC);
+			INSERT OR IGNORE INTO schema_version (version) VALUES (24);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v24: %w", err)
+		}
+		logger.Info("DB", "Applied migration v24 (user trade-state persistence)")
+	}
+
 	return nil
 }
 

@@ -20,6 +20,10 @@ landing/
 
 # SDE data cache (large, auto-downloaded)
 /data/
+# Station AI wiki RAG mirror/index artifacts (generated)
+/data/wiki-rag/
+/tmp/wiki-rag/
+/internal/api/data/wiki-rag/
 
 # SQLite database files
 flipper.db
@@ -77,3 +81,5 @@ desktop.ini
 frontend/.env
 frontend/.env.local
 NUL
+tmp_ai_server.log
+tmp_ai_server.err

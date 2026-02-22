@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -8,6 +9,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +18,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"eve-flipper/internal/auth"
 	"eve-flipper/internal/config"
@@ -45,6 +52,7 @@ type Server struct {
 	sessions         *auth.SessionStore
 	mu               sync.RWMutex
 	ready            bool
+	wikiRAG          *stationAIWikiRAG
 
 	// SSO state: map of CSRF state tokens → (expiry, desktop flag).
 	// Supports concurrent login flows from multiple tabs.
@@ -88,10 +96,215 @@ const userIDCookieName = "eveflipper_uid"
 const userIDCookieMaxAge = 365 * 24 * 60 * 60
 const userIDCookieSignatureBytes = 16
 const userIDCookieSecretMetaKey = "user_cookie_secret_v1"
+const defaultStationAIWikiRepo = "ilyaux/Eve-flipper"
+const defaultStationAIPlannerModel = ""
+const aiWikiCacheTTL = 30 * time.Minute
+const aiWikiErrorCacheTTL = 90 * time.Second
+const stationAIWebMaxQueries = 3
+const stationAIWebMaxSnippets = 4
+const stationAIRuntimeTopItems = 5
+const stationAIRuntimeTxnWindowDays = 30
+const stationAIHistoryMaxMessages = 16
+const stationAIStreamHTTPTimeout = 12 * time.Minute
+const stationAIWikiWebhookSecretEnv = "STATION_AI_WIKI_WEBHOOK_SECRET"
+const stationAIWikiWebhookRefreshTimeout = 2 * time.Minute
+const stationAIMaxTokensLimit = 1_000_000
 
 type contextKey string
 
 const userIDContextKey contextKey = "user_id"
+
+var aiRepoPartRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+type aiWikiCacheEntry struct {
+	Body      string
+	URL       string
+	FetchedAt time.Time
+	Err       string
+}
+
+type aiKnowledgeSnippet struct {
+	SourceLabel  string
+	Title        string
+	Page         string
+	Section      string
+	Locale       string
+	URL          string
+	Content      string
+	Score        int
+	VectorScore  float64
+	KeywordScore float64
+	HybridScore  float64
+}
+
+type stationAIContextSummary struct {
+	TotalRows      int     `json:"total_rows"`
+	VisibleRows    int     `json:"visible_rows"`
+	HighRiskRows   int     `json:"high_risk_rows"`
+	ExtremeRows    int     `json:"extreme_rows"`
+	AverageCTS     float64 `json:"avg_cts"`
+	AverageMargin  float64 `json:"avg_margin"`
+	AverageProfit  float64 `json:"avg_daily_profit"`
+	AverageVolume  float64 `json:"avg_daily_volume"`
+	ActionableRows int     `json:"actionable_rows"`
+}
+
+type stationAIRuntimeItemFlow struct {
+	TypeID      int32   `json:"type_id"`
+	TypeName    string  `json:"type_name"`
+	Trades      int     `json:"trades"`
+	Volume      int64   `json:"volume"`
+	TurnoverISK float64 `json:"turnover_isk"`
+}
+
+type stationAIRuntimeContext struct {
+	Available             bool                         `json:"available"`
+	CharacterID           int64                        `json:"character_id"`
+	CharacterName         string                       `json:"character_name"`
+	WalletAvailable       bool                         `json:"wallet_available"`
+	WalletISK             float64                      `json:"wallet_isk"`
+	OrdersAvailable       bool                         `json:"orders_available"`
+	ActiveOrders          int                          `json:"active_orders"`
+	BuyOrders             int                          `json:"buy_orders"`
+	SellOrders            int                          `json:"sell_orders"`
+	OpenOrderNotionalISK  float64                      `json:"open_order_notional_isk"`
+	TransactionsAvailable bool                         `json:"transactions_available"`
+	TransactionCount      int                          `json:"transactions_count"`
+	TxnWindowDays         int                          `json:"txn_window_days"`
+	BuyFlowISK            float64                      `json:"buy_flow_isk"`
+	SellFlowISK           float64                      `json:"sell_flow_isk"`
+	NetFlowISK            float64                      `json:"net_flow_isk"`
+	TopItems              []stationAIRuntimeItemFlow   `json:"top_items,omitempty"`
+	Risk                  *engine.PortfolioRiskSummary `json:"risk,omitempty"`
+	Notes                 []string                     `json:"notes,omitempty"`
+	FetchedAt             string                       `json:"fetched_at"`
+}
+
+type stationAIContextRow struct {
+	TypeID       int32   `json:"type_id"`
+	TypeName     string  `json:"type_name"`
+	StationName  string  `json:"station_name"`
+	CTS          float64 `json:"cts"`
+	Margin       float64 `json:"margin_percent"`
+	DailyProfit  float64 `json:"daily_profit"`
+	DailyVolume  float64 `json:"daily_volume"`
+	S2BBfSRatio  float64 `json:"s2b_bfs_ratio"`
+	Action       string  `json:"action"`
+	Reason       string  `json:"reason"`
+	Confidence   string  `json:"confidence"`
+	HighRisk     bool    `json:"high_risk"`
+	ExtremePrice bool    `json:"extreme_price"`
+}
+
+type stationAIScanSnapshot struct {
+	ScopeMode           string  `json:"scope_mode"`
+	SystemName          string  `json:"system_name"`
+	RegionID            int32   `json:"region_id"`
+	StationID           int64   `json:"station_id"`
+	Radius              int     `json:"radius"`
+	MinMargin           float64 `json:"min_margin"`
+	SalesTaxPercent     float64 `json:"sales_tax_percent"`
+	BrokerFee           float64 `json:"broker_fee"`
+	SplitTradeFees      bool    `json:"split_trade_fees"`
+	BuyBrokerFee        float64 `json:"buy_broker_fee_percent"`
+	SellBrokerFee       float64 `json:"sell_broker_fee_percent"`
+	BuySalesTaxPercent  float64 `json:"buy_sales_tax_percent"`
+	SellSalesTaxPercent float64 `json:"sell_sales_tax_percent"`
+	CTSProfile          string  `json:"cts_profile"`
+	MinDailyVolume      int64   `json:"min_daily_volume"`
+	MinItemProfit       float64 `json:"min_item_profit"`
+	MinS2BPerDay        float64 `json:"min_s2b_per_day"`
+	MinBfSPerDay        float64 `json:"min_bfs_per_day"`
+	AvgPricePeriod      int     `json:"avg_price_period"`
+	MinPeriodROI        float64 `json:"min_period_roi"`
+	BVSRatioMin         float64 `json:"bvs_ratio_min"`
+	BVSRatioMax         float64 `json:"bvs_ratio_max"`
+	MaxPVI              float64 `json:"max_pvi"`
+	MaxSDS              float64 `json:"max_sds"`
+	LimitBuyToPriceLow  bool    `json:"limit_buy_to_price_low"`
+	FlagExtremePrices   bool    `json:"flag_extreme_prices"`
+	IncludeStructures   bool    `json:"include_structures"`
+	StructuresApplied   bool    `json:"structures_applied"`
+	StructureCount      int     `json:"structure_count"`
+	StructureIDs        []int64 `json:"structure_ids"`
+}
+
+type stationAIContextPayload struct {
+	TabID          string                   `json:"tab_id"`
+	TabTitle       string                   `json:"tab_title"`
+	SystemName     string                   `json:"system_name"`
+	StationScope   string                   `json:"station_scope"`
+	RegionID       int32                    `json:"region_id"`
+	StationID      int64                    `json:"station_id"`
+	Radius         int                      `json:"radius"`
+	MinMargin      float64                  `json:"min_margin"`
+	MinDailyVolume int64                    `json:"min_daily_volume"`
+	MinItemProfit  float64                  `json:"min_item_profit"`
+	ScanSnapshot   stationAIScanSnapshot    `json:"scan_snapshot"`
+	Summary        stationAIContextSummary  `json:"summary"`
+	Rows           []stationAIContextRow    `json:"rows"`
+	Runtime        *stationAIRuntimeContext `json:"runtime,omitempty"`
+}
+
+type stationAIHistoryMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type stationAIChatRequestPayload struct {
+	Provider      string                    `json:"provider"`
+	APIKey        string                    `json:"api_key"`
+	Model         string                    `json:"model"`
+	PlannerModel  string                    `json:"planner_model"`
+	Temperature   float64                   `json:"temperature"`
+	MaxTokens     int                       `json:"max_tokens"`
+	AssistantName string                    `json:"assistant_name"`
+	Locale        string                    `json:"locale"`
+	UserMessage   string                    `json:"user_message"`
+	EnableWiki    *bool                     `json:"enable_wiki_context"`
+	EnableWeb     *bool                     `json:"enable_web_research"`
+	EnablePlanner *bool                     `json:"enable_planner"`
+	WikiRepo      string                    `json:"wiki_repo"`
+	History       []stationAIHistoryMessage `json:"history"`
+	Context       stationAIContextPayload   `json:"context"`
+}
+
+type stationAIIntentKind string
+
+const (
+	stationAIIntentSmallTalk stationAIIntentKind = "smalltalk"
+	stationAIIntentTrading   stationAIIntentKind = "trading_analysis"
+	stationAIIntentProduct   stationAIIntentKind = "product_help"
+	stationAIIntentDebug     stationAIIntentKind = "debug_support"
+	stationAIIntentResearch  stationAIIntentKind = "web_research"
+	stationAIIntentGeneral   stationAIIntentKind = "general"
+)
+
+type stationAIPlannerPlan struct {
+	Intent           stationAIIntentKind `json:"intent"`
+	ContextLevel     string              `json:"context_level"` // none|summary|full
+	ResponseMode     string              `json:"response_mode"` // short|structured|diagnostic|qa
+	NeedWiki         bool                `json:"need_wiki"`
+	NeedWeb          bool                `json:"need_web"`
+	AskClarification bool                `json:"ask_clarification"`
+	Clarification    string              `json:"clarification"`
+	Agents           []string            `json:"agents"`
+}
+
+type stationAIPreflightResult struct {
+	Status  string
+	Missing []string
+	Caveats []string
+}
+
+type stationAIProviderReply struct {
+	Answer     string
+	Model      string
+	ProviderID string
+	Usage      map[string]interface{}
+}
+
+var aiWikiPageCache sync.Map
 
 func (s *Server) getWalletTxnCache(characterID int64) ([]esi.WalletTransaction, bool) {
 	s.txnCacheMu.RLock()
@@ -387,17 +600,22 @@ func (s *Server) saveConfigForUser(userID string, cfg *config.Config) error {
 
 // NewServer creates a Server with the given config, ESI client, and database.
 func NewServer(cfg *config.Config, esiClient *esi.Client, database *db.DB, ssoConfig *auth.SSOConfig, sessions *auth.SessionStore) *Server {
-	return &Server{
+	s := &Server{
 		cfg:                cfg,
 		esi:                esiClient,
 		db:                 database,
 		sso:                ssoConfig,
 		sessions:           sessions,
+		wikiRAG:            newStationAIWikiRAG(),
 		ssoStates:          make(map[string]ssoStateEntry),
 		plexBuildSem:       make(chan struct{}, 1),
 		userIDCookieSecret: loadOrCreateUserCookieSecret(database),
 		authRevision:       make(map[string]int64),
 	}
+	if s.wikiRAG != nil {
+		s.wikiRAG.Start(defaultStationAIWikiRepo)
+	}
+	return s
 }
 
 // SetSDE is called when SDE data finishes loading.
@@ -429,6 +647,7 @@ func (s *Server) isReady() bool {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
+	mux.HandleFunc("POST /api/internal/wiki/gollum", s.handleInternalWikiGollumWebhook)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("POST /api/config", s.handleSetConfig)
 	mux.HandleFunc("POST /api/alerts/test", s.handleAlertsTest)
@@ -461,6 +680,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/auth/location", s.handleAuthLocation)
 	mux.HandleFunc("GET /api/auth/undercuts", s.handleAuthUndercuts)
 	mux.HandleFunc("GET /api/auth/orders/desk", s.handleAuthOrderDesk)
+	mux.HandleFunc("GET /api/auth/station/trade-states", s.handleAuthGetStationTradeStates)
+	mux.HandleFunc("POST /api/auth/station/trade-states/set", s.handleAuthSetStationTradeState)
+	mux.HandleFunc("POST /api/auth/station/trade-states/delete", s.handleAuthDeleteStationTradeStates)
+	mux.HandleFunc("POST /api/auth/station/trade-states/clear", s.handleAuthClearStationTradeStates)
+	mux.HandleFunc("POST /api/auth/station/cache/reboot", s.handleAuthRebootStationCache)
+	mux.HandleFunc("POST /api/auth/station/command", s.handleAuthStationCommand)
+	mux.HandleFunc("POST /api/auth/station/ai/chat", s.handleAuthStationAIChat)
+	mux.HandleFunc("POST /api/auth/station/ai/chat/stream", s.handleAuthStationAIChatStream)
 	mux.HandleFunc("GET /api/auth/portfolio", s.handleAuthPortfolio)
 	mux.HandleFunc("GET /api/auth/portfolio/optimize", s.handleAuthPortfolioOptimize)
 	mux.HandleFunc("GET /api/auth/structures", s.handleAuthStructures)
@@ -560,10 +787,181 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
+func writeJSONStatus(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 func writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+type stationAIWikiGollumPayload struct {
+	Repository struct {
+		FullName string `json:"full_name"`
+		Name     string `json:"name"`
+		Owner    struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Pages []struct {
+		PageName string `json:"page_name"`
+		Title    string `json:"title"`
+		Action   string `json:"action"`
+		SHA      string `json:"sha"`
+	} `json:"pages"`
+}
+
+func stationAIWikiWebhookSecret() string {
+	return strings.TrimSpace(os.Getenv(stationAIWikiWebhookSecretEnv))
+}
+
+func validateGitHubWebhookSignature(body []byte, signatureHeader, secret string) bool {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return true
+	}
+	signatureHeader = strings.TrimSpace(signatureHeader)
+	if !strings.HasPrefix(strings.ToLower(signatureHeader), "sha256=") {
+		return false
+	}
+	signatureHex := strings.TrimSpace(signatureHeader[len("sha256="):])
+	if signatureHex == "" {
+		return false
+	}
+	got, err := hex.DecodeString(signatureHex)
+	if err != nil || len(got) == 0 {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	want := mac.Sum(nil)
+	return hmac.Equal(got, want)
+}
+
+func stationAIWebhookRepoFromPayload(payload stationAIWikiGollumPayload) string {
+	repo := strings.TrimSpace(payload.Repository.FullName)
+	if repo == "" {
+		owner := strings.TrimSpace(payload.Repository.Owner.Login)
+		name := strings.TrimSpace(payload.Repository.Name)
+		if owner != "" && name != "" {
+			repo = owner + "/" + name
+		}
+	}
+	return sanitizeWikiRepo(repo)
+}
+
+func clearAIWikiPageCacheForRepo(repo string) {
+	repo = sanitizeWikiRepo(repo)
+	if strings.TrimSpace(repo) == "" {
+		return
+	}
+	prefix := repo + "|"
+	aiWikiPageCache.Range(func(key, value interface{}) bool {
+		keyStr, ok := key.(string)
+		if ok && strings.HasPrefix(keyStr, prefix) {
+			aiWikiPageCache.Delete(keyStr)
+		}
+		return true
+	})
+}
+
+func (s *Server) handleInternalWikiGollumWebhook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2_000_000))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read webhook body")
+		return
+	}
+
+	secret := stationAIWikiWebhookSecret()
+	signature := r.Header.Get("X-Hub-Signature-256")
+	if !validateGitHubWebhookSignature(body, signature, secret) {
+		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
+		return
+	}
+
+	event := strings.ToLower(strings.TrimSpace(r.Header.Get("X-GitHub-Event")))
+	delivery := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
+	if event == "" {
+		writeError(w, http.StatusBadRequest, "missing X-GitHub-Event header")
+		return
+	}
+	if event == "ping" {
+		writeJSONStatus(w, http.StatusAccepted, map[string]interface{}{
+			"ok":       true,
+			"accepted": true,
+			"event":    event,
+			"delivery": delivery,
+			"message":  "ping acknowledged",
+		})
+		return
+	}
+	if event != "gollum" {
+		writeJSONStatus(w, http.StatusAccepted, map[string]interface{}{
+			"ok":       true,
+			"accepted": true,
+			"event":    event,
+			"delivery": delivery,
+			"ignored":  true,
+			"message":  "event ignored (expected gollum)",
+		})
+		return
+	}
+
+	var payload stationAIWikiGollumPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid webhook json")
+		return
+	}
+	repo := stationAIWebhookRepoFromPayload(payload)
+	clearAIWikiPageCacheForRepo(repo)
+
+	if s.wikiRAG != nil {
+		go func(repo string, pages int, delivery string) {
+			start := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), stationAIWikiWebhookRefreshTimeout)
+			defer cancel()
+			idx, err := s.wikiRAG.ForceRefresh(ctx, repo)
+			if err != nil {
+				log.Printf(
+					"[AI][WIKI-RAG] webhook refresh failed repo=%s pages=%d delivery=%s err=%v",
+					repo,
+					pages,
+					delivery,
+					err,
+				)
+				return
+			}
+			chunks := 0
+			builtAt := ""
+			if idx != nil {
+				chunks = len(idx.Chunks)
+				builtAt = idx.BuiltAt
+			}
+			log.Printf(
+				"[AI][WIKI-RAG] webhook refresh complete repo=%s pages=%d delivery=%s chunks=%d built_at=%s took=%s",
+				repo,
+				pages,
+				delivery,
+				chunks,
+				builtAt,
+				time.Since(start).Round(time.Millisecond),
+			)
+		}(repo, len(payload.Pages), delivery)
+	}
+
+	writeJSONStatus(w, http.StatusAccepted, map[string]interface{}{
+		"ok":       true,
+		"accepted": true,
+		"queued":   s.wikiRAG != nil,
+		"event":    event,
+		"delivery": delivery,
+		"repo":     repo,
+		"pages":    len(payload.Pages),
+	})
 }
 
 // isPlayerStructure returns true if the location ID is a player-owned structure (not NPC station).
@@ -694,6 +1092,51 @@ func filterStationTradesMarketDisabled(results []engine.StationTrade) []engine.S
 		filtered = append(filtered, r)
 	}
 	return filtered
+}
+
+type stationCacheMeta struct {
+	CurrentRevision int64  `json:"current_revision"`
+	LastRefreshAt   string `json:"last_refresh_at,omitempty"`
+	NextExpiryAt    string `json:"next_expiry_at,omitempty"`
+	MinTTLSec       int64  `json:"min_ttl_sec"`
+	MaxTTLSec       int64  `json:"max_ttl_sec"`
+	Regions         int    `json:"regions"`
+	Entries         int    `json:"entries"`
+	Stale           bool   `json:"stale"`
+}
+
+func mapRegionIDSet(regionIDs map[int32]bool) []int32 {
+	if len(regionIDs) == 0 {
+		return nil
+	}
+	out := make([]int32, 0, len(regionIDs))
+	for regionID := range regionIDs {
+		out = append(out, regionID)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func (s *Server) stationCacheMetaForRegions(regionIDs map[int32]bool) stationCacheMeta {
+	if s == nil || s.esi == nil {
+		return stationCacheMeta{Regions: len(regionIDs)}
+	}
+	window := s.esi.OrderCacheWindow(mapRegionIDSet(regionIDs), "all")
+	meta := stationCacheMeta{
+		CurrentRevision: window.CurrentRevision,
+		MinTTLSec:       window.MinTTLSeconds,
+		MaxTTLSec:       window.MaxTTLSeconds,
+		Regions:         window.Regions,
+		Entries:         window.Entries,
+		Stale:           window.Stale,
+	}
+	if !window.LastRefreshAt.IsZero() {
+		meta.LastRefreshAt = window.LastRefreshAt.UTC().Format(time.RFC3339)
+	}
+	if !window.NextExpiryAt.IsZero() {
+		meta.NextExpiryAt = window.NextExpiryAt.UTC().Format(time.RFC3339)
+	}
+	return meta
 }
 
 // filterContractResultsMarketDisabled is a defense-in-depth guard:
@@ -1321,6 +1764,59 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 	}, nil
 }
 
+func mergeRegionSet(dst, src map[int32]bool) {
+	if dst == nil || len(src) == 0 {
+		return
+	}
+	for regionID := range src {
+		dst[regionID] = true
+	}
+}
+
+func (s *Server) regionsWithinRadius(systemID int32, radius int, minSec float64) map[int32]bool {
+	out := make(map[int32]bool)
+	if systemID == 0 {
+		return out
+	}
+	s.mu.RLock()
+	sdeData := s.sdeData
+	s.mu.RUnlock()
+	if sdeData == nil || sdeData.Universe == nil {
+		return out
+	}
+
+	var systems map[int32]int
+	if minSec > 0 {
+		systems = sdeData.Universe.SystemsWithinRadiusMinSecurity(systemID, radius, minSec)
+	} else {
+		systems = sdeData.Universe.SystemsWithinRadius(systemID, radius)
+	}
+	regions := sdeData.Universe.RegionsInSet(systems)
+	for regionID := range regions {
+		out[regionID] = true
+	}
+	return out
+}
+
+func (s *Server) regionScopeForFlipScan(params engine.ScanParams, multiRegion bool) map[int32]bool {
+	out := make(map[int32]bool)
+	mergeRegionSet(out, s.regionsWithinRadius(params.CurrentSystemID, params.BuyRadius, params.MinRouteSecurity))
+	if multiRegion && params.TargetRegionID > 0 {
+		out[params.TargetRegionID] = true
+		return out
+	}
+	mergeRegionSet(out, s.regionsWithinRadius(params.CurrentSystemID, params.SellRadius, params.MinRouteSecurity))
+	return out
+}
+
+func (s *Server) regionScopeForContractScan(params engine.ScanParams) map[int32]bool {
+	// Contracts are sourced from buy-side radius but liquidation can depend on sell-side market context.
+	out := make(map[int32]bool)
+	mergeRegionSet(out, s.regionsWithinRadius(params.CurrentSystemID, params.BuyRadius, params.MinRouteSecurity))
+	mergeRegionSet(out, s.regionsWithinRadius(params.CurrentSystemID, params.SellRadius, params.MinRouteSecurity))
+	return out
+}
+
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromRequest(r)
 	userCfg := s.loadConfigForUser(userID)
@@ -1377,6 +1873,16 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		results = filterFlipResultsExcludeStructures(results)
 	}
 	results = filterFlipResultsMarketDisabled(results)
+	regionIDs := s.regionScopeForFlipScan(params, false)
+	for _, row := range results {
+		if row.BuyRegionID > 0 {
+			regionIDs[row.BuyRegionID] = true
+		}
+		if row.SellRegionID > 0 {
+			regionIDs[row.SellRegionID] = true
+		}
+	}
+	cacheMeta := s.stationCacheMetaForRegions(regionIDs)
 
 	topProfit := 0.0
 	totalProfit := 0.0
@@ -1395,7 +1901,13 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.processWatchlistAlerts(userID, userCfg, results, scanIDPtr)
 
-	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
+	line, marshalErr := json.Marshal(map[string]interface{}{
+		"type":       "result",
+		"data":       results,
+		"count":      len(results),
+		"scan_id":    scanID,
+		"cache_meta": cacheMeta,
+	})
 	if marshalErr != nil {
 		log.Printf("[API] Scan JSON marshal error: %v", marshalErr)
 		errLine, _ := json.Marshal(map[string]string{"type": "error", "message": "JSON: " + marshalErr.Error()})
@@ -1463,6 +1975,16 @@ func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
 		results = filterFlipResultsExcludeStructures(results)
 	}
 	results = filterFlipResultsMarketDisabled(results)
+	regionIDs := s.regionScopeForFlipScan(params, true)
+	for _, row := range results {
+		if row.BuyRegionID > 0 {
+			regionIDs[row.BuyRegionID] = true
+		}
+		if row.SellRegionID > 0 {
+			regionIDs[row.SellRegionID] = true
+		}
+	}
+	cacheMeta := s.stationCacheMetaForRegions(regionIDs)
 
 	topProfit := 0.0
 	totalProfit := 0.0
@@ -1481,7 +2003,13 @@ func (s *Server) handleScanMultiRegion(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.processWatchlistAlerts(userID, userCfg, results, scanIDPtr)
 
-	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
+	line, marshalErr := json.Marshal(map[string]interface{}{
+		"type":       "result",
+		"data":       results,
+		"count":      len(results),
+		"scan_id":    scanID,
+		"cache_meta": cacheMeta,
+	})
 	if marshalErr != nil {
 		log.Printf("[API] ScanMultiRegion JSON marshal error: %v", marshalErr)
 		errLine, _ := json.Marshal(map[string]string{"type": "error", "message": "JSON: " + marshalErr.Error()})
@@ -1552,6 +2080,8 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 	durationMs := time.Since(startTime).Milliseconds()
 	results = s.filterContractResultsMarketDisabled(results)
 	log.Printf("[API] ScanContracts complete: %d results in %dms", len(results), durationMs)
+	regionIDs := s.regionScopeForContractScan(params)
+	cacheMeta := s.stationCacheMetaForRegions(regionIDs)
 
 	topProfit := 0.0
 	totalProfit := 0.0
@@ -1567,7 +2097,13 @@ func (s *Server) handleScanContracts(w http.ResponseWriter, r *http.Request) {
 		go s.db.InsertContractResults(scanID, results)
 	}
 
-	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": results, "count": len(results), "scan_id": scanID})
+	line, marshalErr := json.Marshal(map[string]interface{}{
+		"type":       "result",
+		"data":       results,
+		"count":      len(results),
+		"scan_id":    scanID,
+		"cache_meta": cacheMeta,
+	})
 	if marshalErr != nil {
 		log.Printf("[API] ScanContracts JSON marshal error: %v", marshalErr)
 		errLine, _ := json.Marshal(map[string]string{"type": "error", "message": "JSON: " + marshalErr.Error()})
@@ -2123,6 +2659,7 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 
 	durationMs := time.Since(startTime).Milliseconds()
 	log.Printf("[API] ScanStation complete: %d results in %dms", len(allResults), durationMs)
+	cacheMeta := s.stationCacheMetaForRegions(regionIDs)
 
 	// Filter out player structures if toggle is OFF
 	// (structure names are already resolved inside ScanStationTrades)
@@ -2153,7 +2690,13 @@ func (s *Server) handleScanStation(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.processWatchlistAlerts(userID, userCfg, allResults, scanIDPtr)
 
-	line, marshalErr := json.Marshal(map[string]interface{}{"type": "result", "data": allResults, "count": len(allResults), "scan_id": scanID})
+	line, marshalErr := json.Marshal(map[string]interface{}{
+		"type":       "result",
+		"data":       allResults,
+		"count":      len(allResults),
+		"scan_id":    scanID,
+		"cache_meta": cacheMeta,
+	})
 	if marshalErr != nil {
 		log.Printf("[API] ScanStation JSON marshal error: %v", marshalErr)
 		errLine, _ := json.Marshal(map[string]string{"type": "error", "message": "JSON: " + marshalErr.Error()})
@@ -3091,6 +3634,185 @@ func (s *Server) handleAuthUndercuts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, undercuts)
 }
 
+func (s *Server) handleAuthGetStationTradeStates(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if s.db == nil {
+		writeJSON(w, map[string]interface{}{
+			"tab":    "station",
+			"states": []db.TradeState{},
+		})
+		return
+	}
+
+	tab := strings.TrimSpace(r.URL.Query().Get("tab"))
+	if tab == "" {
+		tab = "station"
+	}
+	currentRevision := int64(0)
+	if v := strings.TrimSpace(r.URL.Query().Get("current_revision")); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeError(w, 400, "invalid current_revision")
+			return
+		}
+		currentRevision = parsed
+	}
+	pruned := int64(0)
+	if currentRevision > 0 {
+		n, err := s.db.DeleteExpiredDoneTradeStatesForUser(userID, tab, currentRevision)
+		if err != nil {
+			writeError(w, 500, "failed to prune expired trade states")
+			return
+		}
+		pruned = n
+	}
+
+	states, err := s.db.ListTradeStatesForUser(userID, tab)
+	if err != nil {
+		writeError(w, 500, "failed to list trade states")
+		return
+	}
+	if states == nil {
+		states = []db.TradeState{}
+	}
+	writeJSON(w, map[string]interface{}{
+		"tab":    tab,
+		"pruned": pruned,
+		"states": states,
+	})
+}
+
+func (s *Server) handleAuthSetStationTradeState(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if s.db == nil {
+		writeError(w, 503, "database unavailable")
+		return
+	}
+
+	var req struct {
+		Tab           string `json:"tab"`
+		TypeID        int32  `json:"type_id"`
+		StationID     int64  `json:"station_id"`
+		RegionID      int32  `json:"region_id"`
+		Mode          string `json:"mode"`
+		UntilRevision int64  `json:"until_revision"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode != db.TradeStateModeDone && mode != db.TradeStateModeIgnored {
+		writeError(w, 400, "mode must be done or ignored")
+		return
+	}
+	if req.TypeID <= 0 || req.StationID <= 0 {
+		writeError(w, 400, "type_id and station_id are required")
+		return
+	}
+	if mode == db.TradeStateModeDone && req.UntilRevision <= 0 {
+		req.UntilRevision = time.Now().UTC().Unix()
+	}
+	if mode == db.TradeStateModeIgnored {
+		req.UntilRevision = 0
+	}
+
+	err := s.db.UpsertTradeStateForUser(userID, db.TradeState{
+		Tab:           req.Tab,
+		TypeID:        req.TypeID,
+		StationID:     req.StationID,
+		RegionID:      req.RegionID,
+		Mode:          mode,
+		UntilRevision: req.UntilRevision,
+	})
+	if err != nil {
+		writeError(w, 500, "failed to save trade state")
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok": true,
+	})
+}
+
+func (s *Server) handleAuthDeleteStationTradeStates(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if s.db == nil {
+		writeError(w, 503, "database unavailable")
+		return
+	}
+
+	var req struct {
+		Tab  string             `json:"tab"`
+		Keys []db.TradeStateKey `json:"keys"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+	if len(req.Keys) == 0 {
+		writeJSON(w, map[string]interface{}{
+			"ok":      true,
+			"deleted": 0,
+		})
+		return
+	}
+
+	if err := s.db.DeleteTradeStatesForUser(userID, req.Tab, req.Keys); err != nil {
+		writeError(w, 500, "failed to delete trade states")
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok":      true,
+		"deleted": len(req.Keys),
+	})
+}
+
+func (s *Server) handleAuthClearStationTradeStates(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if s.db == nil {
+		writeError(w, 503, "database unavailable")
+		return
+	}
+
+	var req struct {
+		Tab  string `json:"tab"`
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode != "" && mode != db.TradeStateModeDone && mode != db.TradeStateModeIgnored {
+		writeError(w, 400, "mode must be empty, done, or ignored")
+		return
+	}
+	deleted, err := s.db.ClearTradeStatesForUser(userID, req.Tab, mode)
+	if err != nil {
+		writeError(w, 500, "failed to clear trade states")
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok":      true,
+		"deleted": deleted,
+	})
+}
+
+func (s *Server) handleAuthRebootStationCache(w http.ResponseWriter, r *http.Request) {
+	if s.esi == nil {
+		writeError(w, 503, "esi client unavailable")
+		return
+	}
+	cleared := s.esi.ClearOrderCache()
+	log.Printf("[API] Station cache reboot requested: cleared %d entries", cleared)
+	writeJSON(w, map[string]interface{}{
+		"ok":          true,
+		"cleared":     cleared,
+		"rebooted_at": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 func (s *Server) handleAuthOrderDesk(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromRequest(r)
 
@@ -3252,6 +3974,3152 @@ func (s *Server) handleAuthOrderDesk(w http.ResponseWriter, r *http.Request) {
 		WarnExpiryDays:   2,
 	})
 	writeJSON(w, result)
+}
+
+func (s *Server) handleAuthStationCommand(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if !s.isReady() {
+		writeError(w, 503, "SDE not loaded yet")
+		return
+	}
+
+	var req struct {
+		StationID            int64   `json:"station_id"` // 0 = all stations
+		RegionID             int32   `json:"region_id"`
+		SystemName           string  `json:"system_name"`
+		Radius               int     `json:"radius"`
+		MinMargin            float64 `json:"min_margin"`
+		SalesTaxPercent      float64 `json:"sales_tax_percent"`
+		BrokerFee            float64 `json:"broker_fee"`
+		CTSProfile           string  `json:"cts_profile"`
+		SplitTradeFees       bool    `json:"split_trade_fees"`
+		BuyBrokerFeePercent  float64 `json:"buy_broker_fee_percent"`
+		SellBrokerFeePercent float64 `json:"sell_broker_fee_percent"`
+		BuySalesTaxPercent   float64 `json:"buy_sales_tax_percent"`
+		SellSalesTaxPercent  float64 `json:"sell_sales_tax_percent"`
+		MinDailyVolume       int64   `json:"min_daily_volume"`
+		MinItemProfit        float64 `json:"min_item_profit"`
+		MinDemandPerDay      float64 `json:"min_demand_per_day"` // legacy alias for min_s2b_per_day
+		MinS2BPerDay         float64 `json:"min_s2b_per_day"`
+		MinBfSPerDay         float64 `json:"min_bfs_per_day"`
+		AvgPricePeriod       int     `json:"avg_price_period"`
+		MinPeriodROI         float64 `json:"min_period_roi"`
+		BvSRatioMin          float64 `json:"bvs_ratio_min"`
+		BvSRatioMax          float64 `json:"bvs_ratio_max"`
+		MaxPVI               float64 `json:"max_pvi"`
+		MaxSDS               int     `json:"max_sds"`
+		LimitBuyToPriceLow   bool    `json:"limit_buy_to_price_low"`
+		FlagExtremePrices    bool    `json:"flag_extreme_prices"`
+		IncludeStructures    bool    `json:"include_structures"`
+		StructureIDs         []int64 `json:"structure_ids"`
+		TargetETADays        float64 `json:"target_eta_days"`
+		LookbackDays         int     `json:"lookback_days"`
+		MaxResults           int     `json:"max_results"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+
+	characterID, allScope, err := parseAuthScope(r)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	selectedSessions, err := s.authSessionsForScope(userID, characterID, allScope, true)
+	if err != nil {
+		if strings.Contains(err.Error(), "not logged in") {
+			writeError(w, 401, err.Error())
+		} else {
+			writeError(w, 400, err.Error())
+		}
+		return
+	}
+
+	s.mu.RLock()
+	scanner := s.scanner
+	sdeData := s.sdeData
+	s.mu.RUnlock()
+	if scanner == nil || sdeData == nil {
+		writeError(w, 503, "station scanner not ready")
+		return
+	}
+
+	stationIDs := make(map[int64]bool)
+	regionIDs := make(map[int32]bool)
+	allowedSystemsByRegion := make(map[int32]map[int32]bool)
+	historyLabel := ""
+	radiusMode := req.Radius > 0 && req.SystemName != ""
+	singleStationMode := !radiusMode && req.StationID > 0
+	allStationsMode := !radiusMode && !singleStationMode
+
+	if radiusMode {
+		systemID, ok := sdeData.SystemByName[strings.ToLower(req.SystemName)]
+		if !ok {
+			writeError(w, 400, "unknown system")
+			return
+		}
+		systems := sdeData.Universe.SystemsWithinRadius(systemID, req.Radius)
+		for _, st := range sdeData.Stations {
+			if _, inRange := systems[st.SystemID]; inRange {
+				stationIDs[st.ID] = true
+			}
+		}
+		for sysID := range systems {
+			if sys, ok := sdeData.Systems[sysID]; ok {
+				regionIDs[sys.RegionID] = true
+				sysSet, exists := allowedSystemsByRegion[sys.RegionID]
+				if !exists {
+					sysSet = make(map[int32]bool)
+					allowedSystemsByRegion[sys.RegionID] = sysSet
+				}
+				sysSet[sysID] = true
+			}
+		}
+		historyLabel = fmt.Sprintf("%s +%d jumps", req.SystemName, req.Radius)
+	} else if singleStationMode {
+		stationIDs[req.StationID] = true
+		regionIDs[req.RegionID] = true
+		historyLabel = fmt.Sprintf("Station %d", req.StationID)
+	} else {
+		regionIDs[req.RegionID] = true
+		historyLabel = fmt.Sprintf("Region %d (all)", req.RegionID)
+	}
+
+	if req.IncludeStructures && len(req.StructureIDs) > 0 && !allStationsMode {
+		for _, sid := range req.StructureIDs {
+			stationIDs[sid] = true
+		}
+	}
+
+	accessToken := ""
+	if req.IncludeStructures && s.sessions != nil {
+		if token, tokenErr := s.sessions.EnsureValidTokenForUser(s.sso, userID); tokenErr == nil {
+			accessToken = token
+		}
+	}
+
+	userCfg := s.loadConfigForUser(userID)
+	if !req.SplitTradeFees {
+		if req.SalesTaxPercent <= 0 && userCfg != nil && userCfg.SalesTaxPercent > 0 {
+			req.SalesTaxPercent = userCfg.SalesTaxPercent
+		}
+		if req.BrokerFee <= 0 && userCfg != nil && userCfg.BrokerFeePercent > 0 {
+			req.BrokerFee = userCfg.BrokerFeePercent
+		}
+	}
+
+	var scanResults []engine.StationTrade
+	for regionID := range regionIDs {
+		if err := r.Context().Err(); err != nil {
+			writeError(w, 499, "request canceled")
+			return
+		}
+		params := engine.StationTradeParams{
+			StationIDs:           stationIDs,
+			AllowedSystems:       allowedSystemsByRegion[regionID],
+			RegionID:             regionID,
+			MinMargin:            req.MinMargin,
+			SalesTaxPercent:      req.SalesTaxPercent,
+			BrokerFee:            req.BrokerFee,
+			CTSProfile:           req.CTSProfile,
+			SplitTradeFees:       req.SplitTradeFees,
+			BuyBrokerFeePercent:  req.BuyBrokerFeePercent,
+			SellBrokerFeePercent: req.SellBrokerFeePercent,
+			BuySalesTaxPercent:   req.BuySalesTaxPercent,
+			SellSalesTaxPercent:  req.SellSalesTaxPercent,
+			MinDailyVolume:       req.MinDailyVolume,
+			MinItemProfit:        req.MinItemProfit,
+			MinDemandPerDay:      req.MinDemandPerDay,
+			MinS2BPerDay:         req.MinS2BPerDay,
+			MinBfSPerDay:         req.MinBfSPerDay,
+			AvgPricePeriod:       req.AvgPricePeriod,
+			MinPeriodROI:         req.MinPeriodROI,
+			BvSRatioMin:          req.BvSRatioMin,
+			BvSRatioMax:          req.BvSRatioMax,
+			MaxPVI:               req.MaxPVI,
+			MaxSDS:               req.MaxSDS,
+			LimitBuyToPriceLow:   req.LimitBuyToPriceLow,
+			FlagExtremePrices:    req.FlagExtremePrices,
+			AccessToken:          accessToken,
+			IncludeStructures:    req.IncludeStructures,
+			Ctx:                  r.Context(),
+		}
+		if allStationsMode {
+			params.StationIDs = nil
+		}
+
+		results, scanErr := scanner.ScanStationTrades(params, func(string) {})
+		if scanErr != nil {
+			if errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
+				writeError(w, 499, "request canceled")
+				return
+			}
+			writeError(w, 500, scanErr.Error())
+			return
+		}
+		scanResults = append(scanResults, results...)
+	}
+
+	if !req.IncludeStructures {
+		scanResults = filterStationTradesExcludeStructures(scanResults)
+	}
+	scanResults = filterStationTradesMarketDisabled(scanResults)
+	sort.Slice(scanResults, func(i, j int) bool {
+		if scanResults[i].CTS != scanResults[j].CTS {
+			return scanResults[i].CTS > scanResults[j].CTS
+		}
+		return scanResults[i].DailyProfit > scanResults[j].DailyProfit
+	})
+	if req.MaxResults > 0 && len(scanResults) > req.MaxResults {
+		scanResults = scanResults[:req.MaxResults]
+	}
+
+	var activeOrders []esi.CharacterOrder
+	for _, sess := range selectedSessions {
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			log.Printf("[AUTH] StationCommand token error (%s): %v", sess.CharacterName, tokenErr)
+			if !allScope {
+				writeError(w, 401, tokenErr.Error())
+				return
+			}
+			continue
+		}
+		charOrders, fetchErr := s.esi.GetCharacterOrders(sess.CharacterID, token)
+		if fetchErr != nil {
+			log.Printf("[AUTH] StationCommand orders error (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 500, "failed to fetch orders: "+fetchErr.Error())
+				return
+			}
+			continue
+		}
+		activeOrders = append(activeOrders, charOrders...)
+	}
+
+	if len(activeOrders) > 0 {
+		locationIDs := make(map[int64]bool, len(activeOrders))
+		for _, o := range activeOrders {
+			locationIDs[o.LocationID] = true
+		}
+		s.esi.PrefetchStationNames(locationIDs)
+		for i := range activeOrders {
+			if t, ok := sdeData.Types[activeOrders[i].TypeID]; ok {
+				activeOrders[i].TypeName = t.Name
+			}
+			activeOrders[i].LocationName = s.esi.StationName(activeOrders[i].LocationID)
+		}
+	}
+
+	type regionType struct {
+		regionID int32
+		typeID   int32
+	}
+	pairs := make(map[regionType]bool)
+	for _, o := range activeOrders {
+		pairs[regionType{regionID: o.RegionID, typeID: o.TypeID}] = true
+	}
+
+	type fetchResult struct {
+		orders []esi.MarketOrder
+		err    error
+	}
+	bookByPair := make(map[regionType]fetchResult)
+	var booksMu sync.Mutex
+	var booksWG sync.WaitGroup
+	booksSem := make(chan struct{}, 10)
+
+	for pair := range pairs {
+		booksWG.Add(1)
+		go func(rt regionType) {
+			defer booksWG.Done()
+			booksSem <- struct{}{}
+			ro, fetchErr := s.esi.FetchRegionOrdersByType(rt.regionID, rt.typeID)
+			<-booksSem
+			booksMu.Lock()
+			bookByPair[rt] = fetchResult{orders: ro, err: fetchErr}
+			booksMu.Unlock()
+		}(pair)
+	}
+	booksWG.Wait()
+
+	var allRegional []esi.MarketOrder
+	for _, fr := range bookByPair {
+		if fr.err == nil {
+			allRegional = append(allRegional, fr.orders...)
+		}
+	}
+
+	salesTax := req.SalesTaxPercent
+	if salesTax <= 0 {
+		if userCfg != nil && userCfg.SalesTaxPercent > 0 {
+			salesTax = userCfg.SalesTaxPercent
+		} else {
+			salesTax = 8.0
+		}
+	}
+	brokerFee := req.BrokerFee
+	if brokerFee <= 0 {
+		if userCfg != nil && userCfg.BrokerFeePercent > 0 {
+			brokerFee = userCfg.BrokerFeePercent
+		} else {
+			brokerFee = 1.0
+		}
+	}
+	targetETADays := req.TargetETADays
+	if targetETADays <= 0 {
+		targetETADays = 3.0
+	}
+	orderDesk := engine.ComputeOrderDesk(activeOrders, allRegional, nil, nil, engine.OrderDeskOptions{
+		SalesTaxPercent:  salesTax,
+		BrokerFeePercent: brokerFee,
+		TargetETADays:    targetETADays,
+		WarnExpiryDays:   2,
+	})
+
+	lookbackDays := req.LookbackDays
+	if lookbackDays <= 0 {
+		lookbackDays = 180
+	}
+	if lookbackDays > 365 {
+		lookbackDays = 365
+	}
+
+	var txns []esi.WalletTransaction
+	for _, sess := range selectedSessions {
+		if !allScope {
+			if cached, ok := s.getWalletTxnCache(sess.CharacterID); ok {
+				txns = append(txns, cached...)
+				continue
+			}
+		}
+		token, tokenErr := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+		if tokenErr != nil {
+			log.Printf("[AUTH] StationCommand tx token error (%s): %v", sess.CharacterName, tokenErr)
+			if !allScope {
+				writeError(w, 401, tokenErr.Error())
+				return
+			}
+			continue
+		}
+		freshTxns, fetchErr := s.esi.GetWalletTransactions(sess.CharacterID, token)
+		if fetchErr != nil {
+			log.Printf("[AUTH] StationCommand tx fetch error (%s): %v", sess.CharacterName, fetchErr)
+			if !allScope {
+				writeError(w, 500, "failed to fetch wallet transactions: "+fetchErr.Error())
+				return
+			}
+			continue
+		}
+		if !allScope {
+			s.setWalletTxnCache(sess.CharacterID, freshTxns)
+		}
+		txns = append(txns, freshTxns...)
+	}
+
+	openPositions := make([]engine.OpenPosition, 0)
+	if pnl := engine.ComputePortfolioPnL(txns, lookbackDays); pnl != nil && len(pnl.OpenPositions) > 0 {
+		openPositions = pnl.OpenPositions
+	}
+	command := engine.BuildStationCommand(scanResults, activeOrders, openPositions)
+
+	var openQtyTotal int64
+	for _, pos := range openPositions {
+		openQtyTotal += pos.Quantity
+	}
+
+	response := struct {
+		GeneratedAt string                      `json:"generated_at"`
+		Scope       string                      `json:"scope"`
+		ScanScope   string                      `json:"scan_scope"`
+		RegionCount int                         `json:"region_count"`
+		ResultCount int                         `json:"result_count"`
+		CacheMeta   stationCacheMeta            `json:"cache_meta"`
+		Command     engine.StationCommandResult `json:"command"`
+		OrderDesk   engine.OrderDeskResponse    `json:"order_desk"`
+		Inventory   struct {
+			OpenPositions int   `json:"open_positions"`
+			OpenQuantity  int64 `json:"open_quantity"`
+			Transactions  int   `json:"transactions"`
+		} `json:"inventory"`
+	}{
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Scope: func() string {
+			if allScope {
+				return "all"
+			}
+			return "single"
+		}(),
+		ScanScope:   historyLabel,
+		RegionCount: len(regionIDs),
+		ResultCount: len(scanResults),
+		CacheMeta:   s.stationCacheMetaForRegions(regionIDs),
+		Command:     command,
+		OrderDesk:   orderDesk,
+	}
+	response.Inventory.OpenPositions = len(openPositions)
+	response.Inventory.OpenQuantity = openQtyTotal
+	response.Inventory.Transactions = len(txns)
+
+	writeJSON(w, response)
+}
+
+func containsAnyLower(haystack string, needles []string) bool {
+	for _, n := range needles {
+		if strings.Contains(haystack, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func stationAIIsDiagnosticAssistantMessage(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	if lower == "" {
+		return false
+	}
+	if containsAnyLower(lower, []string{
+		"need_full_context",
+		"constraint_violation",
+		"rows_seen_count",
+		"preflight",
+		`"status":"need_full_context"`,
+		`"status": "need_full_context"`,
+		`"status":"constraint_violation"`,
+		`"status": "constraint_violation"`,
+	}) {
+		return true
+	}
+	// Drop assistant JSON diagnostics to reduce prompt state contamination.
+	if strings.HasPrefix(lower, "{") && strings.HasSuffix(lower, "}") &&
+		containsAnyLower(lower, []string{`"status"`, `"rows_count"`, `"runtime_available"`}) {
+		return true
+	}
+	return false
+}
+
+func normalizeStationAIHistory(history []stationAIHistoryMessage) []stationAIHistoryMessage {
+	if len(history) == 0 {
+		return nil
+	}
+	out := make([]stationAIHistoryMessage, 0, len(history))
+	for _, msg := range history {
+		role := strings.TrimSpace(strings.ToLower(msg.Role))
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		if role == "assistant" && stationAIIsDiagnosticAssistantMessage(content) {
+			continue
+		}
+		runes := []rune(content)
+		if len(runes) > 1800 {
+			content = string(runes[:1800]) + "..."
+		}
+		out = append(out, stationAIHistoryMessage{
+			Role:    role,
+			Content: content,
+		})
+	}
+	if len(out) > stationAIHistoryMaxMessages {
+		out = out[len(out)-stationAIHistoryMaxMessages:]
+	}
+	return out
+}
+
+func normalizeStationAIChatRequest(req *stationAIChatRequestPayload) (bool, bool, []string, string) {
+	req.Provider = strings.TrimSpace(strings.ToLower(req.Provider))
+	if req.Provider == "" {
+		req.Provider = "openrouter"
+	}
+	if req.Provider != "openrouter" {
+		return false, false, nil, "unsupported ai provider"
+	}
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	if req.APIKey == "" {
+		return false, false, nil, "api_key is required"
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	if req.Model == "" {
+		return false, false, nil, "model is required"
+	}
+	req.PlannerModel = strings.TrimSpace(req.PlannerModel)
+	req.UserMessage = strings.TrimSpace(req.UserMessage)
+	if req.UserMessage == "" {
+		return false, false, nil, "user_message is required"
+	}
+
+	req.Locale = strings.TrimSpace(strings.ToLower(req.Locale))
+	if req.Locale != "ru" && req.Locale != "en" {
+		req.Locale = "en"
+	}
+	req.AssistantName = strings.TrimSpace(req.AssistantName)
+	if req.AssistantName == "" {
+		req.AssistantName = "Ivy AI"
+	}
+
+	enableWiki := true
+	if req.EnableWiki != nil {
+		enableWiki = *req.EnableWiki
+	}
+	enableWeb := false
+	if req.EnableWeb != nil {
+		enableWeb = *req.EnableWeb
+	}
+	req.WikiRepo = sanitizeWikiRepo(req.WikiRepo)
+	req.History = normalizeStationAIHistory(req.History)
+
+	warnings := make([]string, 0, 8)
+	if req.Temperature < 0 || req.Temperature > 2 {
+		req.Temperature = 0.2
+		warnings = append(warnings, "temperature clamped to 0.2")
+	}
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = 900
+	}
+	if req.MaxTokens > stationAIMaxTokensLimit {
+		req.MaxTokens = stationAIMaxTokensLimit
+		warnings = append(warnings, "max_tokens clamped to 1000000")
+	}
+	if len(req.Context.Rows) > 100 {
+		req.Context.Rows = req.Context.Rows[:100]
+		warnings = append(warnings, "rows context was truncated to 100")
+	}
+
+	req.Context.ScanSnapshot.ScopeMode = strings.TrimSpace(strings.ToLower(req.Context.ScanSnapshot.ScopeMode))
+	switch req.Context.ScanSnapshot.ScopeMode {
+	case "", "radius", "single_station", "region_all":
+		// allowed
+	default:
+		req.Context.ScanSnapshot.ScopeMode = ""
+		warnings = append(warnings, "scan_snapshot.scope_mode reset to empty")
+	}
+
+	req.Context.ScanSnapshot.CTSProfile = strings.TrimSpace(strings.ToLower(req.Context.ScanSnapshot.CTSProfile))
+	switch req.Context.ScanSnapshot.CTSProfile {
+	case "", "balanced", "aggressive", "defensive":
+		// allowed
+	default:
+		req.Context.ScanSnapshot.CTSProfile = "balanced"
+		warnings = append(warnings, "scan_snapshot.cts_profile reset to balanced")
+	}
+
+	if req.Context.ScanSnapshot.StructureCount < 0 {
+		req.Context.ScanSnapshot.StructureCount = 0
+	}
+	if len(req.Context.ScanSnapshot.StructureIDs) > 300 {
+		req.Context.ScanSnapshot.StructureIDs = req.Context.ScanSnapshot.StructureIDs[:300]
+		warnings = append(warnings, "scan_snapshot.structure_ids was truncated to 300")
+	}
+	// Runtime account context is backend-owned and must not be accepted from client JSON.
+	req.Context.Runtime = nil
+	return enableWiki, enableWeb, warnings, ""
+}
+
+func detectStationAIIntent(userMessage string, history []stationAIHistoryMessage) stationAIIntentKind {
+	msg := strings.TrimSpace(strings.ToLower(userMessage))
+	if msg == "" {
+		return stationAIIntentGeneral
+	}
+
+	debugTerms := []string{
+		"error", "bug", "trace", "stack", "undefined", "null", "crash", "failed", "panic",
+		"ошибка", "баг", "сломал", "сломалось", "не работает", "краш", "исключение", "лог",
+	}
+	if containsAnyLower(msg, debugTerms) {
+		return stationAIIntentDebug
+	}
+
+	strongTradingTerms := []string{
+		"scan_snapshot", "decision matrix", "execute now", "monitor bucket", "capital allocation",
+		"parameter patch", "stress test", "risk_score", "rows", "runtime", "summary",
+		"min_daily_volume", "min_item_profit", "min_margin", "bvs_ratio", "max_pvi", "max_sds",
+		"матриц", "капитал", "стресс", "параметр патч", "риск_скор", "скан_снапшот",
+	}
+	if containsAnyLower(msg, strongTradingTerms) {
+		return stationAIIntentTrading
+	}
+
+	productTerms := []string{
+		"wiki", "documentation", "docs", "roadmap", "project", "feature", "api",
+		"док", "документац", "проект", "роадмап", "фича", "как работает",
+	}
+	if containsAnyLower(msg, productTerms) {
+		return stationAIIntentProduct
+	}
+
+	webTerms := []string{
+		"google", "search web", "internet", "latest", "today", "news", "reddit", "forum",
+		"гугл", "погугл", "интернет", "сегодня", "новости", "свеж", "внешн",
+	}
+	if containsAnyLower(msg, webTerms) {
+		return stationAIIntentResearch
+	}
+
+	tradingTerms := []string{
+		"trade", "trading", "scan", "station", "profit", "margin", "risk", "filters",
+		"actionable", "reprice", "order", "orders", "liquidity", "volume", "eta", "cts",
+		"сделк", "трейд", "скан", "станц", "прибыл", "марж", "риск", "фильтр", "ордер",
+		"ликвид", "объем", "объём", "действ", "спред",
+	}
+	if containsAnyLower(msg, tradingTerms) {
+		return stationAIIntentTrading
+	}
+
+	greetingTerms := []string{
+		"hi", "hello", "hey", "yo", "sup", "thanks", "thank you",
+		"привет", "здравствуй", "добрый день", "добрый вечер", "ку", "спасибо",
+	}
+	if utf8.RuneCountInString(msg) <= 40 && containsAnyLower(msg, greetingTerms) {
+		return stationAIIntentSmallTalk
+	}
+
+	followupTerms := []string{
+		"почему", "объясни", "что дальше", "дальше", "why", "explain", "next",
+	}
+	if containsAnyLower(msg, followupTerms) {
+		for i := len(history) - 1; i >= 0 && i >= len(history)-4; i-- {
+			if history[i].Role != "assistant" {
+				continue
+			}
+			prev := strings.ToLower(history[i].Content)
+			if containsAnyLower(prev, []string{"recommendation", "рекомендац", "risk", "риск", "filter", "фильтр", "trade", "трейд"}) {
+				return stationAIIntentTrading
+			}
+		}
+	}
+
+	return stationAIIntentGeneral
+}
+
+func stationAIDefaultPlannerPlan(intent stationAIIntentKind) stationAIPlannerPlan {
+	plan := stationAIPlannerPlan{
+		Intent:       intent,
+		ContextLevel: "summary",
+		ResponseMode: "qa",
+		NeedWiki:     false,
+		NeedWeb:      false,
+		Agents:       []string{"intent_router"},
+	}
+	switch intent {
+	case stationAIIntentSmallTalk:
+		plan.ContextLevel = "none"
+		plan.ResponseMode = "short"
+	case stationAIIntentTrading:
+		plan.ContextLevel = "full"
+		plan.ResponseMode = "structured"
+		plan.Agents = []string{"scan_analyzer", "risk_checker"}
+	case stationAIIntentProduct:
+		plan.ContextLevel = "summary"
+		plan.ResponseMode = "qa"
+		plan.NeedWiki = true
+		plan.Agents = []string{"wiki_retriever"}
+	case stationAIIntentDebug:
+		plan.ContextLevel = "summary"
+		plan.ResponseMode = "diagnostic"
+		plan.NeedWiki = true
+		plan.Agents = []string{"debug_helper", "wiki_retriever"}
+	case stationAIIntentResearch:
+		plan.ContextLevel = "summary"
+		plan.ResponseMode = "qa"
+		plan.NeedWeb = true
+		plan.Agents = []string{"web_retriever"}
+	default:
+		plan.ContextLevel = "summary"
+		plan.ResponseMode = "qa"
+	}
+	return plan
+}
+
+func stationAINormalizePlannerPlan(plan stationAIPlannerPlan, fallback stationAIPlannerPlan) stationAIPlannerPlan {
+	out := fallback
+	switch plan.Intent {
+	case stationAIIntentSmallTalk, stationAIIntentTrading, stationAIIntentProduct, stationAIIntentDebug, stationAIIntentResearch, stationAIIntentGeneral:
+		out.Intent = plan.Intent
+	}
+	switch strings.TrimSpace(strings.ToLower(plan.ContextLevel)) {
+	case "none", "summary", "full":
+		out.ContextLevel = strings.TrimSpace(strings.ToLower(plan.ContextLevel))
+	}
+	switch strings.TrimSpace(strings.ToLower(plan.ResponseMode)) {
+	case "short", "structured", "diagnostic", "qa":
+		out.ResponseMode = strings.TrimSpace(strings.ToLower(plan.ResponseMode))
+	}
+	out.NeedWiki = plan.NeedWiki
+	out.NeedWeb = plan.NeedWeb
+	out.AskClarification = plan.AskClarification
+	out.Clarification = strings.TrimSpace(plan.Clarification)
+	if len([]rune(out.Clarification)) > 280 {
+		out.Clarification = string([]rune(out.Clarification)[:280]) + "..."
+	}
+	if len(plan.Agents) > 0 {
+		agents := make([]string, 0, len(plan.Agents))
+		seen := map[string]struct{}{}
+		allowed := map[string]struct{}{
+			"intent_router":  {},
+			"scan_analyzer":  {},
+			"risk_checker":   {},
+			"wiki_retriever": {},
+			"web_retriever":  {},
+			"debug_helper":   {},
+		}
+		for _, a := range plan.Agents {
+			agent := strings.TrimSpace(strings.ToLower(a))
+			if agent == "" {
+				continue
+			}
+			if _, ok := allowed[agent]; !ok {
+				continue
+			}
+			if _, ok := seen[agent]; ok {
+				continue
+			}
+			seen[agent] = struct{}{}
+			agents = append(agents, agent)
+			if len(agents) >= 6 {
+				break
+			}
+		}
+		if len(agents) > 0 {
+			out.Agents = agents
+		}
+	}
+	// Guardrails for smalltalk: no heavy retrieval by default.
+	if out.Intent == stationAIIntentSmallTalk {
+		out.ContextLevel = "none"
+		out.NeedWiki = false
+		out.NeedWeb = false
+		out.ResponseMode = "short"
+	}
+	// Trading analysis needs row-level context by default; summary-only responses
+	// produce generic answers and miss actionable opportunities.
+	if out.Intent == stationAIIntentTrading {
+		out.ContextLevel = "full"
+		if len(out.Agents) == 0 {
+			out.Agents = []string{"scan_analyzer", "risk_checker"}
+		}
+	}
+	return out
+}
+
+func aiExtractJSONObject(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return ""
+	}
+	return raw[start : end+1]
+}
+
+func stationAIPlannerContextSnippet(ctx stationAIContextPayload) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "system=%s; station_scope=%s; rows=%d; actionable=%d; avg_margin=%.2f; avg_daily_profit=%.2f\n",
+		ctx.SystemName,
+		ctx.StationScope,
+		ctx.Summary.VisibleRows,
+		ctx.Summary.ActionableRows,
+		ctx.Summary.AverageMargin,
+		ctx.Summary.AverageProfit,
+	)
+	if ctx.ScanSnapshot.ScopeMode != "" {
+		fmt.Fprintf(
+			&b,
+			"scan_snapshot: scope=%s; split_fees=%t; cts=%s; min_margin=%.2f; min_daily_volume=%d; min_item_profit=%.2f; min_s2b=%.2f; min_bfs=%.2f; avg_price_period=%d; min_period_roi=%.2f; bvs_ratio=[%.2f..%.2f]; max_pvi=%.2f; max_sds=%.2f; limit_buy_to_low=%t; flag_extreme=%t; include_structures=%t (applied=%t count=%d)\n",
+			ctx.ScanSnapshot.ScopeMode,
+			ctx.ScanSnapshot.SplitTradeFees,
+			ctx.ScanSnapshot.CTSProfile,
+			ctx.ScanSnapshot.MinMargin,
+			ctx.ScanSnapshot.MinDailyVolume,
+			ctx.ScanSnapshot.MinItemProfit,
+			ctx.ScanSnapshot.MinS2BPerDay,
+			ctx.ScanSnapshot.MinBfSPerDay,
+			ctx.ScanSnapshot.AvgPricePeriod,
+			ctx.ScanSnapshot.MinPeriodROI,
+			ctx.ScanSnapshot.BVSRatioMin,
+			ctx.ScanSnapshot.BVSRatioMax,
+			ctx.ScanSnapshot.MaxPVI,
+			ctx.ScanSnapshot.MaxSDS,
+			ctx.ScanSnapshot.LimitBuyToPriceLow,
+			ctx.ScanSnapshot.FlagExtremePrices,
+			ctx.ScanSnapshot.IncludeStructures,
+			ctx.ScanSnapshot.StructuresApplied,
+			ctx.ScanSnapshot.StructureCount,
+		)
+	}
+	limit := len(ctx.Rows)
+	if limit > 8 {
+		limit = 8
+	}
+	for i := 0; i < limit; i++ {
+		row := ctx.Rows[i]
+		fmt.Fprintf(&b, "- %s | action=%s | margin=%.2f | daily_profit=%.2f | risk=%t\n",
+			row.TypeName, row.Action, row.Margin, row.DailyProfit, row.HighRisk)
+	}
+	return b.String()
+}
+
+func stationAIPlannerSystemPrompt(locale string) string {
+	if locale == "ru" {
+		return "Ты planner-агент для EVE Flipper. Твоя задача: определить намерение пользователя и выбрать минимально нужный контекст/агентов для следующего LLM шага. Верни ТОЛЬКО JSON без markdown. Поля JSON: intent, context_level, response_mode, need_wiki, need_web, ask_clarification, clarification, agents. intent one of: smalltalk|trading_analysis|product_help|debug_support|web_research|general. context_level one of: none|summary|full. response_mode one of: short|structured|diagnostic|qa."
+	}
+	return "You are the planner agent for EVE Flipper. Determine user intent and choose minimal required context/agents for the next LLM step. Return JSON ONLY, no markdown. JSON fields: intent, context_level, response_mode, need_wiki, need_web, ask_clarification, clarification, agents. intent one of: smalltalk|trading_analysis|product_help|debug_support|web_research|general. context_level one of: none|summary|full. response_mode one of: short|structured|diagnostic|qa."
+}
+
+func stationAIPlannerUserPrompt(locale, userMessage string, history []stationAIHistoryMessage, ctx stationAIContextPayload, fallback stationAIPlannerPlan) string {
+	var hb strings.Builder
+	if len(history) > 0 {
+		start := 0
+		if len(history) > 6 {
+			start = len(history) - 6
+		}
+		for i := start; i < len(history); i++ {
+			msg := history[i]
+			fmt.Fprintf(&hb, "[%s] %s\n", msg.Role, aiTrimForPrompt(msg.Content, 220))
+		}
+	}
+	if locale == "ru" {
+		return fmt.Sprintf(
+			"Сообщение пользователя:\n%s\n\n"+
+				"Краткая история:\n%s\n"+
+				"Сводка контекста таба:\n%s\n"+
+				"Fallback intent: %s\n"+
+				"Верни только JSON.",
+			userMessage,
+			hb.String(),
+			stationAIPlannerContextSnippet(ctx),
+			fallback.Intent,
+		)
+	}
+	return fmt.Sprintf(
+		"User message:\n%s\n\n"+
+			"Recent history:\n%s\n"+
+			"Tab context summary:\n%s\n"+
+			"Fallback intent: %s\n"+
+			"Return JSON only.",
+		userMessage,
+		hb.String(),
+		stationAIPlannerContextSnippet(ctx),
+		fallback.Intent,
+	)
+}
+
+func stationAIContextForPlan(ctx stationAIContextPayload, plan stationAIPlannerPlan) stationAIContextPayload {
+	out := stationAIContextForIntent(ctx, plan.Intent)
+	switch plan.ContextLevel {
+	case "none":
+		out.Rows = nil
+		out.Summary = stationAIContextSummary{}
+	case "summary":
+		out.Rows = nil
+	case "full":
+		if len(out.Rows) > 100 {
+			out.Rows = out.Rows[:100]
+		}
+	default:
+		// keep intent-based default
+	}
+	return out
+}
+
+func stationAIPreflight(locale string, plan stationAIPlannerPlan, ctx stationAIContextPayload, runtimeRequested bool) stationAIPreflightResult {
+	result := stationAIPreflightResult{Status: "pass"}
+	requireRows := plan.ContextLevel == "full" || plan.Intent == stationAIIntentTrading
+	if requireRows && len(ctx.Rows) == 0 {
+		result.Status = "fail"
+		result.Missing = append(result.Missing, "rows")
+	}
+	if plan.Intent == stationAIIntentTrading && ctx.Summary.VisibleRows == 0 && len(ctx.Rows) == 0 {
+		result.Status = "fail"
+		result.Missing = append(result.Missing, "summary.visible_rows")
+	}
+	if runtimeRequested && (ctx.Runtime == nil || !ctx.Runtime.Available) {
+		result.Caveats = append(result.Caveats, stationAIRuntimeLocaleText(
+			locale,
+			"account runtime context unavailable; response quality may be lower",
+			"runtime-контекст аккаунта недоступен; качество ответа может быть ниже",
+		))
+	}
+	if result.Status == "pass" && len(result.Caveats) > 0 {
+		result.Status = "partial"
+	}
+	return result
+}
+
+func stationAIPreflightCaveatBlock(locale string, preflight stationAIPreflightResult) string {
+	if len(preflight.Caveats) == 0 {
+		return ""
+	}
+	if locale == "ru" {
+		return "Ограничения контекста: " + strings.Join(preflight.Caveats, "; ")
+	}
+	return "Context caveats: " + strings.Join(preflight.Caveats, "; ")
+}
+
+func stationAIPreflightFailAnswer(locale string, missing []string) string {
+	list := strings.Join(missing, ", ")
+	if list == "" {
+		list = "context"
+	}
+	if locale == "ru" {
+		return "Не могу выполнить этот анализ: не хватает обязательных данных контекста (" + list + "). Перезапусти скан и повтори запрос."
+	}
+	return "I cannot run this analysis because required context fields are missing (" + list + "). Re-run scan and try again."
+}
+
+func stationAIValidateAnswer(answer string, intent stationAIIntentKind) (bool, string) {
+	trimmed := strings.TrimSpace(answer)
+	if trimmed == "" {
+		return false, "empty ai answer"
+	}
+	lower := strings.ToLower(trimmed)
+	if containsAnyLower(lower, []string{
+		"need_full_context",
+		"constraint_violation",
+		"rows_seen_count",
+		`"status":"need_full_context"`,
+		`"status": "need_full_context"`,
+		`"status":"constraint_violation"`,
+		`"status": "constraint_violation"`,
+		"preflight",
+	}) {
+		return false, "diagnostic markers leaked into answer"
+	}
+	if intent == stationAIIntentTrading {
+		if utf8.RuneCountInString(trimmed) < 60 {
+			return false, "trading answer too short"
+		}
+		hasDigit := false
+		for _, r := range trimmed {
+			if unicode.IsDigit(r) {
+				hasDigit = true
+				break
+			}
+		}
+		if !hasDigit {
+			return false, "trading answer has no numeric evidence"
+		}
+	}
+	return true, ""
+}
+
+func stationAIRetryCorrectionPrompt(locale, issue string) string {
+	issue = strings.TrimSpace(issue)
+	if issue == "" {
+		issue = "invalid answer format"
+	}
+	if locale == "ru" {
+		return fmt.Sprintf(
+			"Предыдущий ответ отклонен серверной валидацией: %s. "+
+				"Дай прямой аналитический ответ по текущему контексту. "+
+				"Не выполняй self-check/preflight и не выводи диагностические маркеры.",
+			issue,
+		)
+	}
+	return fmt.Sprintf(
+		"Your previous response was rejected by server validation: %s. "+
+			"Provide a direct analytical answer using current context only. "+
+			"Do not run self-check/preflight and do not output diagnostic markers.",
+		issue,
+	)
+}
+
+func stationAIUsageTokenInts(usage map[string]interface{}) (int, int, int) {
+	if usage == nil {
+		return 0, 0, 0
+	}
+	readInt := func(key string) int {
+		raw, ok := usage[key]
+		if !ok {
+			return 0
+		}
+		switch v := raw.(type) {
+		case int:
+			return v
+		case int32:
+			return int(v)
+		case int64:
+			return int(v)
+		case float32:
+			return int(v)
+		case float64:
+			return int(v)
+		default:
+			return 0
+		}
+	}
+	return readInt("prompt_tokens"), readInt("completion_tokens"), readInt("total_tokens")
+}
+
+func stationAIPlannerEnabled(req stationAIChatRequestPayload) bool {
+	if req.EnablePlanner != nil {
+		return *req.EnablePlanner
+	}
+	return true
+}
+
+func stationAIResolvePlannerModel(req stationAIChatRequestPayload) string {
+	model := strings.TrimSpace(req.PlannerModel)
+	if model != "" {
+		return model
+	}
+	if strings.TrimSpace(defaultStationAIPlannerModel) != "" {
+		return strings.TrimSpace(defaultStationAIPlannerModel)
+	}
+	return strings.TrimSpace(req.Model)
+}
+
+func stationAIPipelineMeta(req stationAIChatRequestPayload, plan stationAIPlannerPlan, plannerEnabled bool) map[string]interface{} {
+	return map[string]interface{}{
+		"planner_enabled": plannerEnabled,
+		"planner_model":   stationAIResolvePlannerModel(req),
+		"response_mode":   plan.ResponseMode,
+		"context_level":   plan.ContextLevel,
+		"agents":          plan.Agents,
+	}
+}
+
+func (s *Server) stationAIResolvePlan(ctx context.Context, req stationAIChatRequestPayload) (stationAIPlannerPlan, bool, []string) {
+	intent := detectStationAIIntent(req.UserMessage, req.History)
+	plan := stationAIDefaultPlannerPlan(intent)
+	if stationAINeedsWikiContext(intent, req.UserMessage) {
+		plan.NeedWiki = true
+	}
+	if stationAINeedsWebResearch(intent, req.UserMessage) {
+		plan.NeedWeb = true
+	}
+	plannerEnabled := stationAIPlannerEnabled(req)
+	if !plannerEnabled {
+		return plan, false, nil
+	}
+	planned, warnings := s.stationAIPlannerPass(ctx, req, plan)
+	return planned, true, warnings
+}
+
+func (s *Server) stationAIPlannerPass(ctx context.Context, req stationAIChatRequestPayload, fallback stationAIPlannerPlan) (stationAIPlannerPlan, []string) {
+	model := stationAIResolvePlannerModel(req)
+
+	payload := map[string]interface{}{
+		"model":       model,
+		"temperature": 0.0,
+		"max_tokens":  220,
+		"messages": []map[string]string{
+			{"role": "system", "content": stationAIPlannerSystemPrompt(req.Locale)},
+			{
+				"role": "user",
+				"content": stationAIPlannerUserPrompt(
+					req.Locale,
+					req.UserMessage,
+					req.History,
+					req.Context,
+					fallback,
+				),
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fallback, []string{"planner: failed to encode planner request"}
+	}
+
+	httpReq, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"https://openrouter.ai/api/v1/chat/completions",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return fallback, []string{"planner: failed to create planner request"}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
+	httpReq.Header.Set("HTTP-Referer", "http://localhost:1420")
+	httpReq.Header.Set("X-Title", "EVE Flipper Station AI Planner")
+
+	client := &http.Client{Timeout: 35 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return fallback, []string{"planner unavailable, using fallback intent routing"}
+	}
+	defer resp.Body.Close()
+
+	rawResp, err := io.ReadAll(io.LimitReader(resp.Body, 1_000_000))
+	if err != nil {
+		return fallback, []string{"planner read failed, using fallback intent routing"}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fallback, []string{"planner provider error, using fallback intent routing"}
+	}
+
+	var orResp struct {
+		Choices []struct {
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rawResp, &orResp); err != nil || len(orResp.Choices) == 0 {
+		return fallback, []string{"planner invalid response, using fallback intent routing"}
+	}
+	content := extractAIContent(orResp.Choices[0].Message.Content)
+	jsonBlock := aiExtractJSONObject(content)
+	if jsonBlock == "" {
+		return fallback, []string{"planner did not return json, using fallback intent routing"}
+	}
+
+	var plan stationAIPlannerPlan
+	if err := json.Unmarshal([]byte(jsonBlock), &plan); err != nil {
+		return fallback, []string{"planner json parse failed, using fallback intent routing"}
+	}
+	normalized := stationAINormalizePlannerPlan(plan, fallback)
+	return normalized, nil
+}
+
+func stationAIContextForIntent(ctx stationAIContextPayload, intent stationAIIntentKind) stationAIContextPayload {
+	out := ctx
+	switch intent {
+	case stationAIIntentSmallTalk:
+		out.Rows = nil
+		out.Summary = stationAIContextSummary{}
+	case stationAIIntentProduct, stationAIIntentResearch:
+		out.Rows = nil
+	case stationAIIntentGeneral:
+		if len(out.Rows) > 12 {
+			out.Rows = out.Rows[:12]
+		}
+	}
+	return out
+}
+
+func stationAINeedsWikiContext(intent stationAIIntentKind, userMessage string) bool {
+	msg := strings.ToLower(strings.TrimSpace(userMessage))
+	if intent == stationAIIntentSmallTalk {
+		return false
+	}
+	if containsAnyLower(msg, []string{"wiki", "docs", "documentation", "док", "документац", "проект"}) {
+		return true
+	}
+	return intent == stationAIIntentProduct || intent == stationAIIntentDebug
+}
+
+func stationAINeedsWebResearch(intent stationAIIntentKind, userMessage string) bool {
+	if intent == stationAIIntentSmallTalk {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(userMessage))
+	if intent == stationAIIntentResearch {
+		return true
+	}
+	return containsAnyLower(msg, []string{
+		"latest", "today", "news", "reddit", "forum", "search", "web",
+		"сегодня", "новости", "свеж", "погугл", "интернет", "внешн",
+	})
+}
+
+func stationAIRuntimeLocaleText(locale, en, ru string) string {
+	if locale == "ru" {
+		return ru
+	}
+	return en
+}
+
+func stationAINeedsRuntimeContext(intent stationAIIntentKind, userMessage string) bool {
+	if intent == stationAIIntentSmallTalk || intent == stationAIIntentProduct {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(userMessage))
+	if msg == "" {
+		return false
+	}
+
+	// Hard triggers for account/runtime analytics.
+	if containsAnyLower(msg, []string{
+		"wallet", "balance", "capital", "budget", "portfolio", "pnl", "realized",
+		"transaction", "transactions", "ledger",
+		"кошел", "баланс", "капитал", "бюджет", "портфел", "пнл", "реализован",
+		"транзак", "журнал сделок", "история сделок",
+	}) {
+		return true
+	}
+
+	// Soft triggers: only with personal scope to avoid heavy fetches on generic questions.
+	personalTerms := []string{"my ", "mine", "for me", "мой", "моя", "мои", "моё", "у меня", "для меня"}
+	softTerms := []string{
+		"order", "orders", "history", "risk", "var", "es95", "es99",
+		"ордер", "ордера", "истор", "риск", "математ", "формул",
+	}
+	return containsAnyLower(msg, personalTerms) && containsAnyLower(msg, softTerms)
+}
+
+func (s *Server) stationAIEnrichTxnTypeNames(txns []esi.WalletTransaction) {
+	if len(txns) == 0 {
+		return
+	}
+	s.mu.RLock()
+	sdeData := s.sdeData
+	s.mu.RUnlock()
+	if sdeData == nil {
+		return
+	}
+	for i := range txns {
+		if strings.TrimSpace(txns[i].TypeName) != "" {
+			continue
+		}
+		if t, ok := sdeData.Types[txns[i].TypeID]; ok {
+			txns[i].TypeName = t.Name
+		}
+	}
+}
+
+func stationAISummarizeRuntimeTransactions(runtime *stationAIRuntimeContext, txns []esi.WalletTransaction) {
+	if runtime == nil || len(txns) == 0 {
+		return
+	}
+	windowStart := time.Now().UTC().AddDate(0, 0, -stationAIRuntimeTxnWindowDays)
+	type itemAgg struct {
+		typeID   int32
+		typeName string
+		trades   int
+		volume   int64
+		turnover float64
+	}
+	byType := make(map[int32]*itemAgg)
+
+	for _, tx := range txns {
+		ts, err := time.Parse(time.RFC3339, tx.Date)
+		if err != nil || ts.Before(windowStart) {
+			continue
+		}
+		notional := tx.UnitPrice * float64(tx.Quantity)
+		runtime.TransactionCount++
+		if tx.IsBuy {
+			runtime.BuyFlowISK += notional
+		} else {
+			runtime.SellFlowISK += notional
+		}
+
+		item := byType[tx.TypeID]
+		if item == nil {
+			typeName := strings.TrimSpace(tx.TypeName)
+			if typeName == "" {
+				typeName = fmt.Sprintf("Type %d", tx.TypeID)
+			}
+			item = &itemAgg{
+				typeID:   tx.TypeID,
+				typeName: typeName,
+			}
+			byType[tx.TypeID] = item
+		}
+		item.trades++
+		item.volume += int64(tx.Quantity)
+		item.turnover += notional
+	}
+
+	runtime.NetFlowISK = runtime.SellFlowISK - runtime.BuyFlowISK
+	if len(byType) == 0 {
+		return
+	}
+
+	items := make([]itemAgg, 0, len(byType))
+	for _, item := range byType {
+		items = append(items, *item)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].turnover == items[j].turnover {
+			return items[i].trades > items[j].trades
+		}
+		return items[i].turnover > items[j].turnover
+	})
+	if len(items) > stationAIRuntimeTopItems {
+		items = items[:stationAIRuntimeTopItems]
+	}
+	runtime.TopItems = make([]stationAIRuntimeItemFlow, 0, len(items))
+	for _, item := range items {
+		runtime.TopItems = append(runtime.TopItems, stationAIRuntimeItemFlow{
+			TypeID:      item.typeID,
+			TypeName:    item.typeName,
+			Trades:      item.trades,
+			Volume:      item.volume,
+			TurnoverISK: item.turnover,
+		})
+	}
+}
+
+func (s *Server) stationAIBuildRuntimeContext(ctx context.Context, userID, locale string) (*stationAIRuntimeContext, []string) {
+	runtime := &stationAIRuntimeContext{
+		Available:     false,
+		TxnWindowDays: stationAIRuntimeTxnWindowDays,
+		FetchedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	warnings := make([]string, 0, 4)
+	seenWarnings := make(map[string]struct{}, 4)
+	var mu sync.Mutex
+	addWarning := func(msg string) {
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			return
+		}
+		mu.Lock()
+		if _, exists := seenWarnings[msg]; exists {
+			mu.Unlock()
+			return
+		}
+		seenWarnings[msg] = struct{}{}
+		warnings = append(warnings, msg)
+		runtime.Notes = append(runtime.Notes, msg)
+		mu.Unlock()
+	}
+
+	notLoggedWarn := stationAIRuntimeLocaleText(
+		locale,
+		"runtime account context unavailable: user is not logged in",
+		"runtime-контекст аккаунта недоступен: пользователь не авторизован",
+	)
+	cancelWarn := stationAIRuntimeLocaleText(
+		locale,
+		"runtime account context fetch canceled",
+		"сбор runtime-контекста аккаунта отменен",
+	)
+	if s.sessions == nil {
+		addWarning(notLoggedWarn)
+		return runtime, warnings
+	}
+	sess := s.sessions.GetForUser(userID)
+	if sess == nil {
+		addWarning(notLoggedWarn)
+		return runtime, warnings
+	}
+	runtime.CharacterID = sess.CharacterID
+	runtime.CharacterName = sess.CharacterName
+
+	if err := ctx.Err(); err != nil {
+		addWarning(cancelWarn)
+		return runtime, warnings
+	}
+	token, err := s.sessions.EnsureValidTokenForUserCharacter(s.sso, userID, sess.CharacterID)
+	if err != nil {
+		addWarning(stationAIRuntimeLocaleText(
+			locale,
+			"runtime account context unavailable: auth token refresh failed",
+			"runtime-контекст аккаунта недоступен: не удалось обновить auth-токен",
+		))
+		return runtime, warnings
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		if err := ctx.Err(); err != nil {
+			addWarning(cancelWarn)
+			return
+		}
+		balance, fetchErr := s.esi.GetWalletBalance(sess.CharacterID, token)
+		if fetchErr != nil {
+			addWarning(stationAIRuntimeLocaleText(
+				locale,
+				"runtime context: failed to fetch wallet balance",
+				"runtime-контекст: не удалось получить баланс кошелька",
+			))
+			return
+		}
+		mu.Lock()
+		runtime.WalletAvailable = true
+		runtime.WalletISK = balance
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := ctx.Err(); err != nil {
+			addWarning(cancelWarn)
+			return
+		}
+		orders, fetchErr := s.esi.GetCharacterOrders(sess.CharacterID, token)
+		if fetchErr != nil {
+			addWarning(stationAIRuntimeLocaleText(
+				locale,
+				"runtime context: failed to fetch active orders",
+				"runtime-контекст: не удалось получить активные ордера",
+			))
+			return
+		}
+		buyOrders := 0
+		sellOrders := 0
+		notional := 0.0
+		for _, o := range orders {
+			notional += o.Price * float64(o.VolumeRemain)
+			if o.IsBuyOrder {
+				buyOrders++
+			} else {
+				sellOrders++
+			}
+		}
+		mu.Lock()
+		runtime.OrdersAvailable = true
+		runtime.ActiveOrders = len(orders)
+		runtime.BuyOrders = buyOrders
+		runtime.SellOrders = sellOrders
+		runtime.OpenOrderNotionalISK = notional
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := ctx.Err(); err != nil {
+			addWarning(cancelWarn)
+			return
+		}
+		txns, ok := s.getWalletTxnCache(sess.CharacterID)
+		if !ok {
+			freshTxns, fetchErr := s.esi.GetWalletTransactions(sess.CharacterID, token)
+			if fetchErr != nil {
+				addWarning(stationAIRuntimeLocaleText(
+					locale,
+					"runtime context: failed to fetch wallet transactions",
+					"runtime-контекст: не удалось получить транзакции кошелька",
+				))
+				return
+			}
+			s.setWalletTxnCache(sess.CharacterID, freshTxns)
+			txns = freshTxns
+		}
+		s.stationAIEnrichTxnTypeNames(txns)
+		txSummary := stationAIRuntimeContext{
+			TxnWindowDays: stationAIRuntimeTxnWindowDays,
+		}
+		stationAISummarizeRuntimeTransactions(&txSummary, txns)
+		risk := engine.ComputePortfolioRiskFromTransactions(txns)
+		mu.Lock()
+		runtime.TransactionsAvailable = true
+		runtime.TransactionCount = txSummary.TransactionCount
+		runtime.BuyFlowISK = txSummary.BuyFlowISK
+		runtime.SellFlowISK = txSummary.SellFlowISK
+		runtime.NetFlowISK = txSummary.NetFlowISK
+		runtime.TopItems = txSummary.TopItems
+		runtime.Risk = risk
+		mu.Unlock()
+	}()
+
+	wg.Wait()
+
+	runtime.Available = runtime.WalletAvailable || runtime.OrdersAvailable || runtime.TransactionsAvailable
+	if runtime.Available {
+		log.Printf(
+			"[AI][RUNTIME] character=%s(%d) wallet=%t orders=%t tx=%t tx_count=%d",
+			runtime.CharacterName,
+			runtime.CharacterID,
+			runtime.WalletAvailable,
+			runtime.OrdersAvailable,
+			runtime.TransactionsAvailable,
+			runtime.TransactionCount,
+		)
+	} else {
+		log.Printf(
+			"[AI][RUNTIME] character=%s(%d) unavailable notes=%v",
+			runtime.CharacterName,
+			runtime.CharacterID,
+			runtime.Notes,
+		)
+	}
+
+	return runtime, warnings
+}
+
+func buildStationAIMessages(systemPrompt string, history []stationAIHistoryMessage, userPrompt string) []map[string]string {
+	messages := make([]map[string]string, 0, 2+len(history))
+	messages = append(messages, map[string]string{
+		"role":    "system",
+		"content": systemPrompt,
+	})
+	for _, msg := range history {
+		messages = append(messages, map[string]string{
+			"role":    msg.Role,
+			"content": msg.Content,
+		})
+	}
+	messages = append(messages, map[string]string{
+		"role":    "user",
+		"content": userPrompt,
+	})
+	return messages
+}
+
+func (s *Server) stationAIOpenRouterChatOnce(
+	ctx context.Context,
+	req stationAIChatRequestPayload,
+	messages []map[string]string,
+) (stationAIProviderReply, error) {
+	payload := map[string]interface{}{
+		"model":       req.Model,
+		"temperature": req.Temperature,
+		"max_tokens":  req.MaxTokens,
+		"messages":    messages,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return stationAIProviderReply{}, fmt.Errorf("failed to encode ai request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"https://openrouter.ai/api/v1/chat/completions",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return stationAIProviderReply{}, fmt.Errorf("failed to create ai request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
+	httpReq.Header.Set("HTTP-Referer", "http://localhost:1420")
+	httpReq.Header.Set("X-Title", "EVE Flipper Station AI")
+
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return stationAIProviderReply{}, fmt.Errorf("ai provider request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	rawResp, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return stationAIProviderReply{}, fmt.Errorf("failed to read ai provider response: %w", readErr)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errMsg := "ai provider error"
+		var errBody struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(rawResp, &errBody) == nil && strings.TrimSpace(errBody.Error.Message) != "" {
+			errMsg = strings.TrimSpace(errBody.Error.Message)
+		}
+		return stationAIProviderReply{}, errors.New(errMsg)
+	}
+
+	var orResp struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage map[string]interface{} `json:"usage"`
+	}
+	if err := json.Unmarshal(rawResp, &orResp); err != nil {
+		return stationAIProviderReply{}, fmt.Errorf("invalid ai provider response: %w", err)
+	}
+	if len(orResp.Choices) == 0 {
+		return stationAIProviderReply{}, errors.New("empty ai response")
+	}
+
+	answer := strings.TrimSpace(extractAIContent(orResp.Choices[0].Message.Content))
+	if answer == "" {
+		return stationAIProviderReply{}, errors.New("empty ai answer")
+	}
+	model := strings.TrimSpace(orResp.Model)
+	if model == "" {
+		model = req.Model
+	}
+	return stationAIProviderReply{
+		Answer:     answer,
+		Model:      model,
+		ProviderID: strings.TrimSpace(orResp.ID),
+		Usage:      orResp.Usage,
+	}, nil
+}
+
+func (s *Server) handleAuthStationAIChat(w http.ResponseWriter, r *http.Request) {
+	var req stationAIChatRequestPayload
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+
+	enableWiki, enableWeb, warnings, validationErr := normalizeStationAIChatRequest(&req)
+	if validationErr != "" {
+		writeError(w, 400, validationErr)
+		return
+	}
+
+	plan, plannerEnabled, plannerWarnings := s.stationAIResolvePlan(r.Context(), req)
+	warnings = append(warnings, plannerWarnings...)
+	intent := plan.Intent
+	useWiki := enableWiki && intent != stationAIIntentSmallTalk
+	useWeb := enableWeb && intent != stationAIIntentSmallTalk
+	useRuntime := stationAINeedsRuntimeContext(intent, req.UserMessage)
+	pipeline := stationAIPipelineMeta(req, plan, plannerEnabled)
+	log.Printf(
+		"[AI][CHAT] mode=sync intent=%s planner=%t wiki_enabled=%t need_wiki=%t wiki_used=%t web_enabled=%t need_web=%t web_used=%t runtime_requested=%t locale=%s model=%s",
+		intent,
+		plannerEnabled,
+		enableWiki,
+		plan.NeedWiki,
+		useWiki,
+		enableWeb,
+		plan.NeedWeb,
+		useWeb,
+		useRuntime,
+		req.Locale,
+		req.Model,
+	)
+	if len(plannerWarnings) > 0 {
+		log.Printf("[AI][CHAT] mode=sync planner_warnings=%v", plannerWarnings)
+	}
+	if plan.AskClarification && strings.TrimSpace(plan.Clarification) != "" {
+		warnings = append(warnings, "planner asked for clarification")
+		writeJSON(w, map[string]interface{}{
+			"answer":    strings.TrimSpace(plan.Clarification),
+			"provider":  req.Provider,
+			"model":     req.Model,
+			"assistant": req.AssistantName,
+			"intent":    string(intent),
+			"pipeline":  pipeline,
+			"warnings":  warnings,
+		})
+		return
+	}
+	contextForPrompt := stationAIContextForPlan(req.Context, plan)
+	runtimeUsed := false
+	if useRuntime {
+		userID := userIDFromRequest(r)
+		runtimeCtx, rw := s.stationAIBuildRuntimeContext(r.Context(), userID, req.Locale)
+		if runtimeCtx != nil {
+			contextForPrompt.Runtime = runtimeCtx
+			runtimeUsed = runtimeCtx.Available
+		}
+		warnings = append(warnings, rw...)
+		log.Printf("[AI][CHAT] mode=sync runtime_requested=%t runtime_used=%t", useRuntime, runtimeUsed)
+	}
+	preflight := stationAIPreflight(req.Locale, plan, contextForPrompt, useRuntime)
+	pipeline["preflight_status"] = preflight.Status
+	if len(preflight.Missing) > 0 {
+		pipeline["preflight_missing"] = preflight.Missing
+	}
+	if len(preflight.Caveats) > 0 {
+		pipeline["preflight_caveats"] = preflight.Caveats
+	}
+	if preflight.Status == "fail" {
+		warnings = append(warnings, "preflight failed: missing "+strings.Join(preflight.Missing, ", "))
+		answer := stationAIPreflightFailAnswer(req.Locale, preflight.Missing)
+		writeJSON(w, map[string]interface{}{
+			"answer":    answer,
+			"provider":  req.Provider,
+			"model":     req.Model,
+			"assistant": req.AssistantName,
+			"intent":    string(intent),
+			"pipeline":  pipeline,
+			"warnings":  warnings,
+		})
+		log.Printf("[AI][CHAT] mode=sync preflight=fail intent=%s missing=%v", intent, preflight.Missing)
+		return
+	}
+	contextJSON, err := json.Marshal(contextForPrompt)
+	if err != nil {
+		writeError(w, 500, "failed to encode context")
+		return
+	}
+	wikiSnippets := make([]aiKnowledgeSnippet, 0, 4)
+	webSnippets := make([]aiKnowledgeSnippet, 0, 4)
+	if useWiki {
+		ws, ww := s.stationAIWikiSnippets(r.Context(), req.Locale, req.UserMessage, req.WikiRepo, intent)
+		wikiSnippets = ws
+		warnings = append(warnings, ww...)
+	} else if enableWiki {
+		if intent == stationAIIntentSmallTalk {
+			log.Printf("[AI][CHAT] mode=sync wiki skipped for smalltalk intent")
+		} else if !plan.NeedWiki {
+			log.Printf("[AI][CHAT] mode=sync wiki skipped by planner intent=%s", intent)
+		}
+	}
+	if useWeb {
+		ws, ww := stationAIWebSnippets(r.Context(), req.Locale, req.UserMessage, intent)
+		webSnippets = ws
+		warnings = append(warnings, ww...)
+	} else if enableWeb {
+		log.Printf("[AI][CHAT] mode=sync web skipped for smalltalk intent")
+	}
+	knowledgeBlock := buildStationAIKnowledgeBlock(req.Locale, wikiSnippets, webSnippets)
+	agentBlock := buildStationAIAgentBlock(req.Locale, plan, contextForPrompt, wikiSnippets, webSnippets)
+
+	systemPrompt := stationAISystemPrompt(req.Locale, req.AssistantName, plan)
+	userPrompt := stationAIUserPrompt(req.Locale, req.UserMessage, contextJSON, plan)
+	if caveatBlock := stationAIPreflightCaveatBlock(req.Locale, preflight); caveatBlock != "" {
+		userPrompt += "\n\n" + caveatBlock
+	}
+	if agentBlock != "" {
+		userPrompt += "\n\n" + agentBlock
+	}
+	if knowledgeBlock != "" {
+		userPrompt += "\n\n" + knowledgeBlock
+	}
+	messages := buildStationAIMessages(systemPrompt, req.History, userPrompt)
+
+	reply, err := s.stationAIOpenRouterChatOnce(r.Context(), req, messages)
+	if err != nil {
+		writeError(w, 502, err.Error())
+		return
+	}
+
+	if valid, issue := stationAIValidateAnswer(reply.Answer, intent); !valid {
+		warnings = append(warnings, "server validation requested retry: "+issue)
+		retryMessages := make([]map[string]string, 0, len(messages)+2)
+		retryMessages = append(retryMessages, messages...)
+		retryMessages = append(retryMessages,
+			map[string]string{"role": "assistant", "content": reply.Answer},
+			map[string]string{"role": "user", "content": stationAIRetryCorrectionPrompt(req.Locale, issue)},
+		)
+		retryReply, retryErr := s.stationAIOpenRouterChatOnce(r.Context(), req, retryMessages)
+		if retryErr != nil {
+			warnings = append(warnings, "retry failed: "+retryErr.Error())
+		} else if validRetry, retryIssue := stationAIValidateAnswer(retryReply.Answer, intent); validRetry {
+			reply = retryReply
+		} else {
+			warnings = append(warnings, "retry rejected: "+retryIssue)
+		}
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"answer":         reply.Answer,
+		"provider":       req.Provider,
+		"model":          reply.Model,
+		"assistant":      req.AssistantName,
+		"intent":         string(intent),
+		"pipeline":       pipeline,
+		"warnings":       warnings,
+		"provider_id":    reply.ProviderID,
+		"provider_usage": reply.Usage,
+	})
+	log.Printf(
+		"[AI][CHAT] mode=sync done intent=%s wiki_snippets=%d web_snippets=%d warnings=%d provider_model=%s",
+		intent,
+		len(wikiSnippets),
+		len(webSnippets),
+		len(warnings),
+		reply.Model,
+	)
+}
+
+func estimateTokensFromRuneCount(runes int) int {
+	if runes <= 0 {
+		return 0
+	}
+	// Heuristic for mixed EN/RU text; used only for live UI progress, not billing.
+	tokens := int(float64(runes)/3.6 + 0.5)
+	if tokens < 1 {
+		return 1
+	}
+	return tokens
+}
+
+func estimateTokensFromText(text string) int {
+	return estimateTokensFromRuneCount(utf8.RuneCountInString(text))
+}
+
+func sanitizeWikiRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultStationAIWikiRepo
+	}
+
+	// Accept git/ssh variants and plain github paths
+	repo = strings.TrimPrefix(repo, "git@github.com:")
+	repo = strings.TrimPrefix(repo, "github.com/")
+
+	// Accept full URL format like https://github.com/owner/repo/wiki
+	if strings.HasPrefix(strings.ToLower(repo), "http://") || strings.HasPrefix(strings.ToLower(repo), "https://") {
+		u, err := url.Parse(repo)
+		if err != nil {
+			return defaultStationAIWikiRepo
+		}
+		host := strings.ToLower(strings.TrimSpace(u.Host))
+		if host != "github.com" && host != "www.github.com" {
+			return defaultStationAIWikiRepo
+		}
+		repo = strings.Trim(u.Path, "/")
+	}
+
+	segments := strings.Split(strings.Trim(repo, "/"), "/")
+	if len(segments) < 2 {
+		return defaultStationAIWikiRepo
+	}
+	owner := segments[0]
+	repoName := segments[1]
+
+	// Normalize common suffixes
+	repoName = strings.TrimSuffix(repoName, ".git")
+	repoName = strings.TrimSuffix(repoName, ".wiki")
+	if len(segments) >= 3 {
+		last := strings.ToLower(segments[len(segments)-1])
+		if last == "wiki" {
+			// keep owner/repo from first two segments
+		}
+	}
+
+	if !aiRepoPartRe.MatchString(owner) || !aiRepoPartRe.MatchString(repoName) {
+		return defaultStationAIWikiRepo
+	}
+	return owner + "/" + repoName
+}
+
+func aiTrimForPrompt(text string, maxChars int) string {
+	text = strings.TrimSpace(text)
+	if maxChars <= 0 || len(text) <= maxChars {
+		return text
+	}
+	return strings.TrimSpace(text[:maxChars]) + "..."
+}
+
+func aiKeywordTerms(message string) []string {
+	lower := strings.ToLower(message)
+	replacer := strings.NewReplacer(
+		",", " ",
+		".", " ",
+		":", " ",
+		";", " ",
+		"!", " ",
+		"?", " ",
+		"(", " ",
+		")", " ",
+		"[", " ",
+		"]", " ",
+		"{", " ",
+		"}", " ",
+		"\"", " ",
+		"'", " ",
+		"\n", " ",
+		"\t", " ",
+		"/", " ",
+		"\\", " ",
+	)
+	clean := replacer.Replace(lower)
+	parts := strings.Fields(clean)
+	if len(parts) == 0 {
+		return nil
+	}
+	stop := map[string]struct{}{
+		"что": {}, "как": {}, "где": {}, "когда": {}, "почему": {}, "для": {}, "или": {}, "это": {}, "есть": {},
+		"with": {}, "from": {}, "that": {}, "this": {}, "what": {}, "when": {}, "where": {}, "which": {},
+	}
+	seen := make(map[string]struct{}, len(parts))
+	terms := make([]string, 0, 12)
+	for _, p := range parts {
+		if len(p) < 3 {
+			continue
+		}
+		if _, ok := stop[p]; ok {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		terms = append(terms, p)
+		if len(terms) >= 12 {
+			break
+		}
+	}
+	return terms
+}
+
+func aiScoreAndSnippet(doc string, terms []string) (int, string) {
+	if strings.TrimSpace(doc) == "" {
+		return 0, ""
+	}
+	if len(terms) == 0 {
+		return 1, aiTrimForPrompt(doc, 520)
+	}
+	lower := strings.ToLower(doc)
+	score := 0
+	firstPos := -1
+	for _, term := range terms {
+		pos := strings.Index(lower, term)
+		if pos < 0 {
+			continue
+		}
+		score++
+		if firstPos == -1 || pos < firstPos {
+			firstPos = pos
+		}
+	}
+	if score == 0 {
+		return 0, ""
+	}
+	start := firstPos - 220
+	if start < 0 {
+		start = 0
+	}
+	end := firstPos + 420
+	if end > len(doc) {
+		end = len(doc)
+	}
+	return score, aiTrimForPrompt(doc[start:end], 620)
+}
+
+func (s *Server) fetchAIWikiMarkdown(ctx context.Context, repo, page string) (string, string, error) {
+	key := repo + "|" + page
+	if cachedRaw, ok := aiWikiPageCache.Load(key); ok {
+		if cached, ok2 := cachedRaw.(aiWikiCacheEntry); ok2 {
+			age := time.Since(cached.FetchedAt)
+			if cached.Err != "" {
+				// Do not keep transient wiki errors for too long.
+				if age <= aiWikiErrorCacheTTL {
+					return "", cached.URL, errors.New(cached.Err)
+				}
+			} else if age <= aiWikiCacheTTL {
+				return cached.Body, cached.URL, nil
+			}
+		}
+	}
+
+	pageEscaped := url.PathEscape(page)
+	urlStr := fmt.Sprintf("https://raw.githubusercontent.com/wiki/%s/%s.md", repo, pageEscaped)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		aiWikiPageCache.Store(key, aiWikiCacheEntry{URL: urlStr, FetchedAt: time.Now(), Err: err.Error()})
+		return "", urlStr, err
+	}
+	client := &http.Client{Timeout: 12 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		aiWikiPageCache.Store(key, aiWikiCacheEntry{URL: urlStr, FetchedAt: time.Now(), Err: err.Error()})
+		return "", urlStr, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		err := fmt.Errorf("wiki http %d", resp.StatusCode)
+		aiWikiPageCache.Store(key, aiWikiCacheEntry{URL: urlStr, FetchedAt: time.Now(), Err: err.Error()})
+		return "", urlStr, err
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 900_000))
+	if err != nil {
+		aiWikiPageCache.Store(key, aiWikiCacheEntry{URL: urlStr, FetchedAt: time.Now(), Err: err.Error()})
+		return "", urlStr, err
+	}
+	content := strings.TrimSpace(string(body))
+	aiWikiPageCache.Store(key, aiWikiCacheEntry{
+		Body:      content,
+		URL:       urlStr,
+		FetchedAt: time.Now(),
+	})
+	return content, urlStr, nil
+}
+
+func (s *Server) stationAIWikiSnippets(ctx context.Context, locale, userMessage, repo string, intent stationAIIntentKind) ([]aiKnowledgeSnippet, []string) {
+	repo = sanitizeWikiRepo(repo)
+	warnings := make([]string, 0, 3)
+	if s.wikiRAG != nil {
+		if ragSnippets, ragWarnings, ragErr := s.wikiRAG.Retrieve(ctx, repo, locale, userMessage, intent, stationAIWikiTopK); ragErr == nil && len(ragSnippets) > 0 {
+			top := ragSnippets[0]
+			log.Printf(
+				"[AI][WIKI-RAG] repo=%s intent=%s locale=%s results=%d top_page=%s top_section=%s hybrid=%.4f vector=%.4f keyword=%.4f",
+				repo,
+				intent,
+				locale,
+				len(ragSnippets),
+				top.Page,
+				top.Section,
+				top.HybridScore,
+				top.VectorScore,
+				top.KeywordScore,
+			)
+			warnings = append(warnings, ragWarnings...)
+			return ragSnippets, warnings
+		} else if ragErr != nil {
+			log.Printf("[AI][WIKI-RAG] repo=%s intent=%s locale=%s error=%v", repo, intent, locale, ragErr)
+			warnings = append(warnings, "wiki rag unavailable, using fallback retrieval")
+		} else {
+			log.Printf("[AI][WIKI-RAG] repo=%s intent=%s locale=%s no semantic hits, using fallback retrieval", repo, intent, locale)
+		}
+	}
+
+	terms := aiKeywordTerms(userMessage)
+	pages := []string{
+		"Home",
+		"Station-Trading",
+		"Execution-Plan",
+		"Radius-Scan",
+		"Region-Arbitrage",
+		"Route-Trading",
+		"Contract-Scanner",
+		"Industry-Chain-Optimizer",
+		"Getting-Started",
+		"API-Reference",
+		"PLEX-Dashboard",
+		"War-Tracker",
+	}
+	type wikiPageDoc struct {
+		Title string
+		Page  string
+		URL   string
+		Body  string
+		Index int
+	}
+	docs := make([]wikiPageDoc, 0, len(pages))
+	candidates := make([]aiKnowledgeSnippet, 0, 12)
+	for idx, page := range pages {
+		body, srcURL, err := s.fetchAIWikiMarkdown(ctx, repo, page)
+		if err != nil || strings.TrimSpace(body) == "" {
+			continue
+		}
+		title := strings.ReplaceAll(page, "-", " ")
+		docs = append(docs, wikiPageDoc{
+			Title: title,
+			Page:  page,
+			URL:   srcURL,
+			Body:  body,
+			Index: idx,
+		})
+		score, snippet := aiScoreAndSnippet(body, terms)
+		if score == 0 || strings.TrimSpace(snippet) == "" {
+			continue
+		}
+		candidates = append(candidates, aiKnowledgeSnippet{
+			SourceLabel: "WIKI",
+			Title:       title,
+			Page:        title,
+			Section:     title,
+			Locale:      locale,
+			URL:         srcURL,
+			Content:     snippet,
+			Score:       score,
+		})
+	}
+	if len(candidates) == 0 && len(docs) > 0 {
+		// Fallback mode: return generic snippets when no keyword hit is found.
+		for _, doc := range docs {
+			_, snippet := aiScoreAndSnippet(doc.Body, nil)
+			if strings.TrimSpace(snippet) == "" {
+				continue
+			}
+			candidates = append(candidates, aiKnowledgeSnippet{
+				SourceLabel: "WIKI",
+				Title:       doc.Title,
+				Page:        strings.ReplaceAll(doc.Page, "-", " "),
+				Section:     strings.ReplaceAll(doc.Page, "-", " "),
+				Locale:      locale,
+				URL:         doc.URL,
+				Content:     snippet,
+				Score:       100 - doc.Index,
+			})
+			if len(candidates) >= 4 {
+				break
+			}
+		}
+	}
+	if readme, err := os.ReadFile("README.md"); err == nil {
+		score, snippet := aiScoreAndSnippet(string(readme), terms)
+		if score > 0 && strings.TrimSpace(snippet) != "" {
+			candidates = append(candidates, aiKnowledgeSnippet{
+				SourceLabel: "README",
+				Title:       "README",
+				Page:        "README",
+				Section:     "README",
+				Locale:      locale,
+				URL:         "https://github.com/" + repo,
+				Content:     snippet,
+				Score:       score,
+			})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Score == candidates[j].Score {
+			return candidates[i].Title < candidates[j].Title
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+	if len(candidates) > 4 {
+		candidates = candidates[:4]
+	}
+	log.Printf("[AI][WIKI-FALLBACK] repo=%s intent=%s locale=%s terms=%d snippets=%d", repo, intent, locale, len(terms), len(candidates))
+	if len(candidates) == 0 {
+		if locale == "ru" {
+			warnings = append(warnings, "wiki context unavailable")
+		} else {
+			warnings = append(warnings, "wiki context unavailable")
+		}
+	}
+	return candidates, warnings
+}
+
+func stationAIWebSnippets(ctx context.Context, locale, userMessage string, intent stationAIIntentKind) ([]aiKnowledgeSnippet, []string) {
+	userMessage = strings.TrimSpace(userMessage)
+	if userMessage == "" {
+		return nil, nil
+	}
+	unavailableWarn := "web research unavailable"
+	noDataWarn := "web research returned no snippets"
+	partialWarn := "web research returned partial results"
+	if locale == "ru" {
+		unavailableWarn = "web research недоступен"
+		noDataWarn = "web research не вернул сниппетов"
+		partialWarn = "web research вернул частичные результаты"
+	}
+
+	queries := stationAIWebQueryVariants(locale, userMessage, intent)
+	if len(queries) == 0 {
+		return nil, []string{noDataWarn}
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	out := make([]aiKnowledgeSnippet, 0, stationAIWebMaxSnippets)
+	seen := make(map[string]struct{}, stationAIWebMaxSnippets*2)
+	hadErrors := false
+
+	for i, query := range queries {
+		remaining := stationAIWebMaxSnippets - len(out)
+		if remaining <= 0 {
+			break
+		}
+		found, err := stationAIFetchDuckDuckGoSnippets(ctx, client, query, remaining)
+		if err != nil {
+			hadErrors = true
+			log.Printf("[AI][WEB] query=%q error=%v", query, err)
+			continue
+		}
+		log.Printf("[AI][WEB] query=%q snippets=%d", query, len(found))
+		for rank, sn := range found {
+			key := stationAIWebSnippetDedupKey(sn)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			sn.Score = (len(queries)-i)*100 + (remaining - rank)
+			out = append(out, sn)
+			if len(out) >= stationAIWebMaxSnippets {
+				break
+			}
+		}
+	}
+
+	if len(out) == 0 {
+		if hadErrors {
+			return nil, []string{unavailableWarn}
+		}
+		return nil, []string{noDataWarn}
+	}
+	if hadErrors {
+		return out, []string{partialWarn}
+	}
+	return out, nil
+}
+
+func stationAIWebQueryVariants(locale, userMessage string, intent stationAIIntentKind) []string {
+	userMessage = strings.TrimSpace(userMessage)
+	if userMessage == "" {
+		return nil
+	}
+
+	out := make([]string, 0, stationAIWebMaxQueries)
+	seen := make(map[string]struct{}, stationAIWebMaxQueries*2)
+	add := func(query string) {
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return
+		}
+		norm := strings.Join(strings.Fields(strings.ToLower(query)), " ")
+		if norm == "" {
+			return
+		}
+		if _, exists := seen[norm]; exists {
+			return
+		}
+		seen[norm] = struct{}{}
+		out = append(out, query)
+	}
+
+	add(aiTrimForPrompt(userMessage, 220))
+
+	terms := aiKeywordTerms(userMessage)
+	if len(terms) > 0 {
+		n := len(terms)
+		if n > 8 {
+			n = 8
+		}
+		add(strings.Join(terms[:n], " ") + " eve online")
+	}
+
+	switch intent {
+	case stationAIIntentTrading:
+		add(userMessage + " eve online market trading")
+	case stationAIIntentDebug:
+		add(userMessage + " EVE Flipper troubleshooting")
+	case stationAIIntentProduct:
+		add(userMessage + " EVE Flipper wiki docs")
+	case stationAIIntentResearch:
+		add(userMessage + " latest eve online")
+	default:
+		add(userMessage + " eve online")
+	}
+
+	if locale == "ru" {
+		add(userMessage + " EVE Online")
+	}
+
+	if len(out) > stationAIWebMaxQueries {
+		out = out[:stationAIWebMaxQueries]
+	}
+	return out
+}
+
+func stationAIFetchDuckDuckGoSnippets(
+	ctx context.Context,
+	client *http.Client,
+	query string,
+	limit int,
+) ([]aiKnowledgeSnippet, error) {
+	query = strings.TrimSpace(query)
+	if query == "" || limit <= 0 {
+		return nil, nil
+	}
+	reqURL := "https://api.duckduckgo.com/?format=json&no_html=1&skip_disambig=1&q=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("duckduckgo http %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1_000_000))
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Heading       string `json:"Heading"`
+		AbstractText  string `json:"AbstractText"`
+		AbstractURL   string `json:"AbstractURL"`
+		RelatedTopics []struct {
+			Text     string `json:"Text"`
+			FirstURL string `json:"FirstURL"`
+			Topics   []struct {
+				Text     string `json:"Text"`
+				FirstURL string `json:"FirstURL"`
+			} `json:"Topics"`
+		} `json:"RelatedTopics"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+
+	out := make([]aiKnowledgeSnippet, 0, limit)
+	push := func(title, link, text string) {
+		if len(out) >= limit {
+			return
+		}
+		title = strings.TrimSpace(title)
+		link = strings.TrimSpace(link)
+		text = aiTrimForPrompt(strings.TrimSpace(text), 500)
+		if title == "" || text == "" {
+			return
+		}
+		out = append(out, aiKnowledgeSnippet{
+			SourceLabel: "WEB",
+			Title:       title,
+			URL:         link,
+			Content:     text,
+			Score:       1,
+		})
+	}
+
+	if strings.TrimSpace(payload.AbstractText) != "" {
+		title := strings.TrimSpace(payload.Heading)
+		if title == "" {
+			title = "DuckDuckGo"
+		}
+		push(title, payload.AbstractURL, payload.AbstractText)
+	}
+	for _, rt := range payload.RelatedTopics {
+		if strings.TrimSpace(rt.Text) != "" {
+			push("DuckDuckGo related", rt.FirstURL, rt.Text)
+			continue
+		}
+		for _, sub := range rt.Topics {
+			push("DuckDuckGo related", sub.FirstURL, sub.Text)
+			if len(out) >= limit {
+				break
+			}
+		}
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func stationAIWebSnippetDedupKey(sn aiKnowledgeSnippet) string {
+	urlKey := strings.TrimSpace(strings.ToLower(sn.URL))
+	if urlKey != "" {
+		return "url:" + urlKey
+	}
+	titleKey := strings.TrimSpace(strings.ToLower(sn.Title))
+	contentKey := strings.TrimSpace(strings.ToLower(aiTrimForPrompt(sn.Content, 120)))
+	return "txt:" + titleKey + "|" + contentKey
+}
+
+func buildStationAIKnowledgeBlock(locale string, wikiSnippets, webSnippets []aiKnowledgeSnippet) string {
+	if len(wikiSnippets) == 0 && len(webSnippets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if locale == "ru" {
+		b.WriteString("Structured knowledge context (wiki/web). Используй только если релевантно. Ссылайся на источники строго как [WIKI N] / [WEB N].\n\n")
+	} else {
+		b.WriteString("Structured knowledge context (wiki/web). Use only when relevant and cite sources strictly as [WIKI N] / [WEB N].\n\n")
+	}
+	for i, sn := range wikiSnippets {
+		page := strings.TrimSpace(sn.Page)
+		if page == "" {
+			page = sn.Title
+		}
+		section := strings.TrimSpace(sn.Section)
+		if section == "" {
+			section = "Overview"
+		}
+		fmt.Fprintf(
+			&b,
+			"[WIKI %d]\npage: %s\nsection: %s\nurl: %s\ncontent:\n%s\n\n",
+			i+1,
+			page,
+			section,
+			sn.URL,
+			sn.Content,
+		)
+	}
+	for i, sn := range webSnippets {
+		fmt.Fprintf(
+			&b,
+			"[WEB %d]\ntitle: %s\nurl: %s\ncontent:\n%s\n\n",
+			i+1,
+			sn.Title,
+			sn.URL,
+			sn.Content,
+		)
+	}
+	return b.String()
+}
+
+func buildStationAIAgentBlock(locale string, plan stationAIPlannerPlan, ctx stationAIContextPayload, wikiSnippets, webSnippets []aiKnowledgeSnippet) string {
+	if len(plan.Agents) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(plan.Agents))
+	actionableRows := make([]stationAIContextRow, 0, len(ctx.Rows))
+	for _, row := range ctx.Rows {
+		if strings.EqualFold(strings.TrimSpace(row.Action), "hold") {
+			continue
+		}
+		actionableRows = append(actionableRows, row)
+	}
+	if len(actionableRows) == 0 {
+		actionableRows = append(actionableRows, ctx.Rows...)
+	}
+	sort.SliceStable(actionableRows, func(i, j int) bool {
+		if actionableRows[i].DailyProfit == actionableRows[j].DailyProfit {
+			return actionableRows[i].CTS > actionableRows[j].CTS
+		}
+		return actionableRows[i].DailyProfit > actionableRows[j].DailyProfit
+	})
+	highRisk := 0
+	extreme := 0
+	for _, row := range ctx.Rows {
+		if row.HighRisk {
+			highRisk++
+		}
+		if row.ExtremePrice {
+			extreme++
+		}
+	}
+	if ctx.Runtime != nil {
+		if ctx.Runtime.Available {
+			riskLabel := "n/a"
+			if ctx.Runtime.Risk != nil {
+				riskLabel = ctx.Runtime.Risk.RiskLevel
+			}
+			lines = append(lines, fmt.Sprintf(
+				"account_runtime: wallet=%.0f ISK, active_orders=%d (buy=%d sell=%d), tx_%dd=%d, net_flow=%.0f ISK, risk=%s",
+				ctx.Runtime.WalletISK,
+				ctx.Runtime.ActiveOrders,
+				ctx.Runtime.BuyOrders,
+				ctx.Runtime.SellOrders,
+				ctx.Runtime.TxnWindowDays,
+				ctx.Runtime.TransactionCount,
+				ctx.Runtime.NetFlowISK,
+				riskLabel,
+			))
+		} else if len(ctx.Runtime.Notes) > 0 {
+			lines = append(lines, "account_runtime: unavailable ("+ctx.Runtime.Notes[0]+")")
+		}
+	}
+
+	for _, agent := range plan.Agents {
+		switch agent {
+		case "scan_analyzer":
+			if len(actionableRows) == 0 {
+				continue
+			}
+			limit := len(actionableRows)
+			if limit > 3 {
+				limit = 3
+			}
+			parts := make([]string, 0, limit)
+			for i := 0; i < limit; i++ {
+				row := actionableRows[i]
+				parts = append(parts, fmt.Sprintf("%s(%s, %.0f ISK/day, %.1f%%)", row.TypeName, row.Action, row.DailyProfit, row.Margin))
+			}
+			lines = append(lines, "scan_analyzer: "+strings.Join(parts, "; "))
+		case "risk_checker":
+			lines = append(lines, fmt.Sprintf("risk_checker: high_risk=%d, extreme_price=%d, visible_rows=%d", highRisk, extreme, ctx.Summary.VisibleRows))
+		case "wiki_retriever":
+			if len(wikiSnippets) > 0 {
+				lines = append(lines, fmt.Sprintf("wiki_retriever: %d wiki snippets attached", len(wikiSnippets)))
+			}
+		case "web_retriever":
+			if len(webSnippets) > 0 {
+				lines = append(lines, fmt.Sprintf("web_retriever: %d web snippets attached", len(webSnippets)))
+			}
+		case "debug_helper":
+			lines = append(lines, fmt.Sprintf("debug_helper: tab=%s, system=%s, scope=%s", ctx.TabID, ctx.SystemName, ctx.StationScope))
+		}
+	}
+
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if locale == "ru" {
+		b.WriteString("Внутренние заметки агентного пайплайна (planner -> executor):\n")
+	} else {
+		b.WriteString("Internal agent pipeline notes (planner -> executor):\n")
+	}
+	for _, line := range lines {
+		b.WriteString("- ")
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (s *Server) handleAuthStationAIChatStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, 500, "streaming not supported")
+		return
+	}
+
+	writeMsg := func(msg map[string]interface{}) bool {
+		line, err := json.Marshal(msg)
+		if err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+	writeErr := func(message string) {
+		_ = writeMsg(map[string]interface{}{
+			"type":    "error",
+			"message": message,
+		})
+	}
+
+	var req stationAIChatRequestPayload
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr("invalid json")
+		return
+	}
+
+	enableWiki, enableWeb, warnings, validationErr := normalizeStationAIChatRequest(&req)
+	if validationErr != "" {
+		writeErr(validationErr)
+		return
+	}
+	plan, plannerEnabled, plannerWarnings := s.stationAIResolvePlan(r.Context(), req)
+	warnings = append(warnings, plannerWarnings...)
+	intent := plan.Intent
+	useWiki := enableWiki && intent != stationAIIntentSmallTalk
+	useWeb := enableWeb && intent != stationAIIntentSmallTalk
+	useRuntime := stationAINeedsRuntimeContext(intent, req.UserMessage)
+	pipeline := stationAIPipelineMeta(req, plan, plannerEnabled)
+	log.Printf(
+		"[AI][CHAT] mode=stream intent=%s planner=%t wiki_enabled=%t need_wiki=%t wiki_used=%t web_enabled=%t need_web=%t web_used=%t runtime_requested=%t locale=%s model=%s",
+		intent,
+		plannerEnabled,
+		enableWiki,
+		plan.NeedWiki,
+		useWiki,
+		enableWeb,
+		plan.NeedWeb,
+		useWeb,
+		useRuntime,
+		req.Locale,
+		req.Model,
+	)
+	if len(plannerWarnings) > 0 {
+		log.Printf("[AI][CHAT] mode=stream planner_warnings=%v", plannerWarnings)
+	}
+
+	prepareMsg := "Preparing context..."
+	plannerMsg := "Planner pass complete"
+	sendMsg := "Sending request to OpenRouter..."
+	streamMsg := "Streaming model output..."
+	retryMsg := "Final answer failed validation, retrying..."
+	doneMsg := "Done"
+	if req.Locale == "ru" {
+		prepareMsg = "Подготавливаю контекст..."
+		plannerMsg = "Планировщик определил режим ответа"
+		sendMsg = "Отправляю запрос в OpenRouter..."
+		streamMsg = "Получаю ответ модели..."
+		retryMsg = "Финальный ответ не прошел валидацию, выполняю retry..."
+		doneMsg = "Готово"
+	}
+	if !writeMsg(map[string]interface{}{
+		"type":         "progress",
+		"message":      prepareMsg,
+		"progress_pct": 8,
+	}) {
+		return
+	}
+
+	if plannerEnabled {
+		if !writeMsg(map[string]interface{}{
+			"type":         "progress",
+			"message":      plannerMsg,
+			"progress_pct": 14,
+		}) {
+			return
+		}
+	}
+	if plan.AskClarification && strings.TrimSpace(plan.Clarification) != "" {
+		warnings = append(warnings, "planner asked for clarification")
+		_ = writeMsg(map[string]interface{}{
+			"type":          "result",
+			"answer":        strings.TrimSpace(plan.Clarification),
+			"provider":      req.Provider,
+			"model":         req.Model,
+			"assistant":     req.AssistantName,
+			"intent":        string(intent),
+			"pipeline":      pipeline,
+			"warnings":      warnings,
+			"progress_pct":  100,
+			"progress_text": doneMsg,
+		})
+		return
+	}
+
+	contextForPrompt := stationAIContextForPlan(req.Context, plan)
+	runtimeUsed := false
+	if useRuntime {
+		userID := userIDFromRequest(r)
+		runtimeCtx, rw := s.stationAIBuildRuntimeContext(r.Context(), userID, req.Locale)
+		if runtimeCtx != nil {
+			contextForPrompt.Runtime = runtimeCtx
+			runtimeUsed = runtimeCtx.Available
+		}
+		warnings = append(warnings, rw...)
+		log.Printf("[AI][CHAT] mode=stream runtime_requested=%t runtime_used=%t", useRuntime, runtimeUsed)
+	}
+	preflight := stationAIPreflight(req.Locale, plan, contextForPrompt, useRuntime)
+	pipeline["preflight_status"] = preflight.Status
+	if len(preflight.Missing) > 0 {
+		pipeline["preflight_missing"] = preflight.Missing
+	}
+	if len(preflight.Caveats) > 0 {
+		pipeline["preflight_caveats"] = preflight.Caveats
+	}
+	if preflight.Status == "fail" {
+		warnings = append(warnings, "preflight failed: missing "+strings.Join(preflight.Missing, ", "))
+		_ = writeMsg(map[string]interface{}{
+			"type":          "result",
+			"answer":        stationAIPreflightFailAnswer(req.Locale, preflight.Missing),
+			"provider":      req.Provider,
+			"model":         req.Model,
+			"assistant":     req.AssistantName,
+			"intent":        string(intent),
+			"pipeline":      pipeline,
+			"warnings":      warnings,
+			"progress_pct":  100,
+			"progress_text": doneMsg,
+		})
+		log.Printf("[AI][CHAT] mode=stream preflight=fail intent=%s missing=%v", intent, preflight.Missing)
+		return
+	}
+	contextJSON, err := json.Marshal(contextForPrompt)
+	if err != nil {
+		writeErr("failed to encode context")
+		return
+	}
+	wikiSnippets := make([]aiKnowledgeSnippet, 0, 4)
+	webSnippets := make([]aiKnowledgeSnippet, 0, 4)
+	if useWiki {
+		ws, ww := s.stationAIWikiSnippets(r.Context(), req.Locale, req.UserMessage, req.WikiRepo, intent)
+		wikiSnippets = ws
+		warnings = append(warnings, ww...)
+	} else if enableWiki {
+		if intent == stationAIIntentSmallTalk {
+			log.Printf("[AI][CHAT] mode=stream wiki skipped for smalltalk intent")
+		} else if !plan.NeedWiki {
+			log.Printf("[AI][CHAT] mode=stream wiki skipped by planner intent=%s", intent)
+		}
+	}
+	if useWeb {
+		ws, ww := stationAIWebSnippets(r.Context(), req.Locale, req.UserMessage, intent)
+		webSnippets = ws
+		warnings = append(warnings, ww...)
+	} else if enableWeb {
+		log.Printf("[AI][CHAT] mode=stream web skipped for smalltalk intent")
+	}
+	knowledgeBlock := buildStationAIKnowledgeBlock(req.Locale, wikiSnippets, webSnippets)
+	agentBlock := buildStationAIAgentBlock(req.Locale, plan, contextForPrompt, wikiSnippets, webSnippets)
+
+	systemPrompt := stationAISystemPrompt(req.Locale, req.AssistantName, plan)
+	userPrompt := stationAIUserPrompt(req.Locale, req.UserMessage, contextJSON, plan)
+	if caveatBlock := stationAIPreflightCaveatBlock(req.Locale, preflight); caveatBlock != "" {
+		userPrompt += "\n\n" + caveatBlock
+	}
+	if agentBlock != "" {
+		userPrompt += "\n\n" + agentBlock
+	}
+	if knowledgeBlock != "" {
+		userPrompt += "\n\n" + knowledgeBlock
+	}
+	messages := buildStationAIMessages(systemPrompt, req.History, userPrompt)
+	promptTokensEst := estimateTokensFromText(systemPrompt) + estimateTokensFromText(userPrompt)
+	for _, msg := range req.History {
+		promptTokensEst += estimateTokensFromText(msg.Content)
+	}
+
+	if !writeMsg(map[string]interface{}{
+		"type":              "progress",
+		"message":           sendMsg,
+		"progress_pct":      20,
+		"prompt_tokens_est": promptTokensEst,
+		"total_tokens_est":  promptTokensEst,
+	}) {
+		return
+	}
+
+	payload := map[string]interface{}{
+		"model":       req.Model,
+		"temperature": req.Temperature,
+		"max_tokens":  req.MaxTokens,
+		"stream":      true,
+		"stream_options": map[string]bool{
+			"include_usage": true,
+		},
+		"messages": messages,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		writeErr("failed to encode ai request")
+		return
+	}
+
+	httpReq, err := http.NewRequestWithContext(
+		r.Context(),
+		http.MethodPost,
+		"https://openrouter.ai/api/v1/chat/completions",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		writeErr("failed to create ai request")
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
+	httpReq.Header.Set("HTTP-Referer", "http://localhost:1420")
+	httpReq.Header.Set("X-Title", "EVE Flipper Station AI")
+
+	client := &http.Client{Timeout: stationAIStreamHTTPTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		writeErr("ai provider request failed: " + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rawResp, _ := io.ReadAll(resp.Body)
+		errMsg := "ai provider error"
+		var errBody struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(rawResp, &errBody) == nil && strings.TrimSpace(errBody.Error.Message) != "" {
+			errMsg = strings.TrimSpace(errBody.Error.Message)
+		}
+		writeErr(errMsg)
+		return
+	}
+
+	if !writeMsg(map[string]interface{}{
+		"type":         "progress",
+		"message":      streamMsg,
+		"progress_pct": 35,
+	}) {
+		return
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 128*1024), 8*1024*1024)
+	var eventData strings.Builder
+	var answerBuilder strings.Builder
+	answerRuneCount := 0
+	providerModel := req.Model
+	providerID := ""
+	usagePrompt := 0
+	usageCompletion := 0
+	usageTotal := 0
+
+	processEvent := func(raw string) (done bool, fatal bool) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return false, false
+		}
+		if raw == "[DONE]" {
+			return true, false
+		}
+
+		var chunk struct {
+			ID      string `json:"id"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Delta struct {
+					Content json.RawMessage `json:"content"`
+				} `json:"delta"`
+				Message struct {
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+			// Ignore malformed partial event and keep stream alive.
+			return false, false
+		}
+
+		if strings.TrimSpace(chunk.ID) != "" {
+			providerID = strings.TrimSpace(chunk.ID)
+		}
+		if strings.TrimSpace(chunk.Model) != "" {
+			providerModel = strings.TrimSpace(chunk.Model)
+		}
+
+		for _, choice := range chunk.Choices {
+			delta := extractAIDelta(choice.Delta.Content)
+			if delta == "" {
+				delta = extractAIDelta(choice.Message.Content)
+			}
+			if delta == "" {
+				continue
+			}
+			answerBuilder.WriteString(delta)
+			answerRuneCount += utf8.RuneCountInString(delta)
+
+			completionTokensEst := estimateTokensFromRuneCount(answerRuneCount)
+			totalTokensEst := promptTokensEst + completionTokensEst
+			denom := req.MaxTokens
+			if denom < 500 {
+				denom = 500
+			}
+			if denom > 6000 {
+				denom = 6000
+			}
+			progressPct := 45 + int(float64(completionTokensEst)*45.0/float64(denom))
+			if progressPct > 90 {
+				progressPct = 90
+			}
+
+			if !writeMsg(map[string]interface{}{
+				"type":                  "delta",
+				"delta":                 delta,
+				"progress_pct":          progressPct,
+				"completion_tokens_est": completionTokensEst,
+				"total_tokens_est":      totalTokensEst,
+			}) {
+				return false, true
+			}
+		}
+
+		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+			usagePrompt = chunk.Usage.PromptTokens
+			usageCompletion = chunk.Usage.CompletionTokens
+			usageTotal = chunk.Usage.TotalTokens
+			if !writeMsg(map[string]interface{}{
+				"type":              "usage",
+				"prompt_tokens":     usagePrompt,
+				"completion_tokens": usageCompletion,
+				"total_tokens":      usageTotal,
+				"progress_pct":      96,
+			}) {
+				return false, true
+			}
+		}
+
+		return false, false
+	}
+
+	stop := false
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			done, fatal := processEvent(eventData.String())
+			eventData.Reset()
+			if fatal {
+				return
+			}
+			if done {
+				stop = true
+				break
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if eventData.Len() > 0 {
+				eventData.WriteByte('\n')
+			}
+			eventData.WriteString(data)
+		}
+	}
+	if !stop && eventData.Len() > 0 {
+		_, fatal := processEvent(eventData.String())
+		if fatal {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[AI][CHAT] mode=stream read_error=%v", err)
+		writeErr("failed to read ai stream: " + err.Error())
+		return
+	}
+
+	answer := strings.TrimSpace(answerBuilder.String())
+	if answer == "" {
+		writeErr("empty ai answer")
+		return
+	}
+	if valid, issue := stationAIValidateAnswer(answer, intent); !valid {
+		warnings = append(warnings, "server validation requested retry: "+issue)
+		_ = writeMsg(map[string]interface{}{
+			"type":         "progress",
+			"message":      retryMsg,
+			"progress_pct": 94,
+		})
+		retryMessages := make([]map[string]string, 0, len(messages)+2)
+		retryMessages = append(retryMessages, messages...)
+		retryMessages = append(retryMessages,
+			map[string]string{"role": "assistant", "content": answer},
+			map[string]string{"role": "user", "content": stationAIRetryCorrectionPrompt(req.Locale, issue)},
+		)
+		retryReply, retryErr := s.stationAIOpenRouterChatOnce(r.Context(), req, retryMessages)
+		if retryErr != nil {
+			warnings = append(warnings, "retry failed: "+retryErr.Error())
+		} else if validRetry, retryIssue := stationAIValidateAnswer(retryReply.Answer, intent); validRetry {
+			answer = retryReply.Answer
+			if strings.TrimSpace(retryReply.Model) != "" {
+				providerModel = retryReply.Model
+			}
+			if strings.TrimSpace(retryReply.ProviderID) != "" {
+				providerID = retryReply.ProviderID
+			}
+			if p, c, t := stationAIUsageTokenInts(retryReply.Usage); t > 0 {
+				usagePrompt = p
+				usageCompletion = c
+				usageTotal = t
+			}
+		} else {
+			warnings = append(warnings, "retry rejected: "+retryIssue)
+		}
+	}
+
+	result := map[string]interface{}{
+		"type":          "result",
+		"answer":        answer,
+		"provider":      req.Provider,
+		"model":         providerModel,
+		"assistant":     req.AssistantName,
+		"intent":        string(intent),
+		"pipeline":      pipeline,
+		"warnings":      warnings,
+		"provider_id":   providerID,
+		"progress_pct":  100,
+		"progress_text": doneMsg,
+	}
+	if usageTotal > 0 {
+		result["usage"] = map[string]int{
+			"prompt_tokens":     usagePrompt,
+			"completion_tokens": usageCompletion,
+			"total_tokens":      usageTotal,
+		}
+	}
+
+	_ = writeMsg(result)
+	log.Printf(
+		"[AI][CHAT] mode=stream done intent=%s wiki_snippets=%d web_snippets=%d warnings=%d provider_model=%s",
+		intent,
+		len(wikiSnippets),
+		len(webSnippets),
+		len(warnings),
+		providerModel,
+	)
+}
+
+func stationAIIntentPolicy(locale string, plan stationAIPlannerPlan) string {
+	var intentPolicy string
+	if locale == "ru" {
+		switch plan.Intent {
+		case stationAIIntentSmallTalk:
+			intentPolicy = "Режим smalltalk: ответь коротко (1-3 предложения), естественно и по теме. Не давай торговые рекомендации, пока пользователь прямо не запросит анализ/действия."
+		case stationAIIntentTrading:
+			intentPolicy = "Режим trading_analysis: дай прикладной ответ по скану. Формат: 1) Рекомендация 2) Почему 3) Риски 4) Следующие действия/фильтры. Опирайся только на данные контекста."
+		case stationAIIntentProduct:
+			intentPolicy = "Режим product_help: объясняй функциональность проекта и workflow. Если используешь wiki/web контекст, добавляй ссылки в формате [WIKI N]/[WEB N]."
+		case stationAIIntentDebug:
+			intentPolicy = "Режим debug_support: сначала краткий диагноз, затем проверочные шаги и предложенный фикс. Не придумывай факты, явно указывай неопределенность."
+		case stationAIIntentResearch:
+			intentPolicy = "Режим web_research: суммируй только подтвержденные внешние факты, добавляй источники [WEB N], отделяй факты от предположений."
+		default:
+			intentPolicy = "Режим general: ответь по запросу пользователя без навязанных торговых рекомендаций. Если пользователь захочет анализ скана, предложи перейти к нему."
+		}
+		switch plan.ResponseMode {
+		case "short":
+			intentPolicy += " Ответ должен быть кратким."
+		case "structured":
+			intentPolicy += " Сохраняй структурированный формат и конкретные шаги."
+		case "diagnostic":
+			intentPolicy += " Делай акцент на проверках, гипотезах и воспроизводимости."
+		}
+		return intentPolicy
+	}
+
+	switch plan.Intent {
+	case stationAIIntentSmallTalk:
+		intentPolicy = "smalltalk mode: reply naturally in 1-3 short sentences. Do not provide trading recommendations unless explicitly asked for scan/trade analysis."
+	case stationAIIntentTrading:
+		intentPolicy = "trading_analysis mode: provide actionable scan guidance. Format: 1) Recommendation 2) Why 3) Risk check 4) Next actions/filters. Use only supplied data. If user explicitly asks for a full list of scan settings/parameters, prioritize exhaustive scan_snapshot field enumeration (standard + advanced) over the short recommendation template."
+	case stationAIIntentProduct:
+		intentPolicy = "product_help mode: explain product features/workflow. When using wiki/web context, cite sources as [WIKI N]/[WEB N]."
+	case stationAIIntentDebug:
+		intentPolicy = "debug_support mode: provide concise diagnosis first, then checks and fix steps. Never invent facts; call out uncertainty explicitly."
+	case stationAIIntentResearch:
+		intentPolicy = "web_research mode: summarize only grounded external findings, cite [WEB N], separate facts from inferences."
+	default:
+		intentPolicy = "general mode: answer user intent directly without unsolicited trade advice. Offer scan analysis only when user asks for it."
+	}
+	switch plan.ResponseMode {
+	case "short":
+		intentPolicy += " Keep the answer compact."
+	case "structured":
+		intentPolicy += " Keep the answer structured with explicit steps."
+	case "diagnostic":
+		intentPolicy += " Focus on diagnosis, checks, and reproducible fixes."
+	}
+	return intentPolicy
+}
+
+func stationAIRequestsFullScanSettings(userMessage string) bool {
+	msg := strings.TrimSpace(strings.ToLower(userMessage))
+	if msg == "" {
+		return false
+	}
+
+	fullTerms := []string{
+		"full list", "complete list", "all fields", "every field", "all parameters", "full snapshot",
+		"полный список", "полный перечень", "все поля", "все параметры", "весь список",
+	}
+	settingsTerms := []string{
+		"scan settings", "scan parameters", "scan params", "settings", "parameters", "params", "scan snapshot",
+		"настрой", "параметр", "поля", "адванс", "advanced", "обычн", "стандарт",
+	}
+	explicitPhrases := []string{
+		"list all scan parameters",
+		"show all scan settings",
+		"give me full scan settings",
+		"перечисли все настройки скан",
+		"перечисли все параметры скан",
+		"дай полный список настроек скан",
+		"полный список настроек скан",
+	}
+
+	if containsAnyLower(msg, explicitPhrases) {
+		return true
+	}
+	return containsAnyLower(msg, fullTerms) && containsAnyLower(msg, settingsTerms)
+}
+
+func stationAISystemPrompt(locale, assistantName string, plan stationAIPlannerPlan) string {
+	policy := stationAIIntentPolicy(locale, plan)
+	agents := "none"
+	if len(plan.Agents) > 0 {
+		agents = strings.Join(plan.Agents, ", ")
+	}
+	if locale == "ru" {
+		return fmt.Sprintf(
+			"Ты %s, AI-ассистент проекта EVE Flipper. "+
+				"Ты работаешь во втором шаге пайплайна после planner-а. "+
+				"Используй только предоставленные данные (контекст таба/скана, runtime-контекст аккаунта, заметки агентного пайплайна, проектная документация, wiki/web snippets). "+
+				"Разделяй типы данных: runtime-данные таба/скана и runtime-контекст аккаунта — для чисел и текущего состояния, wiki/web — только для описания механик продукта. "+
+				"Если утверждение основано на wiki/web, обязательно ссылайся на конкретный источник [WIKI N]/[WEB N]. "+
+				"Перед тем как писать, что 'в документации нет информации', проверь все переданные wiki-snippets: если релевантный факт уже есть в них, используй его и не заявляй о пробеле. "+
+				"Не выдумывай цены, объемы, ID и внешние факты. Если данных недостаточно — скажи прямо. "+
+				"Подстраивайся под тон пользователя и поддерживай язык запроса. "+
+				"Активные агенты planner-а: %s. "+
+				"%s",
+			assistantName,
+			agents,
+			policy,
+		)
+	}
+	return fmt.Sprintf(
+		"You are %s, the EVE Flipper project copilot. "+
+			"You run as executor step after a planner pass. "+
+			"Use only supplied data (tab/scan context, account runtime context, agent pipeline notes, project docs, wiki/web snippets). "+
+			"Strictly separate data domains: runtime tab/scan context and account runtime context are for live numbers/state, wiki/web snippets are for product mechanics only. "+
+			"If a statement comes from wiki/web, cite the exact source as [WIKI N]/[WEB N]. "+
+			"Before claiming 'the documentation does not specify', verify all provided wiki snippets; if a relevant fact is present, use it and do not claim a gap. "+
+			"Never invent prices, volumes, IDs, or external facts. If context is insufficient, state that clearly. "+
+			"Adapt to the user's tone and language. "+
+			"Planner-selected agents: %s. "+
+			"%s",
+		assistantName,
+		agents,
+		policy,
+	)
+}
+
+func stationAIUserPrompt(locale, userMessage string, contextJSON []byte, plan stationAIPlannerPlan) string {
+	agents := "none"
+	if len(plan.Agents) > 0 {
+		agents = strings.Join(plan.Agents, ", ")
+	}
+	fullSettingsRequest := stationAIRequestsFullScanSettings(userMessage)
+	if locale == "ru" {
+		extra := ""
+		if fullSettingsRequest {
+			extra = "\n\nПользователь явно просит полный список параметров сканирования. " +
+				"В ответе выведи исчерпывающий инвентарь ВСЕХ полей объекта scan_snapshot из JSON выше " +
+				"(обычные + advanced) и их текущие значения. " +
+				"Форматируй построчно как field_name: value. Ничего не пропускай, даже если значение 0/false/пусто."
+		}
+		return fmt.Sprintf(
+			"Planner plan:\nintent=%s\ncontext_level=%s\nresponse_mode=%s\nagents=%s\nneed_wiki=%t\nneed_web=%t\n\n"+
+				"Вопрос пользователя:\n%s\n\n"+
+				"Контекст текущего таба/скана (JSON):\n%s\n\n"+
+				"Ответь на русском языке, дай прямой практический ответ строго на основе переданного контекста.%s",
+			string(plan.Intent),
+			plan.ContextLevel,
+			plan.ResponseMode,
+			agents,
+			plan.NeedWiki,
+			plan.NeedWeb,
+			userMessage,
+			string(contextJSON),
+			extra,
+		)
+	}
+	extra := ""
+	if fullSettingsRequest {
+		extra = "\n\nThe user explicitly asked for a full scan settings list. " +
+			"Output a complete inventory of ALL fields from the scan_snapshot object in the JSON above " +
+			"(standard + advanced) with current values. " +
+			"Use one field per line as field_name: value. Do not omit fields, even when values are 0/false/empty."
+	}
+	return fmt.Sprintf(
+		"Planner plan:\nintent=%s\ncontext_level=%s\nresponse_mode=%s\nagents=%s\nneed_wiki=%t\nneed_web=%t\n\n"+
+			"User question:\n%s\n\n"+
+			"Current tab/scan context (JSON):\n%s\n\n"+
+			"Answer in English with a direct practical response grounded in the provided context.%s",
+		string(plan.Intent),
+		plan.ContextLevel,
+		plan.ResponseMode,
+		agents,
+		plan.NeedWiki,
+		plan.NeedWeb,
+		userMessage,
+		string(contextJSON),
+		extra,
+	)
+}
+
+func extractAIContent(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return strings.TrimSpace(asString)
+	}
+
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if strings.TrimSpace(p.Text) == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(p.Text)
+		}
+		return strings.TrimSpace(b.String())
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func extractAIDelta(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return asString
+	}
+
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if p.Text == "" {
+				continue
+			}
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
 }
 
 func (s *Server) handleAuthPortfolio(w http.ResponseWriter, r *http.Request) {

@@ -37,6 +37,7 @@ import type {
   FlipResult,
   RouteResult,
   ScanParams,
+  StationCacheMeta,
   StationTrade,
 } from "./lib/types";
 import logo from "./assets/logo.svg";
@@ -128,6 +129,9 @@ function App() {
   const [radiusResults, setRadiusResults] = useState<FlipResult[]>([]);
   const [regionResults, setRegionResults] = useState<FlipResult[]>([]);
   const [contractResults, setContractResults] = useState<ContractResult[]>([]);
+  const [radiusCacheMeta, setRadiusCacheMeta] = useState<StationCacheMeta | null>(null);
+  const [regionCacheMeta, setRegionCacheMeta] = useState<StationCacheMeta | null>(null);
+  const [contractCacheMeta, setContractCacheMeta] = useState<StationCacheMeta | null>(null);
   const [stationLoadedResults, setStationLoadedResults] = useState<
     StationTrade[] | null
   >(null);
@@ -386,20 +390,35 @@ function App() {
 
     try {
       if (currentTab === "contracts") {
+        let meta: StationCacheMeta | undefined;
         const results = await scanContracts(
           params,
           setProgress,
           controller.signal,
+          (m) => {
+            meta = m;
+          },
         );
         setContractResults(results);
+        setContractCacheMeta(meta ?? null);
         setContractScanCompleted(true);
       } else {
         const scanFn = currentTab === "radius" ? scan : scanMultiRegion;
-        const results = await scanFn(params, setProgress, controller.signal);
+        let meta: StationCacheMeta | undefined;
+        const results = await scanFn(
+          params,
+          setProgress,
+          controller.signal,
+          (m) => {
+            meta = m;
+          },
+        );
         if (currentTab === "radius") {
           setRadiusResults(results);
+          setRadiusCacheMeta(meta ?? null);
         } else {
           setRegionResults(results);
+          setRegionCacheMeta(meta ?? null);
         }
         // Desktop alerts are local-only; external channels are handled by backend scan handlers.
         if (alertChannels.desktop) {
@@ -914,6 +933,8 @@ function App() {
               results={radiusResults}
               scanning={scanning && tab === "radius"}
               progress={tab === "radius" ? progress : ""}
+              cacheMeta={radiusCacheMeta}
+              tradeStateTab="radius"
               salesTaxPercent={params.sales_tax_percent}
               brokerFeePercent={params.broker_fee_percent}
               splitTradeFees={params.split_trade_fees}
@@ -931,6 +952,8 @@ function App() {
               results={regionResults}
               scanning={scanning && tab === "region"}
               progress={tab === "region" ? progress : ""}
+              cacheMeta={regionCacheMeta}
+              tradeStateTab="region"
               salesTaxPercent={params.sales_tax_percent}
               brokerFeePercent={params.broker_fee_percent}
               splitTradeFees={params.split_trade_fees}
@@ -953,6 +976,8 @@ function App() {
               results={contractResults}
               scanning={scanning && tab === "contracts"}
               progress={tab === "contracts" ? progress : ""}
+              cacheMeta={contractCacheMeta}
+              tradeStateTab="contracts"
               excludeRigPriceIfShip={params.exclude_rigs_with_ship ?? true}
               filterHints={contractFilterHints}
               isLoggedIn={authStatus.logged_in}

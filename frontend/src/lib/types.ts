@@ -106,7 +106,7 @@ export interface ContractDetails {
 
 export type NdjsonContractMessage =
   | { type: "progress"; message: string }
-  | { type: "result"; data: ContractResult[]; count: number }
+  | { type: "result"; data: ContractResult[]; count: number; cache_meta?: StationCacheMeta }
   | { type: "error"; message: string };
 
 export interface RouteHop {
@@ -238,7 +238,7 @@ export interface StationTrade {
 
 export type NdjsonStationMessage =
   | { type: "progress"; message: string }
-  | { type: "result"; data: StationTrade[]; count: number }
+  | { type: "result"; data: StationTrade[]; count: number; cache_meta?: StationCacheMeta }
   | { type: "error"; message: string };
 
 export interface StationInfo {
@@ -539,6 +539,241 @@ export interface OrderDeskResponse {
   orders: OrderDeskOrder[];
   settings: OrderDeskSettings;
 }
+
+export type StationCommandAction = "new_entry" | "reprice" | "hold" | "cancel";
+
+export interface StationForecastBand {
+  p50: number;
+  p80: number;
+  p95: number;
+}
+
+export interface StationCommandForecast {
+  daily_volume: StationForecastBand;
+  daily_profit: StationForecastBand;
+  eta_days: StationForecastBand;
+}
+
+export interface StationCommandRow {
+  trade: StationTrade;
+  personalized_score: number;
+  recommended_action: StationCommandAction;
+  action_reason: string;
+  priority: number;
+  active_order_count: number;
+  active_order_at_station: number;
+  open_position_qty: number;
+  expected_delta_daily_profit: number;
+  forecast: StationCommandForecast;
+}
+
+export interface StationCommandSummary {
+  rows: number;
+  new_entry_count: number;
+  reprice_count: number;
+  hold_count: number;
+  cancel_count: number;
+  with_active_orders: number;
+  with_open_positions: number;
+}
+
+export interface StationCommandResult {
+  generated_at: string;
+  summary: StationCommandSummary;
+  rows: StationCommandRow[];
+}
+
+export interface StationCacheMeta {
+  current_revision: number;
+  last_refresh_at?: string;
+  next_expiry_at?: string;
+  min_ttl_sec: number;
+  max_ttl_sec: number;
+  regions: number;
+  entries: number;
+  stale: boolean;
+}
+
+export interface StationCommandResponse {
+  generated_at: string;
+  scope: "single" | "all";
+  scan_scope: string;
+  region_count: number;
+  result_count: number;
+  cache_meta?: StationCacheMeta;
+  command: StationCommandResult;
+  order_desk: OrderDeskResponse;
+  inventory: {
+    open_positions: number;
+    open_quantity: number;
+    transactions: number;
+  };
+}
+
+export type StationTradeStateMode = "done" | "ignored";
+
+export interface StationTradeState {
+  user_id: string;
+  tab: string;
+  type_id: number;
+  station_id: number;
+  region_id: number;
+  mode: StationTradeStateMode;
+  until_revision: number;
+  updated_at: string;
+}
+
+export interface StationAIContextRow {
+  type_id: number;
+  type_name: string;
+  station_name: string;
+  cts: number;
+  margin_percent: number;
+  daily_profit: number;
+  daily_volume: number;
+  s2b_bfs_ratio: number;
+  action: string;
+  reason: string;
+  confidence: string;
+  high_risk: boolean;
+  extreme_price: boolean;
+}
+
+export interface StationAIContextSummary {
+  total_rows: number;
+  visible_rows: number;
+  high_risk_rows: number;
+  extreme_rows: number;
+  avg_cts: number;
+  avg_margin: number;
+  avg_daily_profit: number;
+  avg_daily_volume: number;
+  actionable_rows: number;
+}
+
+export interface StationAIScanSnapshot {
+  scope_mode: "radius" | "single_station" | "region_all";
+  system_name: string;
+  region_id: number;
+  station_id: number;
+  radius: number;
+  min_margin: number;
+  sales_tax_percent: number;
+  broker_fee: number;
+  split_trade_fees: boolean;
+  buy_broker_fee_percent: number;
+  sell_broker_fee_percent: number;
+  buy_sales_tax_percent: number;
+  sell_sales_tax_percent: number;
+  cts_profile: string;
+  min_daily_volume: number;
+  min_item_profit: number;
+  min_s2b_per_day: number;
+  min_bfs_per_day: number;
+  avg_price_period: number;
+  min_period_roi: number;
+  bvs_ratio_min: number;
+  bvs_ratio_max: number;
+  max_pvi: number;
+  max_sds: number;
+  limit_buy_to_price_low: boolean;
+  flag_extreme_prices: boolean;
+  include_structures: boolean;
+  structures_applied: boolean;
+  structure_count: number;
+  structure_ids: number[];
+}
+
+export interface StationAIChatContext {
+  tab_id?: string;
+  tab_title?: string;
+  system_name: string;
+  station_scope: string;
+  region_id: number;
+  station_id: number;
+  radius: number;
+  min_margin: number;
+  min_daily_volume: number;
+  min_item_profit: number;
+  scan_snapshot: StationAIScanSnapshot;
+  summary: StationAIContextSummary;
+  rows: StationAIContextRow[];
+}
+
+export interface StationAIHistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface StationAIChatRequest {
+  provider: "openrouter";
+  api_key: string;
+  model: string;
+  planner_model?: string;
+  temperature: number;
+  max_tokens: number;
+  assistant_name: string;
+  locale: "ru" | "en";
+  user_message: string;
+  enable_wiki_context?: boolean;
+  enable_web_research?: boolean;
+  enable_planner?: boolean;
+  wiki_repo?: string;
+  history?: StationAIHistoryMessage[];
+  context: StationAIChatContext;
+}
+
+export interface StationAIChatResponse {
+  answer: string;
+  provider: string;
+  model: string;
+  assistant: string;
+  intent?: string;
+  pipeline?: {
+    planner_enabled?: boolean;
+    planner_model?: string;
+    response_mode?: string;
+    context_level?: string;
+    agents?: string[];
+  };
+  warnings?: string[];
+  provider_id?: string;
+  provider_usage?: Record<string, unknown>;
+  usage?: StationAIUsage;
+}
+
+export interface StationAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export type StationAIStreamMessage =
+  | {
+      type: "progress";
+      message: string;
+      progress_pct?: number;
+      prompt_tokens_est?: number;
+      completion_tokens_est?: number;
+      total_tokens_est?: number;
+    }
+  | {
+      type: "delta";
+      delta: string;
+      progress_pct?: number;
+      completion_tokens_est?: number;
+      total_tokens_est?: number;
+    }
+  | ({
+      type: "usage";
+      progress_pct?: number;
+    } & StationAIUsage)
+  | ({
+      type: "result";
+      progress_pct?: number;
+      progress_text?: string;
+    } & StationAIChatResponse)
+  | { type: "error"; message: string };
 
 // --- Industry Types ---
 
