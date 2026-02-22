@@ -337,6 +337,7 @@ export function StationTrading({
   loadedResults,
 }: Props) {
   const { t } = useI18n();
+  const operatorModeDevOnly = import.meta.env.DEV;
 
   const [stations, setStations] = useState<StationInfo[]>([]);
   const [selectedStationId, setSelectedStationId] =
@@ -482,10 +483,10 @@ export function StationTrading({
   }, [loadedResults]);
 
   useEffect(() => {
-    if (!isLoggedIn && operatorMode) {
+    if ((!isLoggedIn || !operatorModeDevOnly) && operatorMode) {
       setOperatorMode(false);
     }
-  }, [isLoggedIn, operatorMode]);
+  }, [isLoggedIn, operatorMode, operatorModeDevOnly]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1037,7 +1038,7 @@ export function StationTrading({
         }
       }
 
-      if (operatorMode && isLoggedIn) {
+      if (operatorModeDevOnly && operatorMode && isLoggedIn) {
         const commandRes = await getStationCommand({
           ...scanParams,
           target_eta_days: 3,
@@ -1307,7 +1308,7 @@ export function StationTrading({
       displayRows.reduce((sum, r) => sum + r.CTS, 0) / displayRows.length;
     return { totalProfit, avgMargin, avgCTS, count: displayRows.length };
   }, [displayRows]);
-  const showOperatorColumns = operatorMode && isLoggedIn;
+  const showOperatorColumns = operatorModeDevOnly && operatorMode && isLoggedIn;
   const operatorPanelAvailable = showOperatorColumns && displayRows.length > 0;
   const operatorPanelVisible =
     operatorPanelAvailable && !operatorPanelCollapsed;
@@ -1862,7 +1863,7 @@ export function StationTrading({
                     </SettingsField>
                   )}
 
-                  {isLoggedIn && (
+                  {isLoggedIn && operatorModeDevOnly && (
                     <SettingsField label="Operator mode">
                       <SettingsCheckbox
                         checked={operatorMode}
