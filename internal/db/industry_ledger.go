@@ -125,6 +125,7 @@ type IndustryProjectCreateInput struct {
 }
 
 type IndustryTaskPlanInput struct {
+	TaskID        int64           `json:"task_id,omitempty"`
 	ParentTaskID  int64           `json:"parent_task_id"`
 	Name          string          `json:"name"`
 	Activity      string          `json:"activity"`
@@ -639,6 +640,7 @@ type industrySchedulerConfig struct {
 
 type industryPlanTaskRecord struct {
 	InputIndex      int64
+	SourceTaskID    int64
 	ID              int64
 	ParentTaskID    int64
 	Name            string
@@ -759,47 +761,87 @@ func normalizeOptionalRFC3339(v string, fieldName string) (string, error) {
 
 const industryTaskRefAmbiguityWarning = "ambiguous task references kept as existing IDs; use negative row refs (-1, -2, ...) for draft task links"
 
+func buildIndustrySourceTaskIDMap(taskRecords []industryPlanTaskRecord) map[int64]int64 {
+	if len(taskRecords) == 0 {
+		return map[int64]int64{}
+	}
+	out := make(map[int64]int64, len(taskRecords))
+	for _, rec := range taskRecords {
+		if rec.SourceTaskID <= 0 || rec.ID <= 0 {
+			continue
+		}
+		if _, exists := out[rec.SourceTaskID]; exists {
+			continue
+		}
+		out[rec.SourceTaskID] = rec.ID
+	}
+	return out
+}
+
 func remapIndustryTaskReference(
 	ref int64,
 	inputTaskIndexToID map[int64]int64,
+	sourceTaskIDToID map[int64]int64,
 	patchTaskCount int,
 	replace bool,
 	existingTaskIDs map[int64]struct{},
 ) (int64, bool) {
-	if ref == 0 || len(inputTaskIndexToID) == 0 {
+	if ref == 0 {
 		return ref, false
 	}
+
 	inputRef := ref
 	forceInputRef := false
 	if inputRef < 0 {
 		inputRef = -inputRef
 		forceInputRef = true
 	}
-	maxInputRef := int64(patchTaskCount)
-	if inputRef <= 0 || inputRef > maxInputRef {
+
+	if forceInputRef {
+		if inputRef <= 0 {
+			return ref, false
+		}
+		if mapped, ok := inputTaskIndexToID[inputRef]; ok {
+			return mapped, false
+		}
 		return ref, false
 	}
-	mapped, ok := inputTaskIndexToID[inputRef]
-	if !ok {
-		return ref, false
-	}
-	if replace || forceInputRef {
+
+	if mapped, ok := sourceTaskIDToID[ref]; ok {
+		if !replace {
+			if _, exists := existingTaskIDs[ref]; exists {
+				return ref, true
+			}
+		}
 		return mapped, false
 	}
-	if _, exists := existingTaskIDs[ref]; exists {
-		return ref, true
+
+	if !replace {
+		if _, exists := existingTaskIDs[ref]; exists {
+			return ref, false
+		}
 	}
-	return mapped, false
+
+	maxInputRef := int64(patchTaskCount)
+	if maxInputRef > 0 && inputRef > 0 && inputRef <= maxInputRef {
+		if mapped, ok := inputTaskIndexToID[inputRef]; ok {
+			// Positive row refs are legacy/ambiguous in append mode.
+			return mapped, !replace
+		}
+	}
+
+	return ref, false
 }
 
 func remapIndustryJobTaskIDs(
 	jobs []IndustryJobPlanInput,
 	inputTaskIndexToID map[int64]int64,
+	sourceTaskIDToID map[int64]int64,
 	patchTaskCount int,
 	replace bool,
 	existingTaskIDs map[int64]struct{},
 ) int {
-	if len(jobs) == 0 || len(inputTaskIndexToID) == 0 {
+	if len(jobs) == 0 {
 		return 0
 	}
 	ambiguousRefs := 0
@@ -810,6 +852,7 @@ func remapIndustryJobTaskIDs(
 		remappedID, ambiguous := remapIndustryTaskReference(
 			jobs[i].TaskID,
 			inputTaskIndexToID,
+			sourceTaskIDToID,
 			patchTaskCount,
 			replace,
 			existingTaskIDs,
@@ -1984,6 +2027,7 @@ func (d *DB) PreviewIndustryPlanForUser(userID string, projectID int64, patch In
 		inputTaskIndexToID[inputIndex] = syntheticID
 		taskRecords = append(taskRecords, industryPlanTaskRecord{
 			InputIndex:      inputIndex,
+			SourceTaskID:    t.TaskID,
 			ID:              syntheticID,
 			ParentTaskID:    t.ParentTaskID,
 			Name:            name,
@@ -2008,10 +2052,12 @@ func (d *DB) PreviewIndustryPlanForUser(userID string, projectID int64, patch In
 		}
 	}
 	ambiguousTaskParentRefs := 0
+	sourceTaskIDToID := buildIndustrySourceTaskIDMap(taskRecords)
 	for i := range taskRecords {
 		parentID, ambiguous := remapIndustryTaskReference(
 			taskRecords[i].ParentTaskID,
 			inputTaskIndexToID,
+			sourceTaskIDToID,
 			len(patch.Tasks),
 			patch.Replace,
 			existingTaskIDs,
@@ -2033,6 +2079,7 @@ func (d *DB) PreviewIndustryPlanForUser(userID string, projectID int64, patch In
 	ambiguousJobTaskRefs := remapIndustryJobTaskIDs(
 		jobsForPreview,
 		inputTaskIndexToID,
+		sourceTaskIDToID,
 		len(patch.Tasks),
 		patch.Replace,
 		existingTaskIDs,
@@ -2259,6 +2306,7 @@ func (d *DB) ApplyIndustryPlanForUser(userID string, projectID int64, patch Indu
 			inputTaskIndexToID[inputIndex] = insertedID
 			insertedTaskRecords = append(insertedTaskRecords, industryPlanTaskRecord{
 				InputIndex:      inputIndex,
+				SourceTaskID:    t.TaskID,
 				ID:              insertedID,
 				ParentTaskID:    t.ParentTaskID,
 				Name:            name,
@@ -2274,12 +2322,14 @@ func (d *DB) ApplyIndustryPlanForUser(userID string, projectID int64, patch Indu
 	}
 
 	ambiguousTaskParentRefs := 0
+	sourceTaskIDToID := buildIndustrySourceTaskIDMap(insertedTaskRecords)
 	if len(insertedTaskRecords) > 0 {
 		for i := range insertedTaskRecords {
 			parentID := insertedTaskRecords[i].ParentTaskID
 			parentID, ambiguous := remapIndustryTaskReference(
 				parentID,
 				inputTaskIndexToID,
+				sourceTaskIDToID,
 				len(patch.Tasks),
 				patch.Replace,
 				existingTaskIDs,
@@ -2304,6 +2354,7 @@ func (d *DB) ApplyIndustryPlanForUser(userID string, projectID int64, patch Indu
 	ambiguousJobTaskRefs := remapIndustryJobTaskIDs(
 		jobsForInsert,
 		inputTaskIndexToID,
+		sourceTaskIDToID,
 		len(patch.Tasks),
 		patch.Replace,
 		existingTaskIDs,
@@ -3115,6 +3166,9 @@ func computeIndustryJobStatusUpdate(
 		nextNotes = trimmed
 	}
 
+	if !jobTerminalStatus(normalizedStatus) {
+		nextFinishedAt = ""
+	}
 	if normalizedStatus == IndustryJobStatusActive && strings.TrimSpace(nextStartedAt) == "" {
 		nextStartedAt = now
 	}

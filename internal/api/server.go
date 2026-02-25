@@ -4705,7 +4705,10 @@ func (s *Server) handleAuthPlanIndustryProject(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handleAuthRebalanceIndustryProjectMaterials(w http.ResponseWriter, r *http.Request) {
-	userID := userIDFromRequest(r)
+	userID, ok := s.requireIndustryAuthUser(w, r)
+	if !ok {
+		return
+	}
 	if s.db == nil {
 		writeError(w, 503, "database unavailable")
 		return
@@ -4926,7 +4929,10 @@ func (s *Server) handleAuthRebalanceIndustryProjectMaterials(w http.ResponseWrit
 }
 
 func (s *Server) handleAuthSyncIndustryProjectBlueprintPool(w http.ResponseWriter, r *http.Request) {
-	userID := userIDFromRequest(r)
+	userID, ok := s.requireIndustryAuthUser(w, r)
+	if !ok {
+		return
+	}
 	if s.db == nil {
 		writeError(w, 503, "database unavailable")
 		return

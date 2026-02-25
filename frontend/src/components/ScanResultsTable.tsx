@@ -32,6 +32,7 @@ const PAGE_SIZE = 100;
 const GROUP_PAGE_SIZE = 50; // rows shown per group before "Show all" button
 const CACHE_TTL_FALLBACK_MS = 20 * 60 * 1000;
 const COLUMN_PREFS_STORAGE_PREFIX = "eve-scan-columns:v1:";
+const ITEM_GROUPING_STORAGE_KEY = "eve-radius-group-by-item:v1";
 
 type SortKey = keyof FlipResult;
 type SortDir = "asc" | "desc";
@@ -560,6 +561,12 @@ interface RegionGroup {
   metricCount: number;
 }
 
+interface ItemGroup {
+  key: string;
+  label: string;
+  rows: IndexedRow[];
+}
+
 /* ─── Filter helpers ─── */
 
 function passesNumericFilter(num: number, fval: string): boolean {
@@ -805,6 +812,13 @@ export function ScanResultsTable({
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
   const [page, setPage] = useState(0);
   const [compactMode, setCompactMode] = useState(false);
+  const [groupByItem, setGroupByItem] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(ITEM_GROUPING_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   const [showHiddenRows, setShowHiddenRows] = useState(false);
   const [hiddenMap, setHiddenMap] = useState<Record<string, HiddenFlipEntry>>({});
   const [ignoredModalOpen, setIgnoredModalOpen] = useState(false);
@@ -817,9 +831,13 @@ export function ScanResultsTable({
   const [collapsedRegionGroups, setCollapsedRegionGroups] = useState<Set<string>>(
     new Set(),
   );
+  const [expandedItemGroups, setExpandedItemGroups] = useState<Set<string>>(
+    new Set(),
+  );
   const [regionCollapseInitialized, setRegionCollapseInitialized] = useState(false);
 
   const isRegionGrouped = columnProfile === "region_eveguru";
+  const isItemGrouped = !isRegionGrouped && groupByItem;
   const preferredSortKey: SortKey = isRegionGrouped
     ? "DayPeriodProfit"
     : "RealProfit";
@@ -981,6 +999,14 @@ export function ScanResultsTable({
       // ignore storage quota errors
     }
   }, [regionGroupSortMode]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ITEM_GROUPING_STORAGE_KEY, groupByItem ? "1" : "0");
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [groupByItem]);
 
   useEffect(() => {
     if (columnDefs.length === 0) return;
@@ -1196,6 +1222,41 @@ export function ScanResultsTable({
     return groups;
   }, [displaySorted, isRegionGrouped, regionGroupSortMode, t]);
 
+  const itemGroups = useMemo<ItemGroup[]>(() => {
+    if (!isItemGrouped) return [];
+    const byType = new Map<number, ItemGroup>();
+    for (const ir of displaySorted) {
+      const typeID = ir.row.TypeID ?? 0;
+      const existing = byType.get(typeID);
+      if (existing) {
+        existing.rows.push(ir);
+      } else {
+        byType.set(typeID, {
+          key: String(typeID),
+          label: ir.row.TypeName || t("hiddenUnknown"),
+          rows: [ir],
+        });
+      }
+    }
+    return [...byType.values()];
+  }, [displaySorted, isItemGrouped, t]);
+
+  useEffect(() => {
+    if (!isItemGrouped) {
+      setExpandedItemGroups(new Set());
+      return;
+    }
+    const existing = new Set(itemGroups.map((g) => g.key));
+    setExpandedItemGroups((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set<string>();
+      for (const key of prev) {
+        if (existing.has(key)) next.add(key);
+      }
+      return next.size === prev.size ? prev : next;
+    });
+  }, [isItemGrouped, itemGroups]);
+
   const defaultCollapsedRegionGroups = useMemo(() => {
     if (!isRegionGrouped || regionGroups.length <= 1) {
       return new Set<string>();
@@ -1247,17 +1308,38 @@ export function ScanResultsTable({
   ]);
 
   const visibleRows = useMemo(() => {
-    if (!isRegionGrouped) return displaySorted;
+    if (isRegionGrouped) {
+      const rows: IndexedRow[] = [];
+      for (const group of regionGroups) {
+        if (effectiveCollapsedRegionGroups.has(group.key)) continue;
+        rows.push(...group.rows);
+      }
+      return rows;
+    }
+    if (!isItemGrouped) return displaySorted;
+
     const rows: IndexedRow[] = [];
-    for (const group of regionGroups) {
-      if (effectiveCollapsedRegionGroups.has(group.key)) continue;
-      rows.push(...group.rows);
+    for (const group of itemGroups) {
+      if (group.rows.length === 0) continue;
+      rows.push(group.rows[0]);
+      if (group.rows.length <= 1 || !expandedItemGroups.has(group.key)) continue;
+      const limit = Math.max(1, groupRowLimit.get(group.key) ?? GROUP_PAGE_SIZE);
+      rows.push(...group.rows.slice(1, limit));
     }
     return rows;
-  }, [displaySorted, effectiveCollapsedRegionGroups, isRegionGrouped, regionGroups]);
+  }, [
+    displaySorted,
+    effectiveCollapsedRegionGroups,
+    expandedItemGroups,
+    groupRowLimit,
+    isItemGrouped,
+    isRegionGrouped,
+    itemGroups,
+    regionGroups,
+  ]);
 
   const { pageRows, totalPages, safePage } = useMemo(() => {
-    if (isRegionGrouped) {
+    if (isRegionGrouped || isItemGrouped) {
       return { pageRows: visibleRows, totalPages: 1, safePage: 0 };
     }
     const totalPages = Math.max(1, Math.ceil(displaySorted.length / PAGE_SIZE));
@@ -1267,12 +1349,12 @@ export function ScanResultsTable({
       (safePage + 1) * PAGE_SIZE,
     );
     return { pageRows, totalPages, safePage };
-  }, [displaySorted, isRegionGrouped, page, visibleRows]);
+  }, [displaySorted, isItemGrouped, isRegionGrouped, page, visibleRows]);
 
   // Reset page when data/filters/sort change
   useEffect(() => {
     setPage(0);
-  }, [results, filters, sortKey, sortDir, showHiddenRows, hiddenMap]);
+  }, [results, filters, sortKey, sortDir, showHiddenRows, hiddenMap, groupByItem]);
 
   // Reset selection/pins/context menu/group limits when results change
   useEffect(() => {
@@ -1406,10 +1488,11 @@ export function ScanResultsTable({
 
   // ── Summary stats ──
   const summary = useMemo(() => {
+    const baseRows = isItemGrouped && selectedIds.size === 0 ? displaySorted : visibleRows;
     const rows =
       selectedIds.size > 0
         ? visibleRows.filter((ir) => selectedIds.has(ir.id))
-        : visibleRows;
+        : baseRows;
     if (rows.length === 0) return null;
     const totalProfit = rows.reduce(
       (s, ir) => s + (ir.row.RealProfit ?? ir.row.ExpectedProfit ?? ir.row.TotalProfit),
@@ -1418,7 +1501,7 @@ export function ScanResultsTable({
     const avgMargin =
       rows.reduce((s, ir) => s + ir.row.MarginPercent, 0) / rows.length;
     return { totalProfit, avgMargin, count: rows.length };
-  }, [selectedIds, visibleRows]);
+  }, [displaySorted, isItemGrouped, selectedIds, visibleRows]);
 
   // ── Callbacks ──
   const toggleSort = useCallback(
@@ -1464,6 +1547,18 @@ export function ScanResultsTable({
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
+    });
+  }, []);
+
+  const toggleItemGroupExpanded = useCallback((typeID: number) => {
+    const key = String(typeID ?? 0);
+    startTransition(() => {
+      setExpandedItemGroups((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
     });
   }, []);
 
@@ -1682,7 +1777,11 @@ export function ScanResultsTable({
 
   // renderDataRow: renders a DataRow memo component — only the changed row re-renders
   const renderDataRow = useCallback(
-    (ir: IndexedRow, globalIdx: number) => (
+    (
+      ir: IndexedRow,
+      globalIdx: number,
+      itemVariantState?: { expandable: boolean; expanded: boolean },
+    ) => (
       <DataRow
         key={ir.id}
         ir={ir}
@@ -1693,7 +1792,11 @@ export function ScanResultsTable({
         isSelected={selectedIds.has(ir.id)}
         variant={variantByRowId.get(ir.id)}
         rowHidden={hiddenMap[flipStateKey(ir.row)]}
+        isItemGrouped={isItemGrouped}
         isRegionGrouped={isRegionGrouped}
+        variantExpandable={itemVariantState?.expandable ?? false}
+        variantExpanded={itemVariantState?.expanded ?? false}
+        onToggleVariantGroup={toggleItemGroupExpanded}
         onContextMenu={handleContextMenu}
         onLmbClick={onLmbClick}
         onToggleSelect={toggleSelect}
@@ -1706,11 +1809,13 @@ export function ScanResultsTable({
       compactMode,
       handleContextMenu,
       hiddenMap,
+      isItemGrouped,
       isRegionGrouped,
       onLmbClick,
       pinnedIds,
       selectedIds,
       t,
+      toggleItemGroupExpanded,
       togglePin,
       toggleSelect,
       variantByRowId,
@@ -1762,7 +1867,7 @@ export function ScanResultsTable({
         <div className="flex-1" />
 
         {/* Pagination */}
-        {!isRegionGrouped && displaySorted.length > PAGE_SIZE && (
+        {!isRegionGrouped && !isItemGrouped && displaySorted.length > PAGE_SIZE && (
           <div className="flex items-center gap-1 text-eve-dim">
             <button
               onClick={() => setPage(0)}
@@ -1800,6 +1905,17 @@ export function ScanResultsTable({
 
         {results.length > 0 && !scanning && (
           <>
+            {!isRegionGrouped && (
+              <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm border border-eve-border/60 bg-eve-dark/40 text-[11px] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={groupByItem}
+                  onChange={(e) => setGroupByItem(e.target.checked)}
+                  className="accent-eve-accent"
+                />
+                <span>Group by item</span>
+              </label>
+            )}
             <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm border border-eve-border/60 bg-eve-dark/40 text-[11px] cursor-pointer">
               <input
                 type="checkbox"
@@ -2197,7 +2313,7 @@ export function ScanResultsTable({
           </thead>
           <tbody>
             {isRegionGrouped
-                ? (() => {
+              ? (() => {
                   let rowIndex = 0;
                   return regionGroups.map((group) => {
                     const collapsed = effectiveCollapsedRegionGroups.has(group.key);
@@ -2274,7 +2390,57 @@ export function ScanResultsTable({
                     );
                   });
                 })()
-              : pageRows.map((ir, i) => renderDataRow(ir, safePage * PAGE_SIZE + i))}
+              : isItemGrouped
+                ? (() => {
+                    let rowIndex = 0;
+                    return itemGroups.map((group) => {
+                      if (group.rows.length === 0) return null;
+                      const topRow = group.rows[0];
+                      const expanded =
+                        group.rows.length > 1 && expandedItemGroups.has(group.key);
+                      const limit = Math.max(
+                        1,
+                        groupRowLimit.get(group.key) ?? GROUP_PAGE_SIZE,
+                      );
+                      const childRows = expanded ? group.rows.slice(1, limit) : [];
+                      const hasMore = expanded && group.rows.length > limit;
+                      const topRendered = renderDataRow(topRow, rowIndex, {
+                        expandable: group.rows.length > 1,
+                        expanded,
+                      });
+                      rowIndex++;
+                      return (
+                        <Fragment key={`item-group:${group.key}`}>
+                          {topRendered}
+                          {childRows.map((ir) => {
+                            const rendered = renderDataRow(ir, rowIndex);
+                            rowIndex++;
+                            return rendered;
+                          })}
+                          {hasMore && (
+                            <tr className="bg-eve-dark/30">
+                              <td colSpan={columnDefs.length + 2} className="px-4 py-1.5 text-center">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setGroupRowLimit((prev) => {
+                                      const next = new Map(prev);
+                                      next.set(group.key, group.rows.length);
+                                      return next;
+                                    })
+                                  }
+                                  className="text-[11px] text-eve-dim hover:text-eve-accent transition-colors"
+                                >
+                                  Show all {group.rows.length} items ({group.rows.length - limit} more) ↓
+                                </button>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    });
+                  })()
+                : pageRows.map((ir, i) => renderDataRow(ir, safePage * PAGE_SIZE + i))}
             {displaySorted.length === 0 && !scanning && (
               <tr>
                 <td colSpan={columnDefs.length + 2} className="p-0">
@@ -2743,7 +2909,11 @@ interface DataRowProps {
   isSelected: boolean;
   variant: { index: number; total: number } | undefined;
   rowHidden: HiddenFlipEntry | undefined;
+  isItemGrouped: boolean;
   isRegionGrouped: boolean;
+  variantExpandable: boolean;
+  variantExpanded: boolean;
+  onToggleVariantGroup: (typeID: number) => void;
   onContextMenu: (e: import("react").MouseEvent, id: number, row: FlipResult) => void;
   onLmbClick: (row: FlipResult) => void;
   onToggleSelect: (id: number) => void;
@@ -2773,7 +2943,8 @@ const DataRow = memo(
   function DataRow({
     ir, globalIdx, columnDefs, compactMode,
     isPinned, isSelected, variant, rowHidden,
-    isRegionGrouped, onContextMenu, onLmbClick,
+    isItemGrouped, isRegionGrouped, variantExpandable, variantExpanded,
+    onToggleVariantGroup, onContextMenu, onLmbClick,
     onToggleSelect, onTogglePin, tFn,
   }: DataRowProps) {
     return (
@@ -2830,12 +3001,34 @@ const DataRow = memo(
                   </span>
                 )}
                 {variant && (
-                  <span
-                    title={tFn("variantChipHint")}
-                    className="shrink-0 inline-flex items-center px-1 py-px rounded-[2px] border border-eve-accent/35 bg-eve-accent/10 text-eve-accent text-[9px] leading-none font-medium uppercase tracking-normal"
-                  >
-                    {tFn("variantChip", { index: variant.index, total: variant.total })}
-                  </span>
+                  variantExpandable && isItemGrouped ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onToggleVariantGroup(ir.row.TypeID);
+                      }}
+                      title={tFn("variantChipHint")}
+                      className="shrink-0 inline-flex items-center gap-1 px-1 py-px rounded-[2px] border border-eve-accent/35 bg-eve-accent/10 text-eve-accent text-[9px] leading-none font-medium uppercase tracking-normal hover:border-eve-accent/70 hover:bg-eve-accent/20 transition-colors"
+                    >
+                      <span>
+                        {tFn("variantChip", {
+                          index: variant.index,
+                          total: variant.total,
+                        })}
+                      </span>
+                      <span className="text-[8px]">
+                        {variantExpanded ? "▼" : "▶"}
+                      </span>
+                    </button>
+                  ) : (
+                    <span
+                      title={tFn("variantChipHint")}
+                      className="shrink-0 inline-flex items-center px-1 py-px rounded-[2px] border border-eve-accent/35 bg-eve-accent/10 text-eve-accent text-[9px] leading-none font-medium uppercase tracking-normal"
+                    >
+                      {tFn("variantChip", { index: variant.index, total: variant.total })}
+                    </span>
+                  )
                 )}
               </div>
             ) : col.key === "DayTradeScore" ? (
@@ -2856,9 +3049,13 @@ const DataRow = memo(
     prev.globalIdx === next.globalIdx &&
     prev.compactMode === next.compactMode &&
     prev.variant === next.variant &&
+    prev.variantExpandable === next.variantExpandable &&
+    prev.variantExpanded === next.variantExpanded &&
     prev.columnDefs === next.columnDefs &&
     prev.ir === next.ir &&
+    prev.isItemGrouped === next.isItemGrouped &&
     prev.isRegionGrouped === next.isRegionGrouped &&
+    prev.onToggleVariantGroup === next.onToggleVariantGroup &&
     prev.onContextMenu === next.onContextMenu &&
     prev.onLmbClick === next.onLmbClick &&
     prev.onToggleSelect === next.onToggleSelect &&

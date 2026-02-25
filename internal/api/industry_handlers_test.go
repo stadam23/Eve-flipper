@@ -293,6 +293,37 @@ func TestHandleAuthIndustryEndpoints_RequireLogin(t *testing.T) {
 	}
 }
 
+func TestHandleAuthIndustryMaintenanceEndpoints_RequireLogin(t *testing.T) {
+	database := openAPITestDB(t)
+	srv := &Server{db: database}
+
+	reqRebalance := requestWithUserID(
+		http.MethodPost,
+		"/api/auth/industry/projects/1/materials/rebalance",
+		bytes.NewBufferString(`{}`),
+		"user-no-session",
+	)
+	reqRebalance.SetPathValue("projectID", "1")
+	recRebalance := httptest.NewRecorder()
+	srv.handleAuthRebalanceIndustryProjectMaterials(recRebalance, reqRebalance)
+	if recRebalance.Code != http.StatusUnauthorized {
+		t.Fatalf("rebalance status = %d, want 401; body=%s", recRebalance.Code, recRebalance.Body.String())
+	}
+
+	reqSync := requestWithUserID(
+		http.MethodPost,
+		"/api/auth/industry/projects/1/blueprints/sync",
+		bytes.NewBufferString(`{}`),
+		"user-no-session",
+	)
+	reqSync.SetPathValue("projectID", "1")
+	recSync := httptest.NewRecorder()
+	srv.handleAuthSyncIndustryProjectBlueprintPool(recSync, reqSync)
+	if recSync.Code != http.StatusUnauthorized {
+		t.Fatalf("blueprints sync status = %d, want 401; body=%s", recSync.Code, recSync.Body.String())
+	}
+}
+
 func TestHandleAuthPreviewIndustryProjectPlan_Success(t *testing.T) {
 	database := openAPITestDB(t)
 	userID := "user-api-preview-plan"

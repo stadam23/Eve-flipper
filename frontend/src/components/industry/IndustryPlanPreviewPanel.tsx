@@ -29,7 +29,10 @@ export function IndustryPlanPreviewPanel({
   const visibleJobs = useMemo(() => {
     const safeSize = Math.max(1, rowsPerPage);
     const start = (page - 1) * safeSize;
-    return previewJobs.slice(start, start + safeSize);
+    return previewJobs.slice(start, start + safeSize).map((job, idx) => ({
+      job,
+      rowKey: `preview-job-${start + idx}-${job.task_id ?? 0}-${job.activity}-${job.runs ?? 0}-${job.external_job_id ?? 0}-${job.started_at ?? ""}-${job.finished_at ?? ""}`,
+    }));
   }, [previewJobs, page, rowsPerPage]);
 
   if (jobsWorkspaceTab !== "planning" || !lastLedgerPlanPreview) {
@@ -109,8 +112,8 @@ export function IndustryPlanPreviewPanel({
             </tr>
           </thead>
           <tbody>
-            {visibleJobs.map((job, idx) => (
-              <tr key={`preview-job-${idx}`} className="border-b border-eve-border/30">
+            {visibleJobs.map(({ job, rowKey }) => (
+              <tr key={rowKey} className="border-b border-eve-border/30">
                 <td className="px-1.5 py-1 text-eve-dim font-mono">{job.task_id ?? 0}</td>
                 <td className="px-1.5 py-1 text-eve-text">{job.activity}</td>
                 <td className="px-1.5 py-1 text-right text-eve-accent font-mono">{job.runs ?? 0}</td>

@@ -1035,6 +1035,8 @@ export interface IndustryProject {
 }
 
 export interface IndustryTaskPlanInput {
+  // Source task ID used to remap links on replace/append plan apply.
+  task_id?: number;
   // Existing task ID, or negative row ref (-1 = first task row in current patch).
   parent_task_id?: number;
   name: string;

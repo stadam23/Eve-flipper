@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Modal } from "./Modal";
 import { getContractDetails, openContractInGame } from "../lib/api";
 import type { ContractDetails, ContractItem } from "../lib/types";
@@ -90,6 +90,23 @@ export function ContractDetailsPopup({
       });
   }, [contractID, open]);
 
+  const displayedTitle = useMemo(() => {
+    if (!details || !Array.isArray(details.items) || details.items.length === 0) {
+      return contractTitle;
+    }
+    const includedNames = details.items
+      .filter((item) => item.is_included && item.quantity > 0)
+      .map((item) => item.type_name?.trim() || `Type ${item.type_id}`)
+      .filter((name) => name.length > 0);
+    if (includedNames.length === 0) {
+      return contractTitle;
+    }
+    if (includedNames.length <= 3) {
+      return includedNames.join(", ");
+    }
+    return `${includedNames.slice(0, 2).join(", ")} + ${includedNames.length - 2} more`;
+  }, [contractTitle, details]);
+
   // Keep raw rows to preserve risk signals (damage/fitted-like markers/BP params).
   const includedItems = details?.items.filter((item) => item.is_included) || [];
   const requestedItems = details?.items.filter((item) => !item.is_included) || [];
@@ -115,7 +132,7 @@ export function ContractDetailsPopup({
         <div className="border border-eve-border rounded-sm p-3 bg-eve-panel">
           <div className="flex items-start justify-between gap-3">
             <div className="text-sm text-eve-text flex-1">
-              <span className="text-eve-dim">{t("colTitle")}:</span> {contractTitle}
+              <span className="text-eve-dim">{t("colTitle")}:</span> {displayedTitle}
             </div>
             {isLoggedIn && (
               <button
@@ -318,6 +335,7 @@ function ItemRow({ item, highlightRig = false }: { item: ContractItem; highlight
                 </span>
               )}
             </div>
+            <div className="text-[10px] text-eve-dim/80 font-mono">type_id: {item.type_id}</div>
             {damagePercent > 0 && (
               <div className="text-xs text-red-400">⚠ Damaged {damagePercent}%</div>
             )}

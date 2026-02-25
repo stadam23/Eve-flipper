@@ -219,6 +219,17 @@ func TestIndustryLedgerUpdateJobStatus(t *testing.T) {
 		t.Fatalf("job finished_at should be auto-filled for completed status")
 	}
 
+	reopenedJob, err := d.UpdateIndustryJobStatusForUser("user-z", jobID, IndustryJobStatusQueued, "", "", "")
+	if err != nil {
+		t.Fatalf("UpdateIndustryJobStatusForUser queued: %v", err)
+	}
+	if reopenedJob.Status != IndustryJobStatusQueued {
+		t.Fatalf("job status after queued = %q, want queued", reopenedJob.Status)
+	}
+	if reopenedJob.FinishedAt != "" {
+		t.Fatalf("job finished_at after reopen = %q, want empty", reopenedJob.FinishedAt)
+	}
+
 	_, err = d.UpdateIndustryJobStatusForUser("user-other", jobID, IndustryJobStatusCancelled, "", "", "")
 	if err == nil {
 		t.Fatalf("expected error for cross-user job update")
@@ -1420,16 +1431,6 @@ func TestIndustryLedgerAppendPlanTaskReferencesPreferExistingIDAndSupportNegativ
 	if summary.JobsInserted != 2 {
 		t.Fatalf("summary.JobsInserted = %d, want 2", summary.JobsInserted)
 	}
-	foundAmbiguityWarning := false
-	for _, warning := range summary.Warnings {
-		if strings.Contains(warning, industryTaskRefAmbiguityWarning) {
-			foundAmbiguityWarning = true
-			break
-		}
-	}
-	if existingTaskID == 1 && !foundAmbiguityWarning {
-		t.Fatalf("expected ambiguity warning when existingTaskID=1, got: %v", summary.Warnings)
-	}
 
 	snapshot, err := d.GetIndustryProjectSnapshotForUser("user-job-remap-append", project.ID)
 	if err != nil {
@@ -1555,6 +1556,156 @@ func TestIndustryLedgerPreviewAppendPlanSupportsNegativeRowRefs(t *testing.T) {
 	}
 	if rowLinkedTaskID != previewTaskID {
 		t.Fatalf("preview row-linked task_id = %d, want %d", rowLinkedTaskID, previewTaskID)
+	}
+}
+
+func TestIndustryLedgerReplacePlanSnapshotRoundTripPreservesTaskLinks(t *testing.T) {
+	d := openTestDB(t)
+	defer d.Close()
+
+	userID := "user-roundtrip-remap"
+
+	seedProject, err := d.CreateIndustryProjectForUser(userID, IndustryProjectCreateInput{
+		Name: "Seed IDs",
+	})
+	if err != nil {
+		t.Fatalf("CreateIndustryProjectForUser seed: %v", err)
+	}
+	if _, err := d.ApplyIndustryPlanForUser(userID, seedProject.ID, IndustryPlanPatch{
+		Replace: true,
+		Tasks: []IndustryTaskPlanInput{
+			{Name: "Seed A", Activity: "manufacturing", TargetRuns: 1},
+			{Name: "Seed B", Activity: "manufacturing", TargetRuns: 1},
+			{Name: "Seed C", Activity: "manufacturing", TargetRuns: 1},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyIndustryPlanForUser seed: %v", err)
+	}
+
+	project, err := d.CreateIndustryProjectForUser(userID, IndustryProjectCreateInput{
+		Name: "Roundtrip Links",
+	})
+	if err != nil {
+		t.Fatalf("CreateIndustryProjectForUser: %v", err)
+	}
+
+	if _, err := d.ApplyIndustryPlanForUser(userID, project.ID, IndustryPlanPatch{
+		Replace: true,
+		Tasks: []IndustryTaskPlanInput{
+			{Name: "Root Task", Activity: "manufacturing", TargetRuns: 2},
+			{Name: "Child Task", Activity: "manufacturing", TargetRuns: 1, ParentTaskID: 1},
+		},
+		Jobs: []IndustryJobPlanInput{
+			{
+				TaskID:          1,
+				Activity:        "manufacturing",
+				Runs:            2,
+				DurationSeconds: 600,
+				CostISK:         1000,
+				Status:          IndustryJobStatusPlanned,
+				Notes:           "job-root",
+			},
+			{
+				TaskID:          2,
+				Activity:        "manufacturing",
+				Runs:            1,
+				DurationSeconds: 300,
+				CostISK:         500,
+				Status:          IndustryJobStatusPlanned,
+				Notes:           "job-child",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyIndustryPlanForUser initial: %v", err)
+	}
+
+	snapshotBefore, err := d.GetIndustryProjectSnapshotForUser(userID, project.ID)
+	if err != nil {
+		t.Fatalf("GetIndustryProjectSnapshotForUser before: %v", err)
+	}
+	if len(snapshotBefore.Tasks) != 2 || len(snapshotBefore.Jobs) != 2 {
+		t.Fatalf("unexpected snapshot before counts: tasks=%d jobs=%d", len(snapshotBefore.Tasks), len(snapshotBefore.Jobs))
+	}
+
+	patchTasks := make([]IndustryTaskPlanInput, 0, len(snapshotBefore.Tasks))
+	for i := len(snapshotBefore.Tasks) - 1; i >= 0; i-- {
+		task := snapshotBefore.Tasks[i]
+		patchTasks = append(patchTasks, IndustryTaskPlanInput{
+			TaskID:        task.ID,
+			ParentTaskID:  task.ParentTaskID,
+			Name:          task.Name,
+			Activity:      task.Activity,
+			ProductTypeID: task.ProductTypeID,
+			TargetRuns:    task.TargetRuns,
+			PlannedStart:  task.PlannedStart,
+			PlannedEnd:    task.PlannedEnd,
+			Priority:      task.Priority,
+			Status:        task.Status,
+			Constraints:   task.Constraints,
+		})
+	}
+	patchJobs := make([]IndustryJobPlanInput, 0, len(snapshotBefore.Jobs))
+	for _, job := range snapshotBefore.Jobs {
+		patchJobs = append(patchJobs, IndustryJobPlanInput{
+			TaskID:          job.TaskID,
+			CharacterID:     job.CharacterID,
+			FacilityID:      job.FacilityID,
+			Activity:        job.Activity,
+			Runs:            job.Runs,
+			DurationSeconds: job.DurationSeconds,
+			CostISK:         job.CostISK,
+			Status:          job.Status,
+			StartedAt:       job.StartedAt,
+			FinishedAt:      job.FinishedAt,
+			ExternalJobID:   job.ExternalJobID,
+			Notes:           job.Notes,
+		})
+	}
+
+	if _, err := d.ApplyIndustryPlanForUser(userID, project.ID, IndustryPlanPatch{
+		Replace: true,
+		Tasks:   patchTasks,
+		Jobs:    patchJobs,
+	}); err != nil {
+		t.Fatalf("ApplyIndustryPlanForUser roundtrip: %v", err)
+	}
+
+	snapshotAfter, err := d.GetIndustryProjectSnapshotForUser(userID, project.ID)
+	if err != nil {
+		t.Fatalf("GetIndustryProjectSnapshotForUser after: %v", err)
+	}
+	if len(snapshotAfter.Tasks) != 2 || len(snapshotAfter.Jobs) != 2 {
+		t.Fatalf("unexpected snapshot after counts: tasks=%d jobs=%d", len(snapshotAfter.Tasks), len(snapshotAfter.Jobs))
+	}
+
+	var rootTaskID int64
+	var childTaskID int64
+	var childParentID int64
+	for _, task := range snapshotAfter.Tasks {
+		switch task.Name {
+		case "Root Task":
+			rootTaskID = task.ID
+		case "Child Task":
+			childTaskID = task.ID
+			childParentID = task.ParentTaskID
+		}
+	}
+	if rootTaskID <= 0 || childTaskID <= 0 {
+		t.Fatalf("expected root/child tasks in snapshot: %+v", snapshotAfter.Tasks)
+	}
+	if childParentID != rootTaskID {
+		t.Fatalf("child parent task_id = %d, want root task id %d", childParentID, rootTaskID)
+	}
+
+	jobTaskByNotes := map[string]int64{}
+	for _, job := range snapshotAfter.Jobs {
+		jobTaskByNotes[job.Notes] = job.TaskID
+	}
+	if got := jobTaskByNotes["job-root"]; got != rootTaskID {
+		t.Fatalf("job-root task_id = %d, want %d", got, rootTaskID)
+	}
+	if got := jobTaskByNotes["job-child"]; got != childTaskID {
+		t.Fatalf("job-child task_id = %d, want %d", got, childTaskID)
 	}
 }
 

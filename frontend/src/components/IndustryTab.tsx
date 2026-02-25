@@ -101,8 +101,37 @@ interface Props {
 
 type IndustryInnerTab = "analysis" | "jobs";
 type PlanBuilderSection = "tasks" | "jobs" | "materials" | "blueprints";
+type IndustryStrategyPreset = "conservative" | "balanced" | "aggressive";
 
 const INDUSTRY_LEDGER_SELECTED_PROJECT_STORAGE_KEY = "eve-flipper-industry-selected-project-id";
+const INDUSTRY_SCHEDULER_DEFAULTS: Record<
+  IndustryStrategyPreset,
+  {
+    slotCount: number;
+    maxRunsPerJob: number;
+    maxDurationHours: number;
+    queueStatus: IndustryJobStatus;
+  }
+> = {
+  conservative: {
+    slotCount: 1,
+    maxRunsPerJob: 50,
+    maxDurationHours: 12,
+    queueStatus: "planned",
+  },
+  balanced: {
+    slotCount: 2,
+    maxRunsPerJob: 200,
+    maxDurationHours: 24,
+    queueStatus: "queued",
+  },
+  aggressive: {
+    slotCount: 4,
+    maxRunsPerJob: 400,
+    maxDurationHours: 72,
+    queueStatus: "queued",
+  },
+};
 
 function readStoredIndustryLedgerProjectID(): number {
   try {
@@ -127,6 +156,11 @@ function persistIndustryLedgerProjectID(projectID: number): void {
   } catch {
     // ignore storage access errors
   }
+}
+
+function schedulerDefaultsForStrategy(strategy?: string) {
+  const normalized = (strategy ?? "").toLowerCase() as IndustryStrategyPreset;
+  return INDUSTRY_SCHEDULER_DEFAULTS[normalized] ?? INDUSTRY_SCHEDULER_DEFAULTS.balanced;
 }
 
 export function IndustryTab({ onError, isLoggedIn = false }: Props) {
@@ -240,13 +274,14 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const [plannerWarnings, setPlannerWarnings] = useState<IndustryPlannerWarningEvent[]>([]);
   const plannerWarningSeqRef = useRef(1);
   const ledgerLoadSeqRef = useRef(0);
+  const schedulerDefaultsProjectKeyRef = useRef("");
   const [industryInnerTab, setIndustryInnerTab] = useState<IndustryInnerTab>("analysis");
   const [jobsWorkspaceTab, setJobsWorkspaceTab] = useState<IndustryJobsWorkspaceTab>("guide");
   const [planBuilderCompactMode, setPlanBuilderCompactMode] = useState(true);
   const [planBuilderPageSize, setPlanBuilderPageSize] = useState(6);
   const [enablePlanScheduler, setEnablePlanScheduler] = useState(true);
   const [schedulerSlotCount, setSchedulerSlotCount] = useState(2);
-  const [schedulerMaxRunsPerJob, setSchedulerMaxRunsPerJob] = useState(100);
+  const [schedulerMaxRunsPerJob, setSchedulerMaxRunsPerJob] = useState(200);
   const [schedulerMaxDurationHours, setSchedulerMaxDurationHours] = useState(24);
   const [schedulerQueueStatus, setSchedulerQueueStatus] = useState<IndustryJobStatus>("queued");
   const [planBuilderCollapsed, setPlanBuilderCollapsed] = useState<Record<PlanBuilderSection, boolean>>({
@@ -534,6 +569,25 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
     });
     setJobsWorkspaceTab("guide");
   }, [selectedLedgerProjectId]);
+
+  useEffect(() => {
+    if (selectedLedgerProjectId <= 0) {
+      schedulerDefaultsProjectKeyRef.current = "";
+      return;
+    }
+    const selectedProject = ledgerProjects.find((project) => project.id === selectedLedgerProjectId);
+    const strategy = selectedProject?.strategy ?? "balanced";
+    const projectKey = `${selectedLedgerProjectId}:${strategy}`;
+    if (schedulerDefaultsProjectKeyRef.current === projectKey) {
+      return;
+    }
+    schedulerDefaultsProjectKeyRef.current = projectKey;
+    const defaults = schedulerDefaultsForStrategy(strategy);
+    setSchedulerSlotCount(defaults.slotCount);
+    setSchedulerMaxRunsPerJob(defaults.maxRunsPerJob);
+    setSchedulerMaxDurationHours(defaults.maxDurationHours);
+    setSchedulerQueueStatus(defaults.queueStatus);
+  }, [selectedLedgerProjectId, ledgerProjects]);
 
   const handleCreateLedgerProject = useCallback(async () => {
     if (!isLoggedIn) return;
@@ -891,6 +945,7 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
 
   const seedVisualPlanBuilderFromSnapshot = useCallback((snapshot: IndustryProjectSnapshot) => {
     const tasks: IndustryTaskPlanInput[] = (snapshot.tasks ?? []).map((task) => ({
+      task_id: task.id,
       parent_task_id: task.parent_task_id,
       name: task.name,
       activity: task.activity,

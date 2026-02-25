@@ -2,12 +2,28 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"eve-flipper/internal/engine"
+	"eve-flipper/internal/esi"
 )
+
+func resolveContractTypeName(sdeName, esiName string, typeID int32) string {
+	live := strings.TrimSpace(esiName)
+	if live != "" {
+		// Prefer live ESI name: contract item naming can drift vs local SDE.
+		return live
+	}
+	local := strings.TrimSpace(sdeName)
+	if local != "" {
+		return local
+	}
+	return fmt.Sprintf("Type %d", typeID)
+}
 
 // ContractItemResponse represents a contract item in the API response
 type ContractItemResponse struct {
@@ -48,37 +64,68 @@ func (s *Server) handleGetContractItems(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Fetch contract items from ESI
-	items, err := s.esi.FetchContractItems(int32(contractID))
-	if err != nil {
-		log.Printf("[API] FetchContractItems error: contract_id=%d, err=%v", contractID, err)
-		http.Error(w, `{"error":"esi_error"}`, http.StatusInternalServerError)
-		return
+	// Prefer scanner-level contract-items cache to avoid repeated ESI calls.
+	var items []esi.ContractItem
+	if s.scanner != nil && s.scanner.ContractItemsCache != nil {
+		batch := s.esi.FetchContractItemsBatch(
+			[]int32{int32(contractID)},
+			s.scanner.ContractItemsCache,
+			func(done, total int) {},
+		)
+		if cached, ok := batch[int32(contractID)]; ok {
+			items = cached
+		}
+	}
+	// Fallback direct fetch if cache path had no entry (e.g. transient ESI errors).
+	if len(items) == 0 {
+		fetched, err := s.esi.FetchContractItems(int32(contractID))
+		if err != nil {
+			log.Printf("[API] FetchContractItems error: contract_id=%d, err=%v", contractID, err)
+			http.Error(w, `{"error":"esi_error"}`, http.StatusInternalServerError)
+			return
+		}
+		items = fetched
 	}
 
 	// Convert to response format with type names
 	responseItems := make([]ContractItemResponse, 0, len(items))
+	liveTypeNames := make(map[int32]string)
+	esiTypeName := func(typeID int32) string {
+		if v, ok := liveTypeNames[typeID]; ok {
+			return v
+		}
+		name := ""
+		if s.esi != nil {
+			name = strings.TrimSpace(s.esi.TypeName(typeID))
+		}
+		liveTypeNames[typeID] = name
+		return name
+	}
+
 	for _, item := range items {
 		if item.Quantity > 0 && engine.IsMarketDisabledTypeID(item.TypeID) {
 			continue
 		}
-		typeName := ""
+		typeNameSDE := ""
 		groupID := int32(0)
 		groupName := ""
 		categoryID := int32(0)
 		isShip := false
 		isRig := false
-		if t, ok := s.sdeData.Types[item.TypeID]; ok {
-			typeName = t.Name
-			groupID = t.GroupID
-			categoryID = t.CategoryID
-			isShip = t.CategoryID == 6
-			isRig = t.IsRig
-			if g, ok := s.sdeData.Groups[t.GroupID]; ok {
-				groupName = g.Name
-				isRig = g.IsRig
+		if s.sdeData != nil {
+			if t, ok := s.sdeData.Types[item.TypeID]; ok {
+				typeNameSDE = t.Name
+				groupID = t.GroupID
+				categoryID = t.CategoryID
+				isShip = t.CategoryID == 6
+				isRig = t.IsRig
+				if g, ok := s.sdeData.Groups[t.GroupID]; ok {
+					groupName = g.Name
+					isRig = g.IsRig
+				}
 			}
 		}
+		typeName := resolveContractTypeName(typeNameSDE, esiTypeName(item.TypeID), item.TypeID)
 
 		resp := ContractItemResponse{
 			TypeID:          item.TypeID,

@@ -7,6 +7,7 @@ import { EmptyState, type EmptyReason } from "./EmptyState";
 import {
   clearStationTradeStates,
   deleteStationTradeStates,
+  getContractDetails,
   getStationTradeStates,
   openContractInGame,
   rebootStationCache,
@@ -116,6 +117,21 @@ function formatCountdown(totalSec: number): string {
   return `${mm}:${ss}`;
 }
 
+function buildContractTitleFromItems(items: Array<{
+  type_id: number;
+  type_name: string;
+  quantity: number;
+  is_included: boolean;
+}>): string {
+  const includedNames = items
+    .filter((item) => item.is_included && item.quantity > 0)
+    .map((item) => (item.type_name || `Type ${item.type_id}`).trim())
+    .filter((name) => name.length > 0);
+  if (includedNames.length === 0) return "";
+  if (includedNames.length <= 3) return includedNames.join(", ");
+  return `${includedNames.slice(0, 2).join(", ")} + ${includedNames.length - 2} more`;
+}
+
 function mapServerCacheMeta(
   meta: StationCacheMeta | null | undefined,
   fallbackScope: string,
@@ -187,6 +203,7 @@ export function ContractResultsTable({
   const [cacheNowTs, setCacheNowTs] = useState<number>(Date.now());
   const [lastScanTs, setLastScanTs] = useState<number>(Date.now());
   const [cacheRebooting, setCacheRebooting] = useState(false);
+  const [resolvedTitles, setResolvedTitles] = useState<Record<number, string>>({});
 
   // Contract details popup
   const [selectedContract, setSelectedContract] = useState<ContractResult | null>(null);
@@ -194,6 +211,7 @@ export function ContractResultsTable({
   // Context menu
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; row: ContractResult } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const titleFetchInFlightRef = useRef<Set<number>>(new Set());
 
   const handleContextMenu = useCallback((e: React.MouseEvent, row: ContractResult) => {
     e.preventDefault();
@@ -255,13 +273,18 @@ export function ContractResultsTable({
     });
   }, [hiddenMap]);
 
+  const effectiveTitle = useCallback(
+    (row: ContractResult) => resolvedTitles[row.ContractID] ?? row.Title,
+    [resolvedTitles],
+  );
+
   const filtered = useMemo(() => {
     if (Object.values(filters).every((v) => !v)) return results;
     return results.filter((row) => {
       for (const col of columnDefs) {
         const fval = filters[col.key];
         if (!fval) continue;
-        const cellVal = row[col.key];
+        const cellVal = col.key === "Title" ? effectiveTitle(row) : row[col.key];
         if (col.numeric) {
           // Support filters: "100-500" (range), ">100", ">=100", "<500", "<=500", "=100" (exact), or plain number (>= threshold)
           const num = numericCellValue(row, col.key);
@@ -299,15 +322,15 @@ export function ContractResultsTable({
       }
       return true;
     });
-  }, [results, filters]);
+  }, [effectiveTitle, filters, results]);
 
   const sorted = useMemo(() => {
     const copy = [...filtered];
     const currentCol = columnDefs.find((c) => c.key === sortKey);
     const numericSort = !!currentCol?.numeric;
     copy.sort((a, b) => {
-      const av = a[sortKey];
-      const bv = b[sortKey];
+      const av = sortKey === "Title" ? effectiveTitle(a) : a[sortKey];
+      const bv = sortKey === "Title" ? effectiveTitle(b) : b[sortKey];
       if (numericSort) {
         const an = numericCellValue(a, sortKey);
         const bn = numericCellValue(b, sortKey);
@@ -318,12 +341,83 @@ export function ContractResultsTable({
         : String(bv).localeCompare(String(av));
     });
     return copy;
-  }, [filtered, sortKey, sortDir]);
+  }, [effectiveTitle, filtered, sortDir, sortKey]);
 
   const displaySorted = useMemo(() => {
     if (showHiddenRows) return sorted;
     return sorted.filter((row) => !hiddenMap[rowKey(row)]);
   }, [hiddenMap, showHiddenRows, sorted]);
+
+  useEffect(() => {
+    const aliveIDs = new Set(results.map((row) => row.ContractID));
+    setResolvedTitles((prev) => {
+      let changed = false;
+      const next: Record<number, string> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        const id = Number(k);
+        if (aliveIDs.has(id)) {
+          next[id] = v;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [results]);
+
+  useEffect(() => {
+    if (scanning) return;
+    const lookAheadRows = displaySorted.slice(0, 25);
+    const queue = lookAheadRows
+      .map((row) => row.ContractID)
+      .filter(
+        (id) =>
+          !resolvedTitles[id] &&
+          !titleFetchInFlightRef.current.has(id),
+      );
+    if (queue.length === 0) return;
+
+    for (const id of queue) {
+      titleFetchInFlightRef.current.add(id);
+    }
+
+    let canceled = false;
+    let cursor = 0;
+    const workerCount = Math.min(3, queue.length);
+
+    const runWorker = async () => {
+      while (true) {
+        if (canceled) return;
+        const idx = cursor++;
+        if (idx >= queue.length) return;
+        const contractID = queue[idx];
+        try {
+          const details = await getContractDetails(contractID);
+          if (canceled) return;
+          const title = buildContractTitleFromItems(details.items ?? []);
+          if (title) {
+            setResolvedTitles((prev) =>
+              prev[contractID] === title
+                ? prev
+                : { ...prev, [contractID]: title },
+            );
+          }
+        } catch {
+          // best effort: keep original scan title if details endpoint fails
+        } finally {
+          titleFetchInFlightRef.current.delete(contractID);
+        }
+      }
+    };
+
+    for (let i = 0; i < workerCount; i++) {
+      void runWorker();
+    }
+
+    return () => {
+      canceled = true;
+    };
+  }, [displaySorted, resolvedTitles, scanning]);
 
   const cacheView = useMemo(
     () => mapServerCacheMeta(cacheMeta, t("hiddenScopeContractScan"), 1, lastScanTs),
@@ -362,7 +456,9 @@ export function ContractResultsTable({
               key,
               mode: s.mode,
               updatedAt: s.updated_at,
-              title: row?.Title ?? prevEntry?.title ?? t("hiddenContractFallback", { id: s.type_id }),
+              title: row
+                ? effectiveTitle(row)
+                : prevEntry?.title ?? t("hiddenContractFallback", { id: s.type_id }),
               stationName: row?.StationName ?? prevEntry?.stationName ?? t("hiddenUnknown"),
               stateTypeID: s.type_id,
               stateStationID: s.station_id,
@@ -375,7 +471,7 @@ export function ContractResultsTable({
         // best effort
       }
     },
-    [results, t, tradeStateTab],
+    [effectiveTitle, results, t, tradeStateTab],
   );
 
   useEffect(() => {
@@ -405,7 +501,7 @@ export function ContractResultsTable({
   const hasActiveFilters = Object.values(filters).some((v) => !!v);
 
   const formatCell = (col: (typeof columnDefs)[number], row: ContractResult): string => {
-    const val = row[col.key];
+    const val = col.key === "Title" ? effectiveTitle(row) : row[col.key];
     if (val == null || val === "") return "\u2014";
     if (
       col.key === "Price" ||
@@ -428,7 +524,11 @@ export function ContractResultsTable({
     const header = columnDefs.map((c) => t(c.labelKey)).join(",");
     const csvRows = displaySorted.map((row) =>
       columnDefs.map((col) => {
-        const val = col.numeric ? numericCellValue(row, col.key) : row[col.key];
+        const val = col.numeric
+          ? numericCellValue(row, col.key)
+          : col.key === "Title"
+            ? effectiveTitle(row)
+            : row[col.key];
         const str = String(val);
         return str.includes(",") ? `"${str}"` : str;
       }).join(",")
@@ -451,7 +551,7 @@ export function ContractResultsTable({
         key,
         mode,
         updatedAt: new Date().toISOString(),
-        title: row.Title,
+        title: effectiveTitle(row),
         stationName: row.StationName,
         stateTypeID: ids.typeID,
         stateStationID: ids.stationID,
@@ -473,7 +573,14 @@ export function ContractResultsTable({
         void refreshHiddenStates(cacheView.currentRevision);
       }
     },
-    [addToast, cacheView.currentRevision, refreshHiddenStates, t, tradeStateTab],
+    [
+      addToast,
+      cacheView.currentRevision,
+      effectiveTitle,
+      refreshHiddenStates,
+      t,
+      tradeStateTab,
+    ],
   );
 
   const unhideRowsByKeys = useCallback(
@@ -810,7 +917,7 @@ export function ContractResultsTable({
             className="fixed z-50 bg-eve-panel border border-eve-border rounded-sm shadow-eve-glow-strong py-1 min-w-[200px]"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
-            <ContextItem label={t("copyItem")} onClick={() => copyText(contextMenu.row.Title)} />
+            <ContextItem label={t("copyItem")} onClick={() => copyText(effectiveTitle(contextMenu.row))} />
             <ContextItem label={t("copyStation")} onClick={() => copyText(contextMenu.row.StationName)} />
             <ContextItem label={t("copyContractID")} onClick={() => copyText(String(contextMenu.row.ContractID))} />
             <div className="h-px bg-eve-border my-1" />
@@ -1068,7 +1175,7 @@ export function ContractResultsTable({
       <ContractDetailsPopup
         open={!!selectedContract}
         contractID={selectedContract?.ContractID ?? 0}
-        contractTitle={selectedContract?.Title ?? ""}
+        contractTitle={selectedContract ? effectiveTitle(selectedContract) : ""}
         contractPrice={selectedContract?.Price ?? 0}
         contractMarketValue={selectedContract?.MarketValue}
         contractProfit={selectedContract?.Profit}
