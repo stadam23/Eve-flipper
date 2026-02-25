@@ -29,6 +29,12 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Frontend build gate
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
       - name: Go unit tests
         run: go test ./...
 
@@ -38,9 +44,3 @@ jobs:
           COVERAGE="$(go tool cover -func engine.cover.out | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
           echo "internal/engine coverage: ${COVERAGE}%"
           awk -v coverage="${COVERAGE}" 'BEGIN { exit (coverage + 0 >= 70 ? 0 : 1) }'
-
-      - name: Frontend build gate
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run build
