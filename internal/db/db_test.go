@@ -432,21 +432,40 @@ func TestDB_ConfigRoundTrip(t *testing.T) {
 	defer d.Close()
 
 	cfg := &config.Config{
-		SystemName:          "Amarr",
-		CargoCapacity:       8000,
-		BuyRadius:           7,
-		SellRadius:          12,
-		MinMargin:           10,
-		SalesTaxPercent:     6,
-		AlertTelegram:       true,
-		AlertDiscord:        true,
-		AlertDesktop:        false,
-		AlertTelegramToken:  "tg-token",
-		AlertTelegramChatID: "123456",
-		AlertDiscordWebhook: "https://discord.example/webhook",
-		Opacity:             200,
-		WindowW:             1024,
-		WindowH:             768,
+		SystemName:             "Amarr",
+		CargoCapacity:          8000,
+		BuyRadius:              7,
+		SellRadius:             12,
+		MinMargin:              10,
+		SalesTaxPercent:        6,
+		MinDailyVolume:         25,
+		MaxInvestment:          9000000,
+		MinItemProfit:          250000,
+		MinS2BPerDay:           2.5,
+		MinBfSPerDay:           1.5,
+		MinS2BBfSRatio:         0.8,
+		MaxS2BBfSRatio:         3.2,
+		MinRouteSecurity:       0.45,
+		AvgPricePeriod:         21,
+		MinPeriodROI:           12.5,
+		MaxDOS:                 4.5,
+		MinDemandPerDay:        7,
+		ShippingCostPerM3Jump:  123,
+		SourceRegions:          []string{"The Forge", "Domain"},
+		TargetRegion:           "Domain",
+		TargetMarketSystem:     "Jita",
+		TargetMarketLocationID: 60003760,
+		CategoryIDs:            []int32{6, 8},
+		SellOrderMode:          true,
+		AlertTelegram:          true,
+		AlertDiscord:           true,
+		AlertDesktop:           false,
+		AlertTelegramToken:     "tg-token",
+		AlertTelegramChatID:    "123456",
+		AlertDiscordWebhook:    "https://discord.example/webhook",
+		Opacity:                200,
+		WindowW:                1024,
+		WindowH:                768,
 	}
 	if err := d.SaveConfig(cfg); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
@@ -466,6 +485,76 @@ func TestDB_ConfigRoundTrip(t *testing.T) {
 	}
 	if got.WindowW != 1024 || got.WindowH != 768 {
 		t.Errorf("LoadConfig window = %dx%d", got.WindowW, got.WindowH)
+	}
+	if got.AvgPricePeriod != 21 || got.MaxDOS != 4.5 || got.MinDemandPerDay != 7 {
+		t.Errorf("LoadConfig region thresholds mismatch: avg=%d max_dos=%v min_demand=%v", got.AvgPricePeriod, got.MaxDOS, got.MinDemandPerDay)
+	}
+	if got.TargetMarketSystem != "Jita" || got.TargetMarketLocationID != 60003760 {
+		t.Errorf("LoadConfig target market mismatch: system=%q location=%d", got.TargetMarketSystem, got.TargetMarketLocationID)
+	}
+	if !got.SellOrderMode || len(got.CategoryIDs) != 2 || len(got.SourceRegions) != 2 {
+		t.Errorf("LoadConfig region arrays/flags mismatch: sell_mode=%v categories=%v sources=%v", got.SellOrderMode, got.CategoryIDs, got.SourceRegions)
+	}
+}
+
+func TestDB_RegionalDayResultsRoundTrip(t *testing.T) {
+	d := openTestDB(t)
+	defer d.Close()
+
+	id := d.InsertHistory("region", "Jita", 1, 100)
+	if id <= 0 {
+		t.Fatal("InsertHistory failed")
+	}
+
+	in := []engine.FlipResult{
+		{
+			TypeID:                34,
+			TypeName:              "Tritanium",
+			BuyStation:            "Jita 4-4",
+			SellStation:           "Amarr VIII",
+			BuySystemName:         "Jita",
+			SellSystemName:        "Amarr",
+			BuySystemID:           30000142,
+			SellSystemID:          30002187,
+			UnitsToBuy:            10,
+			MarginPercent:         5.5,
+			TotalProfit:           1200000,
+			RealProfit:            1100000,
+			DayNowProfit:          1200000,
+			DayPeriodProfit:       1100000,
+			DayTargetDOS:          3.1,
+			DayTargetDemandPerDay: 40,
+			DayTradeScore:         72,
+		},
+	}
+
+	d.InsertRegionalDayResults(id, in)
+	got := d.GetRegionalDayResults(id)
+	if len(got) != 1 {
+		t.Fatalf("GetRegionalDayResults len = %d, want 1", len(got))
+	}
+	if got[0].TypeID != 34 || got[0].DayTargetDOS != 3.1 || got[0].DayTradeScore != 72 {
+		t.Fatalf("regional day row mismatch: %+v", got[0])
+	}
+}
+
+func TestDB_GetRegionalDayResults_SkipsLegacyHubPayload(t *testing.T) {
+	d := openTestDB(t)
+	defer d.Close()
+
+	id := d.InsertHistory("region", "Jita", 7, 100)
+	if id <= 0 {
+		t.Fatal("InsertHistory failed")
+	}
+
+	legacyHub := `{"source_system_id":30000142,"source_system_name":"Jita","item_count":7,"items":[{"type_id":34,"type_name":"Tritanium"}]}`
+	if _, err := d.sql.Exec(`INSERT INTO regional_day_results (scan_id, row_json) VALUES (?, ?)`, id, legacyHub); err != nil {
+		t.Fatalf("insert legacy regional row: %v", err)
+	}
+
+	got := d.GetRegionalDayResults(id)
+	if len(got) != 0 {
+		t.Fatalf("GetRegionalDayResults len = %d, want 0 for legacy payload", len(got))
 	}
 }
 

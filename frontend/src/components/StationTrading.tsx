@@ -1219,9 +1219,9 @@ export function StationTrading({
 
   const cacheBadgeText = useMemo(() => {
     if (!cacheMeta || cacheSecondsLeft == null) return "Cache n/a";
-    if (cacheSecondsLeft <= 0) return "Cache stale";
-    return `Cache ${formatCountdown(cacheSecondsLeft)}`;
-  }, [cacheMeta, cacheSecondsLeft]);
+    if (cacheSecondsLeft <= 0) return t("cacheStale");
+    return t("cacheLabel", { time: formatCountdown(cacheSecondsLeft) });
+  }, [cacheMeta, cacheSecondsLeft, t]);
 
   const riskCounters = useMemo(() => {
     let highRisk = 0;
@@ -1250,15 +1250,16 @@ export function StationTrading({
           : prev,
       );
       setCacheNowTs(now);
-      addToast(`Cache rebooted: ${res.cleared} entries`, "success", 2400);
-      setProgress(`Cache rebooted (${res.cleared}) - run Scan for fresh data`);
+      addToast(t("cacheRebooted", { count: res.cleared }), "success", 2400);
+      addToast(t("cacheRebootRescanHint"), "info", 2600);
+      setProgress(`${t("cacheRebooted", { count: res.cleared })}. ${t("cacheRebootRescanHint")}`);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Cache reboot failed";
+      const msg = e instanceof Error ? e.message : t("cacheRebootFailed");
       addToast(msg, "error", 2800);
     } finally {
       setCacheRebooting(false);
     }
-  }, [addToast, cacheRebooting]);
+  }, [addToast, cacheRebooting, t]);
 
   const { pageRows, totalPages, safePage } = useMemo(() => {
     const totalPages = Math.max(1, Math.ceil(displayRows.length / STATION_PAGE_SIZE));
@@ -2251,17 +2252,21 @@ export function StationTrading({
             >
               Ignored ({hiddenCounts.total})
             </button>
-            <button
-              type="button"
-              onClick={() => {
-                void handleRebootCache();
-              }}
-              disabled={cacheRebooting}
-              className="px-2 py-0.5 rounded-sm border border-eve-border/60 bg-eve-dark/40 text-[11px] text-eve-dim hover:border-eve-accent/50 hover:text-eve-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-              title="Hard reset station market cache"
+              <button
+                type="button"
+                onClick={() => {
+                  void handleRebootCache();
+                }}
+                disabled={cacheRebooting}
+              className={`px-2 py-0.5 rounded-sm border bg-eve-dark/40 text-[11px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                cacheSecondsLeft != null && cacheSecondsLeft <= 0
+                  ? "border-red-500/60 text-red-300 hover:bg-red-900/20"
+                  : "border-eve-border/60 text-eve-dim hover:border-eve-accent/50 hover:text-eve-accent"
+              }`}
+              title={t("cacheHardResetTitle")}
             >
-              {cacheRebooting ? "Rebooting..." : "Reboot cache"}
-            </button>
+              {cacheRebooting ? t("cacheRebooting") : t("cacheReboot")}
+              </button>
             <button
               type="button"
               className={`px-2 py-0.5 rounded-sm border text-[11px] font-mono transition-colors ${
@@ -2277,6 +2282,9 @@ export function StationTrading({
               >
                 {cacheBadgeText}
               </button>
+              {cacheSecondsLeft != null && cacheSecondsLeft <= 0 && (
+                <span className="text-red-300 text-[11px]">{t("cacheStaleHint")}</span>
+              )}
             </div>
           )}
           {!scanning && displayRows.length > STATION_PAGE_SIZE && (
@@ -2319,7 +2327,7 @@ export function StationTrading({
 
       <div
         ref={operatorPanelVisible ? operatorSplitRef : undefined}
-        className={`flex-1 min-h-0 flex px-2 pb-2 ${
+        className={`flex-1 min-h-0 min-w-0 flex px-2 pb-2 ${
           operatorPanelAvailable ? "gap-2" : ""
         }`}
       >
@@ -2657,7 +2665,7 @@ export function StationTrading({
 
         {/* Table */}
         <div
-          className={`min-h-0 overflow-auto border border-eve-border rounded-sm table-scroll-wrapper table-scroll-container eve-scrollbar ${
+          className={`min-h-0 min-w-0 overflow-x-auto overflow-y-auto border border-eve-border rounded-sm table-scroll-wrapper table-scroll-no-fade table-scroll-container eve-scrollbar ${
             operatorPanelVisible ? "" : "flex-1"
           }`}
           style={
@@ -2666,7 +2674,7 @@ export function StationTrading({
               : undefined
           }
         >
-        <table className="w-full text-sm">
+        <table className="w-full min-w-max text-sm">
           <thead className="sticky top-0 z-10">
             <tr className="bg-eve-dark border-b border-eve-border">
               {showOperatorColumns && (

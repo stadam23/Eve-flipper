@@ -91,11 +91,14 @@ type FlatMaterial struct {
 
 // IndustryAnalyzer performs industry calculations.
 type IndustryAnalyzer struct {
-	SDE            *sde.Data
-	ESI            *esi.Client
-	IndustryCache  *esi.IndustryCache
-	adjustedPrices map[int32]float64
-	marketPrices   map[int32]float64 // Best sell order prices
+	SDE                  *sde.Data
+	ESI                  *esi.Client
+	IndustryCache        *esi.IndustryCache
+	adjustedPrices       map[int32]float64
+	marketPrices         map[int32]float64 // Best sell order prices
+	getAllAdjustedPrices func(cache *esi.IndustryCache) (map[int32]float64, error)
+	getSystemCostIndex   func(cache *esi.IndustryCache, systemID int32) (*esi.SystemCostIndices, error)
+	fetchMarketPricesFn  func(params IndustryParams) (map[int32]float64, error)
 }
 
 // NewIndustryAnalyzer creates a new analyzer.
@@ -105,6 +108,44 @@ func NewIndustryAnalyzer(sdeData *sde.Data, esiClient *esi.Client) *IndustryAnal
 		ESI:           esiClient,
 		IndustryCache: esi.NewIndustryCache(),
 	}
+}
+
+func (a *IndustryAnalyzer) ensureIndustryCache() {
+	if a.IndustryCache == nil {
+		a.IndustryCache = esi.NewIndustryCache()
+	}
+}
+
+func (a *IndustryAnalyzer) loadAdjustedPrices() (map[int32]float64, error) {
+	a.ensureIndustryCache()
+	if a.getAllAdjustedPrices != nil {
+		return a.getAllAdjustedPrices(a.IndustryCache)
+	}
+	if a.ESI == nil {
+		return nil, fmt.Errorf("esi client unavailable")
+	}
+	return a.ESI.GetAllAdjustedPrices(a.IndustryCache)
+}
+
+func (a *IndustryAnalyzer) loadSystemCostIndex(systemID int32) (*esi.SystemCostIndices, error) {
+	a.ensureIndustryCache()
+	if a.getSystemCostIndex != nil {
+		return a.getSystemCostIndex(a.IndustryCache, systemID)
+	}
+	if a.ESI == nil {
+		return nil, fmt.Errorf("esi client unavailable")
+	}
+	return a.ESI.GetSystemCostIndex(a.IndustryCache, systemID)
+}
+
+func (a *IndustryAnalyzer) loadMarketPrices(params IndustryParams) (map[int32]float64, error) {
+	if a.fetchMarketPricesFn != nil {
+		return a.fetchMarketPricesFn(params)
+	}
+	if a.ESI == nil {
+		return nil, fmt.Errorf("esi client unavailable")
+	}
+	return a.fetchMarketPrices(params)
 }
 
 // Analyze performs full industry analysis for a given item.
@@ -128,7 +169,7 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 	progress("Fetching market prices...")
 
 	// Fetch adjusted prices for job cost calculation
-	adjustedPrices, err := a.ESI.GetAllAdjustedPrices(a.IndustryCache)
+	adjustedPrices, err := a.loadAdjustedPrices()
 	if err != nil {
 		log.Printf("Warning: failed to fetch adjusted prices: %v", err)
 		adjustedPrices = make(map[int32]float64)
@@ -137,7 +178,7 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 
 	// Fetch market prices (best sell orders) for buy/build comparison
 	progress("Fetching sell order prices...")
-	marketPrices, err := a.fetchMarketPrices(params)
+	marketPrices, err := a.loadMarketPrices(params)
 	if err != nil {
 		log.Printf("Warning: failed to fetch market prices: %v", err)
 		marketPrices = make(map[int32]float64)
@@ -148,7 +189,7 @@ func (a *IndustryAnalyzer) Analyze(params IndustryParams, progress func(string))
 	var costIndex float64
 	if params.SystemID != 0 {
 		progress("Fetching system cost index...")
-		idx, err := a.ESI.GetSystemCostIndex(a.IndustryCache, params.SystemID)
+		idx, err := a.loadSystemCostIndex(params.SystemID)
 		if err != nil {
 			log.Printf("Warning: failed to fetch cost index: %v", err)
 		} else {

@@ -553,6 +553,7 @@ export function ContractResultsTable({
       const res = await rebootStationCache();
       setLastScanTs(Date.now());
       addToast(t("cacheRebooted", { count: res.cleared }), "success", 2400);
+      addToast(t("cacheRebootRescanHint"), "info", 2600);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : t("cacheRebootFailed");
       addToast(msg, "error", 2800);
@@ -616,6 +617,9 @@ export function ContractResultsTable({
               })}
             </span>
           )}
+          {!scanning && results.length > 0 && cacheSecondsLeft <= 0 && (
+            <span className="text-red-300">| {t("cacheStaleHint")}</span>
+          )}
         </div>
         <div className="flex-1" />
         {results.length > 0 && !scanning && (
@@ -643,7 +647,11 @@ export function ContractResultsTable({
                 void handleRebootCache();
               }}
               disabled={cacheRebooting}
-              className="px-2 py-0.5 rounded-sm border border-eve-border/60 bg-eve-dark/40 text-[11px] text-eve-dim hover:border-eve-accent/50 hover:text-eve-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              className={`px-2 py-0.5 rounded-sm border bg-eve-dark/40 text-[11px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                cacheSecondsLeft <= 0
+                  ? "border-red-500/60 text-red-300 hover:bg-red-900/20"
+                  : "border-eve-border/60 text-eve-dim hover:border-eve-accent/50 hover:text-eve-accent"
+              }`}
               title={t("cacheHardResetTitle")}
             >
               {cacheRebooting ? t("cacheRebooting") : t("cacheReboot")}

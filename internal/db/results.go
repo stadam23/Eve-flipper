@@ -1,8 +1,10 @@
 package db
 
 import (
+	"encoding/json"
 	"eve-flipper/internal/engine"
 	"log"
+	"strings"
 )
 
 // InsertFlipResults bulk-inserts flip results linked to a scan history record.
@@ -449,4 +451,77 @@ func (d *DB) GetRouteResults(scanID int64) []engine.RouteResult {
 		}
 	}
 	return results
+}
+
+// InsertRegionalDayResults stores flattened regional day-trader rows as JSON.
+func (d *DB) InsertRegionalDayResults(scanID int64, rows []engine.FlipResult) {
+	if scanID == 0 || len(rows) == 0 {
+		return
+	}
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		log.Printf("[DB] InsertRegionalDayResults begin tx: %v", err)
+		return
+	}
+
+	stmt, err := tx.Prepare(`INSERT INTO regional_day_results (scan_id, row_json) VALUES (?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("[DB] InsertRegionalDayResults prepare: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	for _, row := range rows {
+		payload, marshalErr := json.Marshal(row)
+		if marshalErr != nil {
+			tx.Rollback()
+			log.Printf("[DB] InsertRegionalDayResults marshal type_id=%d: %v", row.TypeID, marshalErr)
+			return
+		}
+		if _, execErr := stmt.Exec(scanID, string(payload)); execErr != nil {
+			tx.Rollback()
+			log.Printf("[DB] InsertRegionalDayResults exec type_id=%d: %v", row.TypeID, execErr)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("[DB] InsertRegionalDayResults commit: %v", err)
+	}
+}
+
+// GetRegionalDayResults retrieves flattened regional day-trader rows for a scan.
+func (d *DB) GetRegionalDayResults(scanID int64) []engine.FlipResult {
+	rows, err := d.sql.Query(`SELECT row_json FROM regional_day_results WHERE scan_id = ? ORDER BY id ASC`, scanID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	out := make([]engine.FlipResult, 0)
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			log.Printf("[DB] GetRegionalDayResults scan row: %v", err)
+			continue
+		}
+		var row engine.FlipResult
+		if unmarshalErr := json.Unmarshal([]byte(payload), &row); unmarshalErr != nil {
+			log.Printf("[DB] GetRegionalDayResults unmarshal row: %v", unmarshalErr)
+			continue
+		}
+		if !isValidRegionalDayRow(row) {
+			// Backward compatibility: ignore legacy/non-flattened payloads
+			// that cannot be represented as a regular FlipResult row.
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func isValidRegionalDayRow(row engine.FlipResult) bool {
+	return row.TypeID > 0 && strings.TrimSpace(row.TypeName) != ""
 }

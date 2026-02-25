@@ -7,9 +7,10 @@ import { useGlobalToast } from "./Toast";
 import { handleEveUIError } from "@/lib/handleEveUIError";
 import {
   TabSettingsPanel,
+  SettingsCheckbox,
   SettingsField,
-  SettingsNumberInput,
   SettingsGrid,
+  SettingsNumberInput,
 } from "./TabSettingsPanel";
 
 type SortKey = "hops" | "profit" | "jumps" | "ppj";
@@ -38,6 +39,9 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
   const { t } = useI18n();
   const [minHops, setMinHops] = useState<number | "">(params.route_min_hops ?? 2);
   const [maxHops, setMaxHops] = useState<number | "">(params.route_max_hops ?? 5);
+  const [targetSystemName, setTargetSystemName] = useState(params.route_target_system_name ?? "");
+  const [minISKPerJump, setMinISKPerJump] = useState<number | "">(params.route_min_isk_per_jump ?? 0);
+  const [allowEmptyHops, setAllowEmptyHops] = useState<boolean>(params.route_allow_empty_hops ?? false);
   const [results, setResults] = useState<RouteResult[]>([]);
 
   // Accept externally loaded results (from history)
@@ -54,6 +58,15 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
   useEffect(() => {
     setMaxHops(params.route_max_hops ?? 5);
   }, [params.route_max_hops]);
+  useEffect(() => {
+    setTargetSystemName(params.route_target_system_name ?? "");
+  }, [params.route_target_system_name]);
+  useEffect(() => {
+    setMinISKPerJump(params.route_min_isk_per_jump ?? 0);
+  }, [params.route_min_isk_per_jump]);
+  useEffect(() => {
+    setAllowEmptyHops(params.route_allow_empty_hops ?? false);
+  }, [params.route_allow_empty_hops]);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState("");
   const [selectedRoute, setSelectedRoute] = useState<RouteResult | null>(null);
@@ -61,13 +74,12 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const abortRef = useRef<AbortController | null>(null);
 
-  const applyHopParams = useCallback(
-    (nextMin: number, nextMax: number) => {
+  const applyRouteParams = useCallback(
+    (patch: Partial<ScanParams>) => {
       if (!onChange) return;
       onChange({
         ...params,
-        route_min_hops: nextMin,
-        route_max_hops: nextMax,
+        ...patch,
       });
     },
     [onChange, params],
@@ -80,9 +92,12 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
       const boundedMax = Math.max(boundedMin, Math.min(25, currentMax));
       setMinHops(boundedMin);
       setMaxHops(boundedMax);
-      applyHopParams(boundedMin, boundedMax);
+      applyRouteParams({
+        route_min_hops: boundedMin,
+        route_max_hops: boundedMax,
+      });
     },
-    [maxHops, applyHopParams],
+    [maxHops, applyRouteParams],
   );
 
   const handleMaxHopsChange = useCallback(
@@ -90,9 +105,37 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
       const currentMin = typeof minHops === "number" ? minHops : 2;
       const boundedMax = Math.max(currentMin, Math.min(25, value));
       setMaxHops(boundedMax);
-      applyHopParams(currentMin, boundedMax);
+      applyRouteParams({
+        route_min_hops: currentMin,
+        route_max_hops: boundedMax,
+      });
     },
-    [minHops, applyHopParams],
+    [minHops, applyRouteParams],
+  );
+
+  const handleTargetSystemChange = useCallback(
+    (value: string) => {
+      setTargetSystemName(value);
+      applyRouteParams({ route_target_system_name: value });
+    },
+    [applyRouteParams],
+  );
+
+  const handleMinISKPerJumpChange = useCallback(
+    (value: number) => {
+      const bounded = Math.max(0, value);
+      setMinISKPerJump(bounded);
+      applyRouteParams({ route_min_isk_per_jump: bounded });
+    },
+    [applyRouteParams],
+  );
+
+  const handleAllowEmptyHopsChange = useCallback(
+    (enabled: boolean) => {
+      setAllowEmptyHops(enabled);
+      applyRouteParams({ route_allow_empty_hops: enabled });
+    },
+    [applyRouteParams],
   );
 
   const toggleSort = (key: SortKey) => {
@@ -132,7 +175,16 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
     try {
       const searchMinHops = typeof minHops === "number" ? minHops : 2;
       const searchMaxHops = typeof maxHops === "number" ? maxHops : 5;
-      const res = await findRoutes(params, searchMinHops, searchMaxHops, setProgress, controller.signal);
+      const searchMinISK = typeof minISKPerJump === "number" ? Math.max(0, minISKPerJump) : 0;
+      const searchParams: ScanParams = {
+        ...params,
+        route_target_system_name: targetSystemName.trim(),
+        route_min_isk_per_jump: searchMinISK,
+        route_allow_empty_hops: allowEmptyHops,
+        route_min_hops: searchMinHops,
+        route_max_hops: searchMaxHops,
+      };
+      const res = await findRoutes(searchParams, searchMinHops, searchMaxHops, setProgress, controller.signal);
       setResults(res);
     } catch (e: unknown) {
       if (e instanceof Error && e.name !== "AbortError") {
@@ -141,10 +193,15 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
     } finally {
       setScanning(false);
     }
-  }, [scanning, params, minHops, maxHops, t]);
+  }, [scanning, params, minHops, maxHops, minISKPerJump, targetSystemName, allowEmptyHops, t]);
 
   const routeSummary = (route: RouteResult) =>
-    route.Hops.map((h) => h.SystemName).concat([route.Hops[route.Hops.length - 1]?.DestSystemName ?? ""]).filter(Boolean).join(" → ");
+    route.Hops
+      .map((h) => h.SystemName)
+      .concat([route.Hops[route.Hops.length - 1]?.DestSystemName ?? ""])
+      .concat(route.TargetSystemName ? [route.TargetSystemName] : [])
+      .filter(Boolean)
+      .join(" → ");
   const copyRouteSystems = async (route: RouteResult) => {
     await navigator.clipboard.writeText(routeSummary(route));
   };
@@ -162,7 +219,7 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
           help={{ stepKeys: ["helpRouteStep1", "helpRouteStep2", "helpRouteStep3"], wikiSlug: "Route-Builder" }}
         >
           <div className="flex items-center gap-4 flex-wrap">
-            <SettingsGrid cols={2}>
+            <SettingsGrid cols={4}>
               <SettingsField label={t("routeMinHops")}>
                 <SettingsNumberInput
                   value={typeof minHops === "number" ? minHops : 2}
@@ -177,6 +234,31 @@ export function RouteBuilder({ params, onChange, loadedResults, isLoggedIn = fal
                   onChange={handleMaxHopsChange}
                   min={typeof minHops === "number" ? minHops : 1}
                   max={25}
+                />
+              </SettingsField>
+              <SettingsField label={t("routeMinISKPerJump")}>
+                <SettingsNumberInput
+                  value={typeof minISKPerJump === "number" ? minISKPerJump : 0}
+                  onChange={handleMinISKPerJumpChange}
+                  min={0}
+                  step={1000}
+                />
+              </SettingsField>
+              <SettingsField label={t("routeTargetSystem")}>
+                <input
+                  type="text"
+                  value={targetSystemName}
+                  onChange={(e) => handleTargetSystemChange(e.target.value)}
+                  placeholder={t("routeTargetSystemPlaceholder")}
+                  className="w-full px-3 py-1.5 bg-eve-input border border-eve-border rounded-sm text-eve-text text-sm
+                             focus:outline-none focus:border-eve-accent focus:ring-1 focus:ring-eve-accent/30
+                             transition-colors"
+                />
+              </SettingsField>
+              <SettingsField label={t("routeAllowEmptyHops")}>
+                <SettingsCheckbox
+                  checked={allowEmptyHops}
+                  onChange={handleAllowEmptyHopsChange}
                 />
               </SettingsField>
             </SettingsGrid>
@@ -347,12 +429,20 @@ function RouteDetailPopup({
   const handleCopyRoute = async () => {
     const lines = ["=== EVE Flipper Route ==="];
     route.Hops.forEach((hop, i) => {
+      const emptyJumps = hop.EmptyJumps ?? 0;
+      const totalHopJumps = hop.Jumps + emptyJumps;
       lines.push(`[${i + 1}] ${hop.StationName || hop.SystemName}`);
       lines.push(`    Buy: ${hop.TypeName} x${hop.Units} @ ${formatISKFull(hop.BuyPrice)} ISK`);
-      lines.push(`    → ${hop.DestSystemName} (${hop.Jumps} jumps)`);
+      if (emptyJumps > 0) {
+        lines.push(`    Empty move: ${emptyJumps} jumps`);
+      }
+      lines.push(`    → ${hop.DestSystemName} (${totalHopJumps} jumps, trade ${hop.Jumps})`);
       lines.push(`    Sell: @ ${formatISKFull(hop.SellPrice)} ISK → Profit: ${formatISK(hop.Profit)}`);
       lines.push("");
     });
+    if (route.TargetSystemName) {
+      lines.push(`Target: ${route.TargetSystemName} (${route.TargetJumps ?? 0} jumps)`);
+    }
     lines.push(`Total: ${formatISKFull(route.TotalProfit)} ISK / ${route.TotalJumps} jumps / ${formatISK(route.ProfitPerJump)} ISK/jump`);
     try {
       await navigator.clipboard.writeText(lines.join("\n"));
@@ -431,7 +521,14 @@ function RouteDetailPopup({
                   <div className="flex items-center gap-2">
                     <span className="text-eve-dim">→ {t("routeDeliverTo")}:</span>
                     <span className="text-eve-text">{hop.DestStationName || hop.DestSystemName}</span>
-                    <span className="text-eve-dim font-mono">({hop.Jumps} {t("routeJumpsUnit")})</span>
+                    <span className="text-eve-dim font-mono">
+                      ({hop.Jumps + (hop.EmptyJumps ?? 0)} {t("routeJumpsUnit")})
+                    </span>
+                    {(hop.EmptyJumps ?? 0) > 0 && (
+                      <span className="text-eve-dim text-[11px]">
+                        {t("routeEmptyLeg", { count: hop.EmptyJumps ?? 0 })}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-eve-dim">{t("routeSell")}:</span>
@@ -465,6 +562,13 @@ function RouteDetailPopup({
             <RouteMetricChip label={t("routeTotalJumps")} value={String(route.TotalJumps)} tone="dim" />
             <RouteMetricChip label={`ISK/${t("routeJumpsUnit")}`} value={formatISK(route.ProfitPerJump)} tone="ppj" />
             <RouteMetricChip label={t("routeHopsCol")} value={String(route.HopCount)} tone="dim" />
+            {route.TargetSystemName && (
+              <RouteMetricChip
+                label={t("routeTargetTail")}
+                value={`${route.TargetSystemName} (+${route.TargetJumps ?? 0})`}
+                tone="dim"
+              />
+            )}
           </div>
           <div className="flex flex-wrap justify-end gap-2">
             <button

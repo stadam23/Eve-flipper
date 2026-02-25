@@ -75,6 +75,69 @@ func (d *DB) LoadConfigForUser(userID string) *config.Config {
 	if v, ok := m["sell_sales_tax_percent"]; ok {
 		cfg.SellSalesTaxPercent, _ = strconv.ParseFloat(v, 64)
 	}
+	if v, ok := m["min_daily_volume"]; ok {
+		cfg.MinDailyVolume, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if v, ok := m["max_investment"]; ok {
+		cfg.MaxInvestment, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["min_item_profit"]; ok {
+		cfg.MinItemProfit, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["min_s2b_per_day"]; ok {
+		cfg.MinS2BPerDay, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["min_bfs_per_day"]; ok {
+		cfg.MinBfSPerDay, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["min_s2b_bfs_ratio"]; ok {
+		cfg.MinS2BBfSRatio, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["max_s2b_bfs_ratio"]; ok {
+		cfg.MaxS2BBfSRatio, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["min_route_security"]; ok {
+		cfg.MinRouteSecurity, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["avg_price_period"]; ok {
+		cfg.AvgPricePeriod, _ = strconv.Atoi(v)
+	}
+	if v, ok := m["min_period_roi"]; ok {
+		cfg.MinPeriodROI, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["max_dos"]; ok {
+		cfg.MaxDOS, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["min_demand_per_day"]; ok {
+		cfg.MinDemandPerDay, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["shipping_cost_per_m3_jump"]; ok {
+		cfg.ShippingCostPerM3Jump, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := m["source_regions"]; ok {
+		var regions []string
+		if err := json.Unmarshal([]byte(v), &regions); err == nil {
+			cfg.SourceRegions = regions
+		}
+	}
+	if v, ok := m["target_region"]; ok {
+		cfg.TargetRegion = v
+	}
+	if v, ok := m["target_market_system"]; ok {
+		cfg.TargetMarketSystem = v
+	}
+	if v, ok := m["target_market_location_id"]; ok {
+		cfg.TargetMarketLocationID, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if v, ok := m["category_ids"]; ok {
+		var ids []int32
+		if err := json.Unmarshal([]byte(v), &ids); err == nil {
+			cfg.CategoryIDs = ids
+		}
+	}
+	if v, ok := m["sell_order_mode"]; ok {
+		cfg.SellOrderMode, _ = strconv.ParseBool(v)
+	}
 	if v, ok := m["alert_telegram"]; ok {
 		cfg.AlertTelegram, _ = strconv.ParseBool(v)
 	}
@@ -121,30 +184,58 @@ func (d *DB) SaveConfig(cfg *config.Config) error {
 func (d *DB) SaveConfigForUser(userID string, cfg *config.Config) error {
 	userID = normalizeUserID(userID)
 
+	sourceRegionsJSON := "[]"
+	if b, err := json.Marshal(cfg.SourceRegions); err == nil {
+		sourceRegionsJSON = string(b)
+	}
+	categoryIDsJSON := "[]"
+	if b, err := json.Marshal(cfg.CategoryIDs); err == nil {
+		categoryIDsJSON = string(b)
+	}
+
 	pairs := map[string]string{
-		"system_name":             cfg.SystemName,
-		"cargo_capacity":          fmt.Sprintf("%g", cfg.CargoCapacity),
-		"buy_radius":              strconv.Itoa(cfg.BuyRadius),
-		"sell_radius":             strconv.Itoa(cfg.SellRadius),
-		"min_margin":              fmt.Sprintf("%g", cfg.MinMargin),
-		"sales_tax_percent":       fmt.Sprintf("%g", cfg.SalesTaxPercent),
-		"broker_fee_percent":      fmt.Sprintf("%g", cfg.BrokerFeePercent),
-		"split_trade_fees":        strconv.FormatBool(cfg.SplitTradeFees),
-		"buy_broker_fee_percent":  fmt.Sprintf("%g", cfg.BuyBrokerFeePercent),
-		"sell_broker_fee_percent": fmt.Sprintf("%g", cfg.SellBrokerFeePercent),
-		"buy_sales_tax_percent":   fmt.Sprintf("%g", cfg.BuySalesTaxPercent),
-		"sell_sales_tax_percent":  fmt.Sprintf("%g", cfg.SellSalesTaxPercent),
-		"alert_telegram":          strconv.FormatBool(cfg.AlertTelegram),
-		"alert_discord":           strconv.FormatBool(cfg.AlertDiscord),
-		"alert_desktop":           strconv.FormatBool(cfg.AlertDesktop),
-		"alert_telegram_token":    cfg.AlertTelegramToken,
-		"alert_telegram_chat_id":  cfg.AlertTelegramChatID,
-		"alert_discord_webhook":   cfg.AlertDiscordWebhook,
-		"opacity":                 strconv.Itoa(cfg.Opacity),
-		"window_x":                strconv.Itoa(cfg.WindowX),
-		"window_y":                strconv.Itoa(cfg.WindowY),
-		"window_w":                strconv.Itoa(cfg.WindowW),
-		"window_h":                strconv.Itoa(cfg.WindowH),
+		"system_name":               cfg.SystemName,
+		"cargo_capacity":            fmt.Sprintf("%g", cfg.CargoCapacity),
+		"buy_radius":                strconv.Itoa(cfg.BuyRadius),
+		"sell_radius":               strconv.Itoa(cfg.SellRadius),
+		"min_margin":                fmt.Sprintf("%g", cfg.MinMargin),
+		"sales_tax_percent":         fmt.Sprintf("%g", cfg.SalesTaxPercent),
+		"broker_fee_percent":        fmt.Sprintf("%g", cfg.BrokerFeePercent),
+		"split_trade_fees":          strconv.FormatBool(cfg.SplitTradeFees),
+		"buy_broker_fee_percent":    fmt.Sprintf("%g", cfg.BuyBrokerFeePercent),
+		"sell_broker_fee_percent":   fmt.Sprintf("%g", cfg.SellBrokerFeePercent),
+		"buy_sales_tax_percent":     fmt.Sprintf("%g", cfg.BuySalesTaxPercent),
+		"sell_sales_tax_percent":    fmt.Sprintf("%g", cfg.SellSalesTaxPercent),
+		"min_daily_volume":          strconv.FormatInt(cfg.MinDailyVolume, 10),
+		"max_investment":            fmt.Sprintf("%g", cfg.MaxInvestment),
+		"min_item_profit":           fmt.Sprintf("%g", cfg.MinItemProfit),
+		"min_s2b_per_day":           fmt.Sprintf("%g", cfg.MinS2BPerDay),
+		"min_bfs_per_day":           fmt.Sprintf("%g", cfg.MinBfSPerDay),
+		"min_s2b_bfs_ratio":         fmt.Sprintf("%g", cfg.MinS2BBfSRatio),
+		"max_s2b_bfs_ratio":         fmt.Sprintf("%g", cfg.MaxS2BBfSRatio),
+		"min_route_security":        fmt.Sprintf("%g", cfg.MinRouteSecurity),
+		"avg_price_period":          strconv.Itoa(cfg.AvgPricePeriod),
+		"min_period_roi":            fmt.Sprintf("%g", cfg.MinPeriodROI),
+		"max_dos":                   fmt.Sprintf("%g", cfg.MaxDOS),
+		"min_demand_per_day":        fmt.Sprintf("%g", cfg.MinDemandPerDay),
+		"shipping_cost_per_m3_jump": fmt.Sprintf("%g", cfg.ShippingCostPerM3Jump),
+		"source_regions":            sourceRegionsJSON,
+		"target_region":             cfg.TargetRegion,
+		"target_market_system":      cfg.TargetMarketSystem,
+		"target_market_location_id": strconv.FormatInt(cfg.TargetMarketLocationID, 10),
+		"category_ids":              categoryIDsJSON,
+		"sell_order_mode":           strconv.FormatBool(cfg.SellOrderMode),
+		"alert_telegram":            strconv.FormatBool(cfg.AlertTelegram),
+		"alert_discord":             strconv.FormatBool(cfg.AlertDiscord),
+		"alert_desktop":             strconv.FormatBool(cfg.AlertDesktop),
+		"alert_telegram_token":      cfg.AlertTelegramToken,
+		"alert_telegram_chat_id":    cfg.AlertTelegramChatID,
+		"alert_discord_webhook":     cfg.AlertDiscordWebhook,
+		"opacity":                   strconv.Itoa(cfg.Opacity),
+		"window_x":                  strconv.Itoa(cfg.WindowX),
+		"window_y":                  strconv.Itoa(cfg.WindowY),
+		"window_w":                  strconv.Itoa(cfg.WindowW),
+		"window_h":                  strconv.Itoa(cfg.WindowH),
 	}
 
 	tx, err := d.sql.Begin()

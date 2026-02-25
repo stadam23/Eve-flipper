@@ -56,6 +56,30 @@ type WalletTransaction struct {
 	LocationName string `json:"location_name,omitempty"`
 }
 
+// CharacterAsset represents an asset row from character inventory.
+type CharacterAsset struct {
+	ItemID          int64  `json:"item_id"`
+	TypeID          int32  `json:"type_id"`
+	LocationID      int64  `json:"location_id"`
+	LocationType    string `json:"location_type"`
+	LocationFlag    string `json:"location_flag"`
+	Quantity        int64  `json:"quantity"`
+	IsSingleton     bool   `json:"is_singleton"`
+	IsBlueprintCopy bool   `json:"is_blueprint_copy"`
+}
+
+// CharacterBlueprint represents a blueprint owned by character.
+type CharacterBlueprint struct {
+	ItemID             int64  `json:"item_id"`
+	TypeID             int32  `json:"type_id"`
+	LocationID         int64  `json:"location_id"`
+	LocationFlag       string `json:"location_flag"`
+	Quantity           int64  `json:"quantity"`
+	TimeEfficiency     int32  `json:"time_efficiency"`
+	MaterialEfficiency int32  `json:"material_efficiency"`
+	Runs               int64  `json:"runs"`
+}
+
 // SkillEntry represents a single trained skill.
 type SkillEntry struct {
 	SkillID      int32 `json:"skill_id"`
@@ -234,6 +258,162 @@ func (c *Client) GetWalletTransactions(characterID int64, accessToken string) ([
 		return nil, fmt.Errorf("wallet transactions: %w", err)
 	}
 	return txns, nil
+}
+
+// GetCharacterAssets fetches all pages of character assets.
+func (c *Client) GetCharacterAssets(characterID int64, accessToken string) ([]CharacterAsset, error) {
+	assetsURL := fmt.Sprintf("%s/characters/%d/assets/?datasource=tranquility", baseURL, characterID)
+
+	// Fetch page 1 to discover total pages.
+	c.sem <- struct{}{}
+
+	req, err := http.NewRequest("GET", assetsURL+"&page=1", nil)
+	if err != nil {
+		<-c.sem
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "eve-flipper/1.0 (github.com)")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		<-c.sem
+		return nil, fmt.Errorf("assets page 1: %w", err)
+	}
+
+	totalPages := 1
+	if p := resp.Header.Get("X-Pages"); p != "" {
+		if tp, parseErr := strconv.Atoi(p); parseErr == nil && tp > 1 {
+			totalPages = tp
+		}
+	}
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		<-c.sem
+		return nil, fmt.Errorf("assets: ESI %d: %s", resp.StatusCode, string(body))
+	}
+
+	var page1 []CharacterAsset
+	decErr := json.NewDecoder(resp.Body).Decode(&page1)
+	resp.Body.Close()
+	<-c.sem
+	if decErr != nil {
+		return nil, fmt.Errorf("assets decode: %w", decErr)
+	}
+
+	if totalPages <= 1 {
+		return page1, nil
+	}
+
+	type pageResult struct {
+		data []CharacterAsset
+		err  error
+	}
+	results := make(chan pageResult, totalPages-1)
+
+	for p := 2; p <= totalPages; p++ {
+		go func(pageNum int) {
+			pageURL := fmt.Sprintf("%s&page=%d", assetsURL, pageNum)
+			var data []CharacterAsset
+			if fetchErr := c.AuthGetJSON(pageURL, accessToken, &data); fetchErr != nil {
+				results <- pageResult{err: fetchErr}
+				return
+			}
+			results <- pageResult{data: data}
+		}(p)
+	}
+
+	all := make([]CharacterAsset, 0, len(page1)*totalPages)
+	all = append(all, page1...)
+	for i := 0; i < totalPages-1; i++ {
+		r := <-results
+		if r.err != nil {
+			continue // keep partial success behavior
+		}
+		all = append(all, r.data...)
+	}
+	return all, nil
+}
+
+// GetCharacterBlueprints fetches all pages of character blueprints.
+func (c *Client) GetCharacterBlueprints(characterID int64, accessToken string) ([]CharacterBlueprint, error) {
+	blueprintsURL := fmt.Sprintf("%s/characters/%d/blueprints/?datasource=tranquility", baseURL, characterID)
+
+	// Fetch page 1 to discover total pages.
+	c.sem <- struct{}{}
+
+	req, err := http.NewRequest("GET", blueprintsURL+"&page=1", nil)
+	if err != nil {
+		<-c.sem
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "eve-flipper/1.0 (github.com)")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		<-c.sem
+		return nil, fmt.Errorf("blueprints page 1: %w", err)
+	}
+
+	totalPages := 1
+	if p := resp.Header.Get("X-Pages"); p != "" {
+		if tp, parseErr := strconv.Atoi(p); parseErr == nil && tp > 1 {
+			totalPages = tp
+		}
+	}
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		<-c.sem
+		return nil, fmt.Errorf("blueprints: ESI %d: %s", resp.StatusCode, string(body))
+	}
+
+	var page1 []CharacterBlueprint
+	decErr := json.NewDecoder(resp.Body).Decode(&page1)
+	resp.Body.Close()
+	<-c.sem
+	if decErr != nil {
+		return nil, fmt.Errorf("blueprints decode: %w", decErr)
+	}
+
+	if totalPages <= 1 {
+		return page1, nil
+	}
+
+	type pageResult struct {
+		data []CharacterBlueprint
+		err  error
+	}
+	results := make(chan pageResult, totalPages-1)
+
+	for p := 2; p <= totalPages; p++ {
+		go func(pageNum int) {
+			pageURL := fmt.Sprintf("%s&page=%d", blueprintsURL, pageNum)
+			var data []CharacterBlueprint
+			if fetchErr := c.AuthGetJSON(pageURL, accessToken, &data); fetchErr != nil {
+				results <- pageResult{err: fetchErr}
+				return
+			}
+			results <- pageResult{data: data}
+		}(p)
+	}
+
+	all := make([]CharacterBlueprint, 0, len(page1)*totalPages)
+	all = append(all, page1...)
+	for i := 0; i < totalPages-1; i++ {
+		r := <-results
+		if r.err != nil {
+			continue // keep partial success behavior
+		}
+		all = append(all, r.data...)
+	}
+	return all, nil
 }
 
 // GetCharacterLocation fetches a character's current location (system/station).

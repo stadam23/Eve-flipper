@@ -237,7 +237,7 @@ func TestSelectInstantLiquidationSystem_RequiresSingleSystemForAllTypes(t *testi
 		},
 	}
 
-	if _, ok := selectInstantLiquidationSystem(items, books); ok {
+	if _, ok := selectInstantLiquidationSystem(items, books, nil); ok {
 		t.Fatalf("expected no valid system when item liquidity is split across different systems")
 	}
 }
@@ -258,7 +258,7 @@ func TestSelectInstantLiquidationSystem_PicksBestCommonSystem(t *testing.T) {
 		},
 	}
 
-	choice, ok := selectInstantLiquidationSystem(items, books)
+	choice, ok := selectInstantLiquidationSystem(items, books, nil)
 	if !ok {
 		t.Fatalf("expected a valid liquidation system")
 	}
@@ -270,6 +270,39 @@ func TestSelectInstantLiquidationSystem_PicksBestCommonSystem(t *testing.T) {
 	}
 	if choice.PricedCount != 2 {
 		t.Fatalf("PricedCount = %d, want 2", choice.PricedCount)
+	}
+}
+
+func TestSelectInstantLiquidationSystem_RespectsAllowedSystems(t *testing.T) {
+	items := []instantValuationItem{
+		{TypeID: 1, Quantity: 1, Label: "Item A", ValueFactor: 1},
+	}
+	books := map[int32]map[int32][]esi.MarketOrder{
+		1: {
+			30000142: {{TypeID: 1, SystemID: 30000142, IsBuyOrder: true, Price: 200, VolumeRemain: 10}},
+			30002187: {{TypeID: 1, SystemID: 30002187, IsBuyOrder: true, Price: 150, VolumeRemain: 10}},
+		},
+	}
+
+	allowOnlyLowsec := func(systemID int32) bool { return systemID != 30000142 }
+	choice, ok := selectInstantLiquidationSystem(items, books, allowOnlyLowsec)
+	if !ok {
+		t.Fatalf("expected a valid liquidation system after filtering")
+	}
+	if choice.SystemID != 30002187 {
+		t.Fatalf("SystemID = %d, want 30002187", choice.SystemID)
+	}
+}
+
+func TestIsHighsecRestrictedShipGroup(t *testing.T) {
+	if !isHighsecRestrictedShipGroup(883, "Capital Industrial Ship") {
+		t.Fatalf("group 883 (Capital Industrial Ship) must be highsec-restricted")
+	}
+	if !isHighsecRestrictedShipGroup(0, "Carrier") {
+		t.Fatalf("carrier name fallback must be highsec-restricted")
+	}
+	if isHighsecRestrictedShipGroup(902, "Jump Freighter") {
+		t.Fatalf("jump freighter should not be highsec-restricted")
 	}
 }
 

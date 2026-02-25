@@ -51,6 +51,98 @@ export interface FlipResult {
   CanFill?: boolean;
   SlippageBuyPct?: number;
   SlippageSellPct?: number;
+  // Regional day-trader enrichments (for EveGuru-style regional view in ScanResultsTable)
+  DaySecurity?: number;
+  DaySourceUnits?: number;
+  DayTargetDemandPerDay?: number;
+  DayTargetSupplyUnits?: number;
+  DayTargetDOS?: number;
+  DayAssets?: number;
+  DayActiveOrders?: number;
+  DaySourceAvgPrice?: number;
+  DayTargetNowPrice?: number;
+  DayTargetPeriodPrice?: number;
+  DayNowProfit?: number;
+  DayPeriodProfit?: number;
+  DayROINow?: number;
+  DayROIPeriod?: number;
+  DayCapitalRequired?: number;
+  DayShippingCost?: number;
+  DayCategoryID?: number;
+  DayGroupID?: number;
+  DayGroupName?: string;
+  /** ISK profit per m³ of cargo per jump — efficiency metric for haulers */
+  DayIskPerM3Jump?: number;
+  /** Composite 0-100 trade score (ROI 35% + Demand 25% + DOS 20% + Margin 20%) */
+  DayTradeScore?: number;
+  /** Last N daily average prices for the target region (spark-line chart) */
+  DayPriceHistory?: number[];
+  /** Lowest sell order price at the destination — populated in sell-order mode */
+  DayTargetLowestSell?: number;
+}
+
+export interface RegionalDayTradeItem {
+  type_id: number;
+  type_name: string;
+  source_system_id: number;
+  source_system_name: string;
+  source_station_name: string;
+  source_location_id: number;
+  source_region_id: number;
+  source_region_name: string;
+  target_system_id: number;
+  target_system_name: string;
+  target_station_name: string;
+  target_location_id: number;
+  target_region_id: number;
+  target_region_name: string;
+  purchase_units: number;
+  source_units: number;
+  target_demand_per_day: number;
+  target_supply_units: number;
+  target_dos: number;
+  assets: number;
+  active_orders: number;
+  source_avg_price: number;
+  target_now_price: number;
+  target_period_price: number;
+  target_now_profit: number;
+  target_period_profit: number;
+  roi_now: number;
+  roi_period: number;
+  capital_required: number;
+  item_volume: number;
+  shipping_cost: number;
+  jumps: number;
+  margin_now: number;
+  margin_period: number;
+  category_id?: number;
+  group_id?: number;
+  group_name?: string;
+  trade_score?: number;
+  target_price_history?: number[];
+  target_lowest_sell?: number;
+}
+
+export interface RegionalDayTradeHub {
+  source_system_id: number;
+  source_system_name: string;
+  source_region_id: number;
+  source_region_name: string;
+  security: number;
+  purchase_units: number;
+  source_units: number;
+  target_demand_per_day: number;
+  target_supply_units: number;
+  target_dos: number;
+  assets: number;
+  active_orders: number;
+  target_now_profit: number;
+  target_period_profit: number;
+  capital_required: number;
+  shipping_cost: number;
+  item_count: number;
+  items: RegionalDayTradeItem[];
 }
 
 export interface ContractResult {
@@ -113,6 +205,7 @@ export interface RouteHop {
   SystemName: string;
   StationName: string;
   SystemID: number;
+  EmptyJumps?: number;
   DestSystemName: string;
   DestStationName?: string;
   DestSystemID: number;
@@ -132,6 +225,8 @@ export interface RouteResult {
   TotalJumps: number;
   ProfitPerJump: number;
   HopCount: number;
+  TargetSystemName?: string;
+  TargetJumps?: number;
 }
 
 export type NdjsonRouteMessage =
@@ -312,14 +407,26 @@ export interface ScanParams {
   sell_sales_tax_percent?: number;
   min_daily_volume?: number;
   max_investment?: number;
+  min_item_profit?: number;
+  min_period_roi?: number;
+  max_dos?: number;
+  min_demand_per_day?: number;
   min_s2b_per_day?: number;
   min_bfs_per_day?: number;
   min_s2b_bfs_ratio?: number;
   max_s2b_bfs_ratio?: number;
+  avg_price_period?: number;
+  shipping_cost_per_m3_jump?: number;
   /** Route security: 0 = all space, 0.45 = highsec only, 0.7 = min 0.7 */
   min_route_security?: number;
+  /** Optional source-region scope for regional trade (empty = buy radius from System). */
+  source_regions?: string[];
   /** Target region name for regional arbitrage (empty = search all by radius) */
   target_region?: string;
+  /** Optional destination marketplace system for regional day trader. */
+  target_market_system?: string;
+  /** Optional destination marketplace location_id (station/structure). */
+  target_market_location_id?: number;
   // Contract-specific filters
   min_contract_price?: number;
   max_contract_margin?: number;
@@ -331,8 +438,15 @@ export interface ScanParams {
   exclude_rigs_with_ship?: boolean;
   route_min_hops?: number;
   route_max_hops?: number;
+  route_target_system_name?: string;
+  route_min_isk_per_jump?: number;
+  route_allow_empty_hops?: boolean;
   // Player structures
   include_structures?: boolean;
+  /** Category filter for regional day trader. Empty = all. */
+  category_ids?: number[];
+  /** When true, use lowest sell order at destination as revenue price instead of highest buy order. */
+  sell_order_mode?: boolean;
 }
 
 export interface AppConfig {
@@ -348,6 +462,25 @@ export interface AppConfig {
   sell_broker_fee_percent?: number;
   buy_sales_tax_percent?: number;
   sell_sales_tax_percent?: number;
+  min_daily_volume?: number;
+  max_investment?: number;
+  min_item_profit?: number;
+  min_s2b_per_day?: number;
+  min_bfs_per_day?: number;
+  min_s2b_bfs_ratio?: number;
+  max_s2b_bfs_ratio?: number;
+  min_route_security?: number;
+  avg_price_period?: number;
+  min_period_roi?: number;
+  max_dos?: number;
+  min_demand_per_day?: number;
+  shipping_cost_per_m3_jump?: number;
+  source_regions?: string[];
+  target_region?: string;
+  target_market_system?: string;
+  target_market_location_id?: number;
+  category_ids?: number[];
+  sell_order_mode?: boolean;
   alert_telegram: boolean;
   alert_discord: boolean;
   alert_desktop: boolean;
@@ -867,6 +1000,270 @@ export interface IndustrySystem {
   reaction: number;
   copying: number;
   invention: number;
+}
+
+export type IndustryProjectStatus = "draft" | "planned" | "active" | "completed" | "archived";
+
+export type IndustryTaskStatus =
+  | "planned"
+  | "ready"
+  | "active"
+  | "paused"
+  | "completed"
+  | "blocked"
+  | "cancelled";
+
+export type IndustryJobStatus =
+  | "planned"
+  | "queued"
+  | "active"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface IndustryProject {
+  id: number;
+  user_id: string;
+  name: string;
+  status: IndustryProjectStatus;
+  strategy: "conservative" | "balanced" | "aggressive";
+  notes: string;
+  params: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IndustryTaskPlanInput {
+  // Existing task ID, or negative row ref (-1 = first task row in current patch).
+  parent_task_id?: number;
+  name: string;
+  activity: string;
+  product_type_id?: number;
+  target_runs?: number;
+  planned_start?: string;
+  planned_end?: string;
+  priority?: number;
+  status?: IndustryTaskStatus;
+  constraints?: unknown;
+}
+
+export interface IndustryJobPlanInput {
+  // Existing task ID, or negative row ref (-1 = first task row in current patch).
+  task_id?: number;
+  character_id?: number;
+  facility_id?: number;
+  activity: string;
+  runs?: number;
+  duration_seconds?: number;
+  cost_isk?: number;
+  status?: IndustryJobStatus;
+  started_at?: string;
+  finished_at?: string;
+  external_job_id?: number;
+  notes?: string;
+}
+
+export interface IndustryMaterialPlanInput {
+  task_id?: number;
+  type_id: number;
+  type_name?: string;
+  required_qty?: number;
+  available_qty?: number;
+  buy_qty?: number;
+  build_qty?: number;
+  unit_cost_isk?: number;
+  source?: "market" | "stock" | "build" | "reprocess" | "contract";
+}
+
+export interface IndustryBlueprintPoolInput {
+  blueprint_type_id: number;
+  blueprint_name?: string;
+  location_id?: number;
+  quantity?: number;
+  me?: number;
+  te?: number;
+  is_bpo?: boolean;
+  available_runs?: number;
+}
+
+export interface IndustryPlanSchedulerInput {
+  enabled?: boolean;
+  slot_count?: number;
+  max_job_runs?: number;
+  max_job_duration_seconds?: number;
+  window_days?: number;
+  queue_status?: IndustryJobStatus;
+}
+
+export interface IndustryPlanPatch {
+  replace?: boolean;
+  replace_blueprints?: boolean;
+  project_status?: IndustryProjectStatus;
+  tasks?: IndustryTaskPlanInput[];
+  jobs?: IndustryJobPlanInput[];
+  materials?: IndustryMaterialPlanInput[];
+  blueprints?: IndustryBlueprintPoolInput[];
+  scheduler?: IndustryPlanSchedulerInput;
+  strict_bp_bypass?: boolean;
+}
+
+export interface IndustryPlanSummary {
+  project_id: number;
+  project_status: IndustryProjectStatus;
+  replaced: boolean;
+  tasks_inserted: number;
+  jobs_inserted: number;
+  materials_upserted: number;
+  blueprints_upserted: number;
+  scheduler_applied?: boolean;
+  jobs_split_from?: number;
+  jobs_planned_total?: number;
+  warnings?: string[];
+  updated_at: string;
+}
+
+export interface IndustryTaskPreview {
+  input_index: number;
+  task_id: number;
+  parent_task_id: number;
+  name: string;
+  activity: string;
+  target_runs: number;
+  planned_start: string;
+  planned_end: string;
+  priority: number;
+}
+
+export interface IndustryPlanPreview {
+  project_id: number;
+  replace: boolean;
+  summary: IndustryPlanSummary;
+  tasks: IndustryTaskPreview[];
+  jobs: IndustryJobPlanInput[];
+  warnings: string[];
+}
+
+export interface IndustryJob {
+  id: number;
+  user_id: string;
+  project_id: number;
+  task_id: number;
+  character_id: number;
+  facility_id: number;
+  activity: string;
+  runs: number;
+  duration_seconds: number;
+  cost_isk: number;
+  status: IndustryJobStatus;
+  started_at: string;
+  finished_at: string;
+  external_job_id: number;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IndustryLedgerEntry {
+  job_id: number;
+  project_id: number;
+  project_name: string;
+  task_id: number;
+  task_name: string;
+  character_id: number;
+  facility_id: number;
+  activity: string;
+  runs: number;
+  duration_seconds: number;
+  cost_isk: number;
+  status: IndustryJobStatus;
+  started_at: string;
+  finished_at: string;
+  external_job_id: number;
+  notes: string;
+  updated_at: string;
+}
+
+export interface IndustryLedger {
+  project_id: number;
+  status_filter: string;
+  limit: number;
+  total: number;
+  planned: number;
+  active: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  total_cost_isk: number;
+  entries: IndustryLedgerEntry[];
+}
+
+export interface IndustryTaskRecord {
+  id: number;
+  user_id: string;
+  project_id: number;
+  parent_task_id: number;
+  name: string;
+  activity: string;
+  product_type_id: number;
+  target_runs: number;
+  planned_start: string;
+  planned_end: string;
+  priority: number;
+  status: IndustryTaskStatus;
+  constraints: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IndustryMaterialPlanRecord {
+  id: number;
+  user_id: string;
+  project_id: number;
+  task_id: number;
+  type_id: number;
+  type_name: string;
+  required_qty: number;
+  available_qty: number;
+  buy_qty: number;
+  build_qty: number;
+  unit_cost_isk: number;
+  source: "market" | "stock" | "build" | "reprocess" | "contract";
+  updated_at: string;
+}
+
+export interface IndustryBlueprintPoolRecord {
+  id: number;
+  user_id: string;
+  project_id: number;
+  blueprint_type_id: number;
+  blueprint_name: string;
+  location_id: number;
+  quantity: number;
+  me: number;
+  te: number;
+  is_bpo: boolean;
+  available_runs: number;
+  updated_at: string;
+}
+
+export interface IndustryMaterialDiff {
+  type_id: number;
+  type_name: string;
+  required_qty: number;
+  available_qty: number;
+  buy_qty: number;
+  build_qty: number;
+  missing_qty: number;
+}
+
+export interface IndustryProjectSnapshot {
+  project: IndustryProject;
+  tasks: IndustryTaskRecord[];
+  jobs: IndustryJob[];
+  materials: IndustryMaterialPlanRecord[];
+  blueprints: IndustryBlueprintPoolRecord[];
+  material_diff: IndustryMaterialDiff[];
 }
 
 // --- Portfolio P&L Types ---

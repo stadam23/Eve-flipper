@@ -42,6 +42,12 @@ type FlipResult struct {
 	BuyCompetitors  int     `json:"BuyCompetitors"`
 	SellCompetitors int     `json:"SellCompetitors"`
 	DailyProfit     float64 `json:"DailyProfit"` // ProfitPerUnit * min(UnitsToBuy, DailyVolume)
+	// Sell-book supply at the destination market scope for this type.
+	// Populated from live destination sell orders (station/system fallback).
+	TargetSellSupply int64 `json:"TargetSellSupply,omitempty"`
+	// Lowest sell order price at the destination market — used by sell-order mode.
+	// Zero when no sell orders are found in the destination scope.
+	TargetLowestSell float64 `json:"TargetLowestSell,omitempty"`
 	// Execution-aware effective margin after slippage and fees.
 	RealMarginPercent float64 `json:"RealMarginPercent,omitempty"`
 	// True when market history for this type/region was fetched successfully.
@@ -55,6 +61,31 @@ type FlipResult struct {
 	CanFill           bool    `json:"CanFill"`              // true when requested quantity is executable profitably
 	SlippageBuyPct    float64 `json:"SlippageBuyPct,omitempty"`
 	SlippageSellPct   float64 `json:"SlippageSellPct,omitempty"`
+
+	// Regional day-trader enrichments (EVE Guru-style grouped region view).
+	DaySecurity           float64   `json:"DaySecurity,omitempty"`
+	DaySourceUnits        int32     `json:"DaySourceUnits,omitempty"`
+	DayTargetDemandPerDay float64   `json:"DayTargetDemandPerDay,omitempty"`
+	DayTargetSupplyUnits  int64     `json:"DayTargetSupplyUnits,omitempty"`
+	DayTargetDOS          float64   `json:"DayTargetDOS,omitempty"`
+	DayAssets             int64     `json:"DayAssets,omitempty"`
+	DayActiveOrders       int64     `json:"DayActiveOrders,omitempty"`
+	DaySourceAvgPrice     float64   `json:"DaySourceAvgPrice,omitempty"`
+	DayTargetNowPrice     float64   `json:"DayTargetNowPrice,omitempty"`
+	DayTargetPeriodPrice  float64   `json:"DayTargetPeriodPrice,omitempty"`
+	DayNowProfit          float64   `json:"DayNowProfit,omitempty"`
+	DayPeriodProfit       float64   `json:"DayPeriodProfit,omitempty"`
+	DayROINow             float64   `json:"DayROINow,omitempty"`
+	DayROIPeriod          float64   `json:"DayROIPeriod,omitempty"`
+	DayCapitalRequired    float64   `json:"DayCapitalRequired,omitempty"`
+	DayShippingCost       float64   `json:"DayShippingCost,omitempty"`
+	DayCategoryID         int32     `json:"DayCategoryID,omitempty"`
+	DayGroupID            int32     `json:"DayGroupID,omitempty"`
+	DayGroupName          string    `json:"DayGroupName,omitempty"`
+	DayIskPerM3Jump       float64   `json:"DayIskPerM3Jump,omitempty"`
+	DayTradeScore         float64   `json:"DayTradeScore,omitempty"`
+	DayPriceHistory       []float64 `json:"DayPriceHistory,omitempty"`
+	DayTargetLowestSell   float64   `json:"DayTargetLowestSell,omitempty"`
 }
 
 // ContractResult represents a profitable public contract compared to market value.
@@ -90,6 +121,7 @@ type RouteHop struct {
 	SystemID        int32
 	RegionID        int32 `json:"RegionID"` // Market region for execution plan / slippage
 	LocationID      int64 `json:"-"`
+	EmptyJumps      int   `json:"EmptyJumps,omitempty"` // optional deadhead jumps before this trade hop
 	DestSystemID    int32
 	DestSystemName  string
 	DestStationName string `json:"DestStationName,omitempty"`
@@ -105,18 +137,22 @@ type RouteHop struct {
 
 // RouteResult represents a complete multi-hop trade route with aggregated profit.
 type RouteResult struct {
-	Hops          []RouteHop
-	TotalProfit   float64
-	TotalJumps    int
-	ProfitPerJump float64
-	HopCount      int
+	Hops             []RouteHop
+	TotalProfit      float64
+	TotalJumps       int
+	ProfitPerJump    float64
+	HopCount         int
+	TargetSystemName string `json:"TargetSystemName,omitempty"` // optional trip destination constraint
+	TargetJumps      int    `json:"TargetJumps,omitempty"`      // deadhead jumps from final trade to target
 }
 
 // RouteParams holds the input parameters for multi-hop route search.
 type RouteParams struct {
 	SystemName       string
+	TargetSystemName string
 	CargoCapacity    float64
 	MinMargin        float64
+	MinISKPerJump    float64
 	SalesTaxPercent  float64
 	BrokerFeePercent float64
 	// SplitTradeFees enables side-specific fee model.
@@ -129,6 +165,7 @@ type RouteParams struct {
 	MinHops              int
 	MaxHops              int
 	MinRouteSecurity     float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7
+	AllowEmptyHops       bool    // allow empty travel legs between trade hops
 	IncludeStructures    bool    // true = allow Upwell structure orders; false = NPC stations only
 }
 
@@ -149,15 +186,37 @@ type ScanParams struct {
 	BuySalesTaxPercent   float64
 	SellSalesTaxPercent  float64
 	// Advanced filters
-	MinDailyVolume   int64   // 0 = no filter
-	MaxInvestment    float64 // 0 = no filter (max ISK per position)
-	MinS2BPerDay     float64 // 0 = no filter
-	MinBfSPerDay     float64 // 0 = no filter
-	MinS2BBfSRatio   float64 // 0 = no filter
-	MaxS2BBfSRatio   float64 // 0 = no filter
-	SecurityFilter   string  // "" = all, "highsec", "lowsec", "nullsec"
-	MinRouteSecurity float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7 (route must stay in this security)
-	TargetRegionID   int32   // 0 = search all by radius; >0 = search only in this specific region
+	MinDailyVolume  int64   // 0 = no filter
+	MaxInvestment   float64 // 0 = no filter (max ISK per position)
+	MinItemProfit   float64 // 0 = no filter (min ISK profit per position for regional day trader)
+	MinPeriodROI    float64 // 0 = no filter (min period ROI % for regional day trader)
+	MaxDOS          float64 // 0 = no filter (max days-of-supply at target for regional day trader)
+	MinDemandPerDay float64 // 0 = no filter (min demand units/day at target for regional day trader)
+	MinS2BPerDay    float64 // 0 = no filter
+	MinBfSPerDay    float64 // 0 = no filter
+	MinS2BBfSRatio  float64 // 0 = no filter
+	MaxS2BBfSRatio  float64 // 0 = no filter
+	AvgPricePeriod  int     // 0 = default period (14 days for regional day trader)
+	// Heuristic hauling cost model: ISK per (m3 * jump) used by regional day trader scoring.
+	ShippingCostPerM3Jump float64 // 0 = disabled
+	// Optional source-side region constraints for regional day trader.
+	// Empty = use legacy buy-radius scope from CurrentSystemID.
+	SourceRegionIDs []int32
+	// Optional sell-side target marketplace constraints for regional day trader.
+	TargetMarketSystemID   int32   // 0 = any sell system in scope
+	TargetMarketLocationID int64   // 0 = any location in target system/region
+	SecurityFilter         string  // "" = all, "highsec", "lowsec", "nullsec"
+	MinRouteSecurity       float64 // 0 = all space; 0.45 = highsec only; 0.7 = min 0.7 (route must stay in this security)
+	TargetRegionID         int32   // 0 = search all by radius; >0 = search only in this specific region
+
+	// --- Category/group filter for regional day trader ---
+	CategoryIDs []int32 // empty = all categories; non-empty = only include these EVE category IDs
+
+	// --- Sell-order mode for regional day trader ---
+	// When true, targetNowPrice uses TargetLowestSell (lowest ask at destination)
+	// instead of TargetBuyOrderPrice (highest bid). Reflects listing a sell order
+	// rather than instantly hitting a buy order. Higher profit, higher risk.
+	SellOrderMode bool
 
 	// --- Contract-specific filters ---
 	MinContractPrice           float64 // Minimum contract price in ISK (0 = use default 10M)

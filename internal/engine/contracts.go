@@ -41,6 +41,35 @@ const (
 	ContractShipModuleValueFactor = 0.55
 )
 
+// Capitals and related hulls that cannot enter highsec via gates.
+// Keep list intentionally conservative; name-based fallback below covers unknown IDs.
+var highsecRestrictedShipGroupIDs = map[int32]struct{}{
+	30:   {}, // Titan
+	485:  {}, // Dreadnought
+	547:  {}, // Carrier
+	659:  {}, // Supercarrier
+	883:  {}, // Capital Industrial Ship (Rorqual)
+	1538: {}, // Force Auxiliary
+}
+
+func isHighsecRestrictedShipGroup(groupID int32, groupName string) bool {
+	if _, ok := highsecRestrictedShipGroupIDs[groupID]; ok {
+		return true
+	}
+	// Name-based fallback for future groups not present in hardcoded IDs.
+	name := strings.ToLower(strings.TrimSpace(groupName))
+	switch name {
+	case "titan", "dreadnought", "carrier", "supercarrier", "force auxiliary", "capital industrial ship":
+		return true
+	default:
+		return false
+	}
+}
+
+func isHighsecSecurity(security float64) bool {
+	return security >= 0.45
+}
+
 // getRigSizeClass returns the size class of a rig: 1=Small, 2=Medium, 3=Large/Capital, 0=Unknown.
 // Checks item name for size keywords (since some rig groups are type-based, not size-based).
 func getRigSizeClass(itemName string) int {
@@ -308,6 +337,7 @@ func (s *Scanner) contractItemLabel(typeID int32, resolvedTypeNames map[int32]st
 func selectInstantLiquidationSystem(
 	items []instantValuationItem,
 	buyBooksByTypeBySystem map[int32]map[int32][]esi.MarketOrder,
+	systemAllowed func(systemID int32) bool,
 ) (instantLiquidationChoice, bool) {
 	if len(items) == 0 {
 		return instantLiquidationChoice{}, false
@@ -325,6 +355,9 @@ func selectInstantLiquidationSystem(
 
 		plans := make(map[int32]ExecutionPlanResult, len(typeBooks))
 		for systemID, book := range typeBooks {
+			if systemAllowed != nil && !systemAllowed(systemID) {
+				continue
+			}
 			plan := ComputeExecutionPlan(book, item.Quantity, false)
 			if !plan.CanFill || plan.ExpectedPrice <= 0 {
 				continue
@@ -718,6 +751,7 @@ func (s *Scanner) ScanContractsWithContext(ctx context.Context, params ScanParam
 
 		// FIRST PASS: detect ship presence for fitted-risk handling.
 		shipSizeClass := 0 // 0=no ship, 1=small, 2=medium, 3=large
+		hasHighsecRestrictedShip := false
 		for _, item := range items {
 			if !item.IsIncluded || item.Quantity <= 0 {
 				continue
@@ -726,6 +760,13 @@ func (s *Scanner) ScanContractsWithContext(ctx context.Context, params ScanParam
 				sizeClass := getShipSizeClass(typeInfo.GroupID)
 				if sizeClass > 0 && sizeClass > shipSizeClass {
 					shipSizeClass = sizeClass
+				}
+				groupName := ""
+				if g, ok := s.SDE.Groups[typeInfo.GroupID]; ok {
+					groupName = g.Name
+				}
+				if isHighsecRestrictedShipGroup(typeInfo.GroupID, groupName) {
+					hasHighsecRestrictedShip = true
 				}
 			}
 		}
@@ -874,11 +915,28 @@ func (s *Scanner) ScanContractsWithContext(ctx context.Context, params ScanParam
 			}
 		}
 		if contractInstant {
-			choice, ok := selectInstantLiquidationSystem(instantItems, buyOrdersByTypeBySystem)
+			var liquidationSystemAllowed func(int32) bool
+			if hasHighsecRestrictedShip {
+				liquidationSystemAllowed = func(systemID int32) bool {
+					if sys, ok := s.SDE.Systems[systemID]; ok {
+						return !isHighsecSecurity(sys.Security)
+					}
+					// Unknown security metadata: keep system eligible.
+					return true
+				}
+			}
+
+			choice, ok := selectInstantLiquidationSystem(instantItems, buyOrdersByTypeBySystem, liquidationSystemAllowed)
 			if !ok {
 				continue
 			}
 			liquidationSystemID = choice.SystemID
+			// Defensive safety net: restricted capitals must not liquidate in highsec.
+			if hasHighsecRestrictedShip {
+				if liqSys, ok := s.SDE.Systems[liquidationSystemID]; ok && isHighsecSecurity(liqSys.Security) {
+					continue
+				}
+			}
 			marketValue = choice.MarketValue
 			pricedCount = choice.PricedCount
 			itemCount = choice.ItemCount

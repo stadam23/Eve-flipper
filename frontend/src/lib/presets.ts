@@ -86,12 +86,23 @@ const defaultScanPresetParams = {
   sell_sales_tax_percent: 8,
   min_daily_volume: 0,
   max_investment: 0,
+  min_item_profit: 0,
+  min_period_roi: 0,
+  max_dos: 0,
+  min_demand_per_day: 0,
+  avg_price_period: 14,
+  shipping_cost_per_m3_jump: 0,
   min_s2b_per_day: 0,
   min_bfs_per_day: 0,
   min_s2b_bfs_ratio: 0,
   max_s2b_bfs_ratio: 0,
-  min_route_security: 0,
+  category_ids: [] as number[],
+  sell_order_mode: false,
+  min_route_security: 0.45,
+  source_regions: [],
   target_region: "",
+  target_market_system: "Jita",
+  target_market_location_id: 0,
   min_contract_price: 10_000_000,
   max_contract_margin: 100,
   min_priced_ratio: 0.8,
@@ -103,7 +114,23 @@ const defaultScanPresetParams = {
   include_structures: false,
   route_min_hops: 2,
   route_max_hops: 5,
+  route_target_system_name: "",
+  route_min_isk_per_jump: 0,
+  route_allow_empty_hops: false,
 };
+
+export function getPresetApplyBase(tab: string): Record<string, any> {
+  const mapped = mapTabToPresetTab(tab);
+  switch (mapped) {
+    case "flipper":
+    case "region":
+    case "contracts":
+    case "route":
+      return { ...defaultScanPresetParams };
+    default:
+      return {};
+  }
+}
 
 export const BUILTIN_PRESETS: BuiltinPreset[] = [
   // ── Flipper ──
@@ -147,15 +174,82 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
 
   // ── Regional Arbitrage ──
   {
+    id: "region-safe",
+    nameKey: "presetRegionSafe",
+    tab: "region",
+    params: {
+      ...defaultScanPresetParams,
+      min_margin: 18,
+      min_item_profit: 10_000_000,
+      min_period_roi: 6,
+      min_demand_per_day: 2,
+      max_dos: 45,
+      avg_price_period: 14,
+      shipping_cost_per_m3_jump: 0,
+      buy_radius: 5,
+      cargo_capacity: 12_000,
+      min_route_security: 0.45,
+      source_regions: ["The Forge", "Domain", "Sinq Laison", "Metropolis", "Heimatar"],
+      target_region: "",
+    },
+  },
+  {
+    id: "region-normal",
+    nameKey: "presetRegionNormal",
+    tab: "region",
+    params: {
+      ...defaultScanPresetParams,
+      min_margin: 12,
+      min_item_profit: 4_000_000,
+      min_period_roi: 4,
+      min_demand_per_day: 1,
+      max_dos: 75,
+      avg_price_period: 14,
+      shipping_cost_per_m3_jump: 0,
+      buy_radius: 8,
+      cargo_capacity: 20_000,
+      min_route_security: 0.45,
+      source_regions: ["The Forge", "Domain", "Sinq Laison", "Metropolis", "Heimatar"],
+      target_region: "",
+    },
+  },
+  {
+    id: "region-wide",
+    nameKey: "presetRegionWide",
+    tab: "region",
+    params: {
+      ...defaultScanPresetParams,
+      min_margin: 8,
+      min_item_profit: 1_500_000,
+      min_period_roi: 2,
+      min_demand_per_day: 0.5,
+      max_dos: 120,
+      avg_price_period: 14,
+      shipping_cost_per_m3_jump: 0,
+      buy_radius: 20,
+      cargo_capacity: 60_000,
+      min_route_security: 0,
+      source_regions: ["The Forge", "Domain", "Sinq Laison", "Metropolis", "Heimatar"],
+      target_region: "",
+    },
+  },
+  {
     id: "region-quick",
     nameKey: "presetRegionQuick",
     tab: "region",
     params: {
       ...defaultScanPresetParams,
-      min_margin: 10,
+      min_margin: 20,
+      min_item_profit: 15_000_000,
+      min_period_roi: 5,
+      min_demand_per_day: 2,
+      max_dos: 90,
+      avg_price_period: 14,
+      shipping_cost_per_m3_jump: 0,
       buy_radius: 5,
       cargo_capacity: 5000,
       min_route_security: 0.45,
+      source_regions: ["The Forge", "Domain", "Sinq Laison", "Metropolis", "Heimatar"],
       target_region: "",
     },
   },
@@ -165,11 +259,18 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
     tab: "region",
     params: {
       ...defaultScanPresetParams,
-      min_margin: 3,
+      min_margin: 10,
+      min_item_profit: 5_000_000,
+      min_period_roi: 3,
+      min_demand_per_day: 1,
+      max_dos: 120,
+      avg_price_period: 14,
+      shipping_cost_per_m3_jump: 0,
       buy_radius: 20,
       cargo_capacity: 60000,
       sell_radius: 20,
       min_route_security: 0,
+      source_regions: ["The Forge", "Domain", "Sinq Laison", "Metropolis", "Heimatar"],
       target_region: "",
     },
   },

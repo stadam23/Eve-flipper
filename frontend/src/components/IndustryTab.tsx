@@ -1,7 +1,44 @@
-import { useState, useCallback, useRef, useMemo, useEffect } from "react";
+import { useState, useCallback, useRef, useMemo, useEffect, lazy, Suspense } from "react";
 import { useI18n } from "@/lib/i18n";
-import { analyzeIndustry, searchBuildableItems, getStations, getStructures } from "@/lib/api";
-import type { IndustryAnalysis, IndustryParams, MaterialNode, FlatMaterial, BuildableItem, StationInfo } from "@/lib/types";
+import {
+  analyzeIndustry,
+  searchBuildableItems,
+  getStations,
+  getStructures,
+  getAuthIndustryProjects,
+  createAuthIndustryProject,
+  getAuthIndustryProjectSnapshot,
+  previewAuthIndustryProjectPlan,
+  planAuthIndustryProject,
+  rebalanceAuthIndustryProjectMaterials,
+  syncAuthIndustryProjectBlueprintPool,
+  getAuthIndustryLedger,
+  updateAuthIndustryTaskStatus,
+  updateAuthIndustryTaskStatusBulk,
+  updateAuthIndustryTaskPriority,
+  updateAuthIndustryTaskPriorityBulk,
+  updateAuthIndustryJobStatus,
+  updateAuthIndustryJobStatusBulk,
+} from "@/lib/api";
+import type {
+  IndustryAnalysis,
+  IndustryParams,
+  FlatMaterial,
+  BuildableItem,
+  StationInfo,
+  IndustryProject,
+  IndustryProjectSnapshot,
+  IndustryLedger,
+  IndustryTaskStatus,
+  IndustryJobStatus,
+  IndustryPlanPatch,
+  IndustryPlanPreview,
+  IndustryPlanSchedulerInput,
+  IndustryTaskPlanInput,
+  IndustryJobPlanInput,
+  IndustryMaterialPlanInput,
+  IndustryBlueprintPoolInput,
+} from "@/lib/types";
 import { formatISK } from "@/lib/format";
 import {
   TabSettingsPanel,
@@ -15,21 +52,28 @@ import { SystemAutocomplete } from "./SystemAutocomplete";
 import { EmptyState } from "./EmptyState";
 import { useGlobalToast } from "./Toast";
 import { ExecutionPlannerPopup } from "./ExecutionPlannerPopup";
+import {
+  formatUtcShort,
+  industryJobStatusClass,
+  industryTaskStatusClass,
+  planPatchSignature,
+  taskConstraintRecord,
+  taskConstraintNumber,
+  type IndustryPlannerWarningEvent,
+  type IndustryPlannerWarningSource,
+  type IndustryTaskDependencyBoard,
+} from "./industry/industryHelpers";
+import type { IndustryJobsWorkspaceTab } from "./industry/IndustryJobsWorkspaceNav";
 
-// Format duration in seconds to human-readable string
-function formatDuration(seconds: number): string {
-  if (seconds <= 0) return "—";
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  const parts: string[] = [];
-  if (d > 0) parts.push(`${d}d`);
-  if (h > 0) parts.push(`${h}h`);
-  if (m > 0) parts.push(`${m}m`);
-  if (parts.length === 0) parts.push(`${s}s`);
-  return parts.join(" ");
-}
+const IndustryJobsLedgerPanel = lazy(async () => {
+  const mod = await import("./industry/IndustryJobsLedgerPanel");
+  return { default: mod.IndustryJobsLedgerPanel };
+});
+
+const IndustryAnalysisResultsPanel = lazy(async () => {
+  const mod = await import("./industry/IndustryAnalysisResultsPanel");
+  return { default: mod.IndustryAnalysisResultsPanel };
+});
 
 // Highlight matching text in search results
 function HighlightMatch({ text, query }: { text: string; query: string }) {
@@ -55,6 +99,36 @@ interface Props {
   isLoggedIn?: boolean;
 }
 
+type IndustryInnerTab = "analysis" | "jobs";
+type PlanBuilderSection = "tasks" | "jobs" | "materials" | "blueprints";
+
+const INDUSTRY_LEDGER_SELECTED_PROJECT_STORAGE_KEY = "eve-flipper-industry-selected-project-id";
+
+function readStoredIndustryLedgerProjectID(): number {
+  try {
+    const raw = localStorage.getItem(INDUSTRY_LEDGER_SELECTED_PROJECT_STORAGE_KEY);
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed);
+    }
+  } catch {
+    // ignore storage access errors
+  }
+  return 0;
+}
+
+function persistIndustryLedgerProjectID(projectID: number): void {
+  try {
+    if (projectID > 0) {
+      localStorage.setItem(INDUSTRY_LEDGER_SELECTED_PROJECT_STORAGE_KEY, String(projectID));
+      return;
+    }
+    localStorage.removeItem(INDUSTRY_LEDGER_SELECTED_PROJECT_STORAGE_KEY);
+  } catch {
+    // ignore storage access errors
+  }
+}
+
 export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const { t } = useI18n();
   const { addToast } = useGlobalToast();
@@ -66,6 +140,8 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const [showDropdown, setShowDropdown] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const searchRequestSeqRef = useRef(0);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -106,6 +182,10 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   const [includeStructures, setIncludeStructures] = useState(false);
   const [structureStations, setStructureStations] = useState<StationInfo[]>([]);
   const [loadingStructures, setLoadingStructures] = useState(false);
+  const stationsAbortRef = useRef<AbortController | null>(null);
+  const stationsRequestSeqRef = useRef(0);
+  const structuresAbortRef = useRef<AbortController | null>(null);
+  const structuresRequestSeqRef = useRef(0);
 
   // Analysis state
   const [analyzing, setAnalyzing] = useState(false);
@@ -119,37 +199,147 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   // Execution plan popup (from shopping list)
   const [execPlanMaterial, setExecPlanMaterial] = useState<FlatMaterial | null>(null);
 
+  // Industry ledger (M1) state
+  const [ledgerProjects, setLedgerProjects] = useState<IndustryProject[]>([]);
+  const [ledgerProjectsLoading, setLedgerProjectsLoading] = useState(false);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [selectedLedgerProjectId, setSelectedLedgerProjectId] = useState(() => readStoredIndustryLedgerProjectID());
+  const [ledgerData, setLedgerData] = useState<IndustryLedger | null>(null);
+  const [ledgerSnapshot, setLedgerSnapshot] = useState<IndustryProjectSnapshot | null>(null);
+  const [ledgerSnapshotLoading, setLedgerSnapshotLoading] = useState(false);
+  const [newLedgerProjectName, setNewLedgerProjectName] = useState("");
+  const [newLedgerProjectStrategy, setNewLedgerProjectStrategy] = useState<"conservative" | "balanced" | "aggressive">("balanced");
+  const [creatingLedgerProject, setCreatingLedgerProject] = useState(false);
+  const [updatingLedgerTaskId, setUpdatingLedgerTaskId] = useState(0);
+  const [updatingLedgerTasksBulk, setUpdatingLedgerTasksBulk] = useState(false);
+  const [selectedLedgerTaskIDs, setSelectedLedgerTaskIDs] = useState<number[]>([]);
+  const [bulkLedgerTaskPriority, setBulkLedgerTaskPriority] = useState(100);
+  const [updatingLedgerJobId, setUpdatingLedgerJobId] = useState(0);
+  const [updatingLedgerJobsBulk, setUpdatingLedgerJobsBulk] = useState(false);
+  const [selectedLedgerJobIDs, setSelectedLedgerJobIDs] = useState<number[]>([]);
+  const [rebalancingLedgerMaterials, setRebalancingLedgerMaterials] = useState(false);
+  const [syncingLedgerBlueprintPool, setSyncingLedgerBlueprintPool] = useState(false);
+  const [rebalanceInventoryScope, setRebalanceInventoryScope] = useState<"single" | "all">("single");
+  const [rebalanceLookbackDays, setRebalanceLookbackDays] = useState(180);
+  const [rebalanceStrategy, setRebalanceStrategy] = useState<"preserve" | "buy" | "build">("preserve");
+  const [rebalanceWarehouseScope, setRebalanceWarehouseScope] = useState<"global" | "location_first" | "strict_location">("location_first");
+  const [blueprintSyncDefaultBPCRuns, setBlueprintSyncDefaultBPCRuns] = useState(1);
+  const [rebalanceUseSelectedStation, setRebalanceUseSelectedStation] = useState(false);
+  const [applyingLedgerPlan, setApplyingLedgerPlan] = useState(false);
+  const [replaceLedgerPlanOnApply, setReplaceLedgerPlanOnApply] = useState(true);
+  const [lastLedgerPlanSummary, setLastLedgerPlanSummary] = useState("");
+  const [previewingLedgerPlan, setPreviewingLedgerPlan] = useState(false);
+  const [lastLedgerPlanPreview, setLastLedgerPlanPreview] = useState<IndustryPlanPreview | null>(null);
+  const [lastLedgerPlanPreviewPatch, setLastLedgerPlanPreviewPatch] = useState<IndustryPlanPatch | null>(null);
+  const [useVisualPlanBuilder, setUseVisualPlanBuilder] = useState(true);
+  const [planDraftTasks, setPlanDraftTasks] = useState<IndustryTaskPlanInput[]>([]);
+  const [planDraftJobs, setPlanDraftJobs] = useState<IndustryJobPlanInput[]>([]);
+  const [planDraftMaterials, setPlanDraftMaterials] = useState<IndustryMaterialPlanInput[]>([]);
+  const [planDraftBlueprints, setPlanDraftBlueprints] = useState<IndustryBlueprintPoolInput[]>([]);
+  const [strictBlueprintBindingMode, setStrictBlueprintBindingMode] = useState(true);
+  const [plannerWarnings, setPlannerWarnings] = useState<IndustryPlannerWarningEvent[]>([]);
+  const plannerWarningSeqRef = useRef(1);
+  const ledgerLoadSeqRef = useRef(0);
+  const [industryInnerTab, setIndustryInnerTab] = useState<IndustryInnerTab>("analysis");
+  const [jobsWorkspaceTab, setJobsWorkspaceTab] = useState<IndustryJobsWorkspaceTab>("guide");
+  const [planBuilderCompactMode, setPlanBuilderCompactMode] = useState(true);
+  const [planBuilderPageSize, setPlanBuilderPageSize] = useState(6);
+  const [enablePlanScheduler, setEnablePlanScheduler] = useState(true);
+  const [schedulerSlotCount, setSchedulerSlotCount] = useState(2);
+  const [schedulerMaxRunsPerJob, setSchedulerMaxRunsPerJob] = useState(100);
+  const [schedulerMaxDurationHours, setSchedulerMaxDurationHours] = useState(24);
+  const [schedulerQueueStatus, setSchedulerQueueStatus] = useState<IndustryJobStatus>("queued");
+  const [planBuilderCollapsed, setPlanBuilderCollapsed] = useState<Record<PlanBuilderSection, boolean>>({
+    tasks: false,
+    jobs: false,
+    materials: false,
+    blueprints: false,
+  });
+  const [planBuilderPage, setPlanBuilderPage] = useState<Record<PlanBuilderSection, number>>({
+    tasks: 1,
+    jobs: 1,
+    materials: 1,
+    blueprints: 1,
+  });
+
+  useEffect(() => () => {
+    clearTimeout(searchTimeoutRef.current);
+    searchAbortRef.current?.abort();
+    stationsAbortRef.current?.abort();
+    structuresAbortRef.current?.abort();
+    abortRef.current?.abort();
+  }, []);
+
   // Load stations when system changes
   useEffect(() => {
-    if (!systemName) return;
+    stationsAbortRef.current?.abort();
+    stationsRequestSeqRef.current += 1;
+    const reqSeq = stationsRequestSeqRef.current;
+    const normalizedSystem = systemName.trim();
+    if (!normalizedSystem) {
+      setStations([]);
+      setSystemRegionId(0);
+      setSystemId(0);
+      setSelectedStationId(0);
+      setStructureStations([]);
+      setLoadingStations(false);
+      return;
+    }
+    const controller = new AbortController();
+    stationsAbortRef.current = controller;
     setLoadingStations(true);
-    getStations(systemName)
+    setStructureStations([]);
+    getStations(normalizedSystem, controller.signal)
       .then((resp) => {
+        if (reqSeq !== stationsRequestSeqRef.current) return;
         setStations(resp.stations);
         setSystemRegionId(resp.region_id);
         setSystemId(resp.system_id);
         setSelectedStationId(0);
         setStructureStations([]);
       })
-      .catch(() => {
+      .catch((e: unknown) => {
+        if (reqSeq !== stationsRequestSeqRef.current) return;
+        if (e instanceof Error && e.name === "AbortError") return;
         setStations([]);
         setSystemRegionId(0);
         setSystemId(0);
       })
-      .finally(() => setLoadingStations(false));
+      .finally(() => {
+        if (reqSeq === stationsRequestSeqRef.current) {
+          setLoadingStations(false);
+        }
+      });
   }, [systemName]);
 
   // Fetch structures when toggle is enabled
   useEffect(() => {
+    structuresAbortRef.current?.abort();
+    structuresRequestSeqRef.current += 1;
+    const reqSeq = structuresRequestSeqRef.current;
     if (!includeStructures || !systemId || !systemRegionId) {
       setStructureStations([]);
+      setLoadingStructures(false);
       return;
     }
+    const controller = new AbortController();
+    structuresAbortRef.current = controller;
     setLoadingStructures(true);
-    getStructures(systemId, systemRegionId)
-      .then(setStructureStations)
-      .catch(() => setStructureStations([]))
-      .finally(() => setLoadingStructures(false));
+    getStructures(systemId, systemRegionId, controller.signal)
+      .then((rows) => {
+        if (reqSeq !== structuresRequestSeqRef.current) return;
+        setStructureStations(rows);
+      })
+      .catch((e: unknown) => {
+        if (reqSeq !== structuresRequestSeqRef.current) return;
+        if (e instanceof Error && e.name === "AbortError") return;
+        setStructureStations([]);
+      })
+      .finally(() => {
+        if (reqSeq === structuresRequestSeqRef.current) {
+          setLoadingStructures(false);
+        }
+      });
   }, [includeStructures, systemId, systemRegionId]);
 
   // Combined stations (NPC + structures when toggle is on)
@@ -160,6 +350,1573 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
     return stations;
   }, [stations, structureStations, includeStructures]);
 
+  useEffect(() => {
+    if (selectedStationId <= 0) return;
+    const exists = allStations.some((station) => Number(station.id) === selectedStationId);
+    if (!exists) {
+      setSelectedStationId(0);
+    }
+  }, [allStations, selectedStationId]);
+
+  const refreshLedgerProjects = useCallback(async (preferredProjectId?: number) => {
+    if (!isLoggedIn) {
+      persistIndustryLedgerProjectID(0);
+      setLedgerProjects([]);
+      setSelectedLedgerProjectId(0);
+      setLedgerData(null);
+      setLedgerSnapshot(null);
+      setSelectedLedgerTaskIDs([]);
+      setSelectedLedgerJobIDs([]);
+      return;
+    }
+
+    setLedgerProjectsLoading(true);
+    try {
+      const resp = await getAuthIndustryProjects({ limit: 120 });
+      const projects = Array.isArray(resp.projects) ? resp.projects : [];
+      const storedProjectID = readStoredIndustryLedgerProjectID();
+      setLedgerProjects(projects);
+      setSelectedLedgerProjectId((current) => {
+        const candidates = [preferredProjectId ?? 0, current, storedProjectID];
+        for (const candidate of candidates) {
+          if (candidate > 0 && projects.some((p) => p.id === candidate)) {
+            return candidate;
+          }
+        }
+        return Number(projects[0]?.id ?? 0);
+      });
+    } catch (e: unknown) {
+      console.error("Industry projects load error:", e);
+      onError?.(e instanceof Error ? e.message : "Failed to load industry projects");
+      persistIndustryLedgerProjectID(0);
+      setLedgerProjects([]);
+      setSelectedLedgerProjectId(0);
+      setLedgerData(null);
+      setLedgerSnapshot(null);
+      setSelectedLedgerTaskIDs([]);
+      setSelectedLedgerJobIDs([]);
+    } finally {
+      setLedgerProjectsLoading(false);
+    }
+  }, [isLoggedIn, onError]);
+
+  const refreshLedger = useCallback(async (projectId: number) => {
+    if (!isLoggedIn || projectId <= 0) {
+      ledgerLoadSeqRef.current += 1;
+      setLedgerData(null);
+      setLedgerSnapshot(null);
+      setSelectedLedgerTaskIDs([]);
+      setSelectedLedgerJobIDs([]);
+      return;
+    }
+
+    const loadSeq = ledgerLoadSeqRef.current + 1;
+    ledgerLoadSeqRef.current = loadSeq;
+
+    setLedgerLoading(true);
+    setLedgerSnapshotLoading(true);
+    setLedgerData(null);
+    setLedgerSnapshot(null);
+    setSelectedLedgerTaskIDs([]);
+    setSelectedLedgerJobIDs([]);
+
+    try {
+      const [ledgerResult, snapshotResult] = await Promise.allSettled([
+        getAuthIndustryLedger({ project_id: projectId, limit: 200 }),
+        getAuthIndustryProjectSnapshot(projectId),
+      ]);
+      if (loadSeq !== ledgerLoadSeqRef.current) {
+        return;
+      }
+
+      if (ledgerResult.status !== "fulfilled") {
+        throw ledgerResult.reason;
+      }
+      setLedgerData(ledgerResult.value);
+      setSelectedLedgerTaskIDs([]);
+      setSelectedLedgerJobIDs([]);
+
+      if (snapshotResult.status === "fulfilled") {
+        setLedgerSnapshot(snapshotResult.value);
+      } else {
+        console.error("Industry snapshot load error:", snapshotResult.reason);
+        setLedgerSnapshot(null);
+      }
+    } catch (e: unknown) {
+      if (loadSeq !== ledgerLoadSeqRef.current) {
+        return;
+      }
+      console.error("Industry ledger load error:", e);
+      onError?.(e instanceof Error ? e.message : "Failed to load industry ledger");
+      setLedgerData(null);
+      setLedgerSnapshot(null);
+      setSelectedLedgerTaskIDs([]);
+      setSelectedLedgerJobIDs([]);
+    } finally {
+      if (loadSeq === ledgerLoadSeqRef.current) {
+        setLedgerLoading(false);
+        setLedgerSnapshotLoading(false);
+      }
+    }
+  }, [isLoggedIn, onError]);
+
+  useEffect(() => {
+    refreshLedgerProjects();
+  }, [refreshLedgerProjects]);
+
+  useEffect(() => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0) {
+      ledgerLoadSeqRef.current += 1;
+      setLedgerData(null);
+      setLedgerSnapshot(null);
+      setSelectedLedgerTaskIDs([]);
+      setSelectedLedgerJobIDs([]);
+      return;
+    }
+    refreshLedger(selectedLedgerProjectId);
+  }, [isLoggedIn, selectedLedgerProjectId, refreshLedger]);
+
+  const pushPlannerWarnings = useCallback((source: IndustryPlannerWarningSource, warnings: string[] | string) => {
+    const list = Array.isArray(warnings) ? warnings : [warnings];
+    const normalized = list
+      .map((entry) => String(entry ?? "").trim())
+      .filter((entry) => entry.length > 0);
+    if (normalized.length === 0) {
+      return;
+    }
+    const nowISO = new Date().toISOString();
+    setPlannerWarnings((prev) => {
+      const next = [...prev];
+      for (const message of normalized) {
+        const duplicateIndex = next.findIndex((item) => item.source === source && item.message === message);
+        if (duplicateIndex >= 0) {
+          next[duplicateIndex] = {
+            ...next[duplicateIndex],
+            created_at: nowISO,
+          };
+          continue;
+        }
+        next.unshift({
+          id: plannerWarningSeqRef.current++,
+          source,
+          message,
+          created_at: nowISO,
+        });
+      }
+      return next.slice(0, 40);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!isLoggedIn) {
+      persistIndustryLedgerProjectID(0);
+      return;
+    }
+    persistIndustryLedgerProjectID(selectedLedgerProjectId);
+  }, [isLoggedIn, selectedLedgerProjectId]);
+
+  useEffect(() => {
+    setSelectedLedgerTaskIDs([]);
+    setSelectedLedgerJobIDs([]);
+    setPlannerWarnings([]);
+    setLastLedgerPlanSummary("");
+    setLastLedgerPlanPreview(null);
+    setLastLedgerPlanPreviewPatch(null);
+    setPlanDraftTasks([]);
+    setPlanDraftJobs([]);
+    setPlanDraftMaterials([]);
+    setPlanDraftBlueprints([]);
+    setPlanBuilderPage({
+      tasks: 1,
+      jobs: 1,
+      materials: 1,
+      blueprints: 1,
+    });
+    setJobsWorkspaceTab("guide");
+  }, [selectedLedgerProjectId]);
+
+  const handleCreateLedgerProject = useCallback(async () => {
+    if (!isLoggedIn) return;
+    const name = newLedgerProjectName.trim();
+    if (!name) {
+      addToast(t("industryLedgerEnterProjectName"), "warning", 2000);
+      return;
+    }
+    setCreatingLedgerProject(true);
+    try {
+      const created = await createAuthIndustryProject({
+        name,
+        strategy: newLedgerProjectStrategy,
+      });
+      const createdProjectID = Number(created.project?.id ?? 0);
+      setNewLedgerProjectName("");
+      addToast(t("industryLedgerProjectCreated"), "success", 1800);
+      if (createdProjectID > 0) {
+        setSelectedLedgerProjectId(createdProjectID);
+      }
+      await refreshLedgerProjects(createdProjectID > 0 ? createdProjectID : undefined);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to create project";
+      onError?.(msg);
+      addToast(msg, "error", 2400);
+    } finally {
+      setCreatingLedgerProject(false);
+    }
+  }, [isLoggedIn, newLedgerProjectName, newLedgerProjectStrategy, addToast, onError, refreshLedgerProjects, t]);
+
+  const handleSetLedgerTaskStatus = useCallback(async (taskId: number, status: IndustryTaskStatus) => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0 || taskId <= 0) return;
+    setUpdatingLedgerTaskId(taskId);
+    try {
+      await updateAuthIndustryTaskStatus({ task_id: taskId, status });
+      addToast(`Task #${taskId} -> ${status}`, "success", 1500);
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to update task status";
+      onError?.(msg);
+      addToast(msg, "error", 2500);
+    } finally {
+      setUpdatingLedgerTaskId(0);
+    }
+  }, [isLoggedIn, selectedLedgerProjectId, refreshLedger, addToast, onError]);
+
+  const handleSetLedgerTaskPriority = useCallback(async (taskId: number, priority: number) => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0 || taskId <= 0) return;
+    const normalizedPriority = Number.isFinite(priority) ? Math.round(priority) : 0;
+    setUpdatingLedgerTaskId(taskId);
+    try {
+      await updateAuthIndustryTaskPriority({ task_id: taskId, priority: normalizedPriority });
+      addToast(`Task #${taskId} priority -> ${normalizedPriority}`, "success", 1500);
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to update task priority";
+      onError?.(msg);
+      addToast(msg, "error", 2500);
+    } finally {
+      setUpdatingLedgerTaskId(0);
+    }
+  }, [isLoggedIn, selectedLedgerProjectId, refreshLedger, addToast, onError]);
+
+  const toggleLedgerTaskSelection = useCallback((taskId: number, selected: boolean) => {
+    setSelectedLedgerTaskIDs((prev) => {
+      const next = new Set(prev);
+      if (selected) {
+        next.add(taskId);
+      } else {
+        next.delete(taskId);
+      }
+      return Array.from(next);
+    });
+  }, []);
+
+  const handleBulkSetLedgerTaskStatus = useCallback(async (status: IndustryTaskStatus) => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0) return;
+    if (selectedLedgerTaskIDs.length === 0) {
+      addToast("Select tasks first", "warning", 2000);
+      return;
+    }
+    setUpdatingLedgerTasksBulk(true);
+    try {
+      const resp = await updateAuthIndustryTaskStatusBulk({
+        task_ids: selectedLedgerTaskIDs,
+        status,
+      });
+      addToast(`Updated ${resp.updated} tasks -> ${status}`, "success", 1800);
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to bulk update tasks";
+      onError?.(msg);
+      addToast(msg, "error", 2500);
+    } finally {
+      setUpdatingLedgerTasksBulk(false);
+    }
+  }, [isLoggedIn, selectedLedgerProjectId, selectedLedgerTaskIDs, addToast, refreshLedger, onError]);
+
+  const handleBulkSetLedgerTaskPriority = useCallback(async (priority: number) => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0) return;
+    if (selectedLedgerTaskIDs.length === 0) {
+      addToast("Select tasks first", "warning", 2000);
+      return;
+    }
+    const normalizedPriority = Number.isFinite(priority) ? Math.round(priority) : 0;
+    setUpdatingLedgerTasksBulk(true);
+    try {
+      const resp = await updateAuthIndustryTaskPriorityBulk({
+        task_ids: selectedLedgerTaskIDs,
+        priority: normalizedPriority,
+      });
+      addToast(`Updated ${resp.updated} task priorities -> ${normalizedPriority}`, "success", 1800);
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to bulk update task priorities";
+      onError?.(msg);
+      addToast(msg, "error", 2500);
+    } finally {
+      setUpdatingLedgerTasksBulk(false);
+    }
+  }, [isLoggedIn, selectedLedgerProjectId, selectedLedgerTaskIDs, addToast, refreshLedger, onError]);
+
+  const handleSetLedgerJobStatus = useCallback(async (jobId: number, status: IndustryJobStatus) => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0 || jobId <= 0) return;
+    setUpdatingLedgerJobId(jobId);
+    try {
+      await updateAuthIndustryJobStatus({ job_id: jobId, status });
+      addToast(t("industryLedgerJobUpdated", { id: jobId, status }), "success", 1500);
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to update job status";
+      onError?.(msg);
+      addToast(msg, "error", 2500);
+    } finally {
+      setUpdatingLedgerJobId(0);
+    }
+  }, [isLoggedIn, selectedLedgerProjectId, refreshLedger, addToast, onError, t]);
+
+  const toggleLedgerJobSelection = useCallback((jobId: number, selected: boolean) => {
+    setSelectedLedgerJobIDs((prev) => {
+      const next = new Set(prev);
+      if (selected) {
+        next.add(jobId);
+      } else {
+        next.delete(jobId);
+      }
+      return Array.from(next);
+    });
+  }, []);
+
+  const handleBulkSetLedgerJobStatus = useCallback(async (status: IndustryJobStatus) => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0) return;
+    if (selectedLedgerJobIDs.length === 0) {
+      addToast(t("industryLedgerSelectJobsFirst"), "warning", 2000);
+      return;
+    }
+    setUpdatingLedgerJobsBulk(true);
+    try {
+      const resp = await updateAuthIndustryJobStatusBulk({
+        job_ids: selectedLedgerJobIDs,
+        status,
+      });
+      addToast(t("industryLedgerBulkUpdated", { count: resp.updated, status }), "success", 1800);
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to bulk update jobs";
+      onError?.(msg);
+      addToast(msg, "error", 2500);
+    } finally {
+      setUpdatingLedgerJobsBulk(false);
+    }
+  }, [isLoggedIn, selectedLedgerProjectId, selectedLedgerJobIDs, addToast, refreshLedger, onError, t]);
+
+  const handleRebalanceLedgerMaterialsFromInventory = useCallback(async () => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0) return;
+    setRebalancingLedgerMaterials(true);
+    try {
+      const locationIDs = rebalanceUseSelectedStation && selectedStationId > 0
+        ? [selectedStationId]
+        : [];
+      const resp = await rebalanceAuthIndustryProjectMaterials(selectedLedgerProjectId, {
+        scope: rebalanceInventoryScope,
+        lookback_days: Math.max(1, Math.min(365, Math.round(rebalanceLookbackDays || 180))),
+        strategy: rebalanceStrategy,
+        warehouse_scope: rebalanceWarehouseScope,
+        location_ids: locationIDs,
+      });
+      const s = resp.summary;
+      addToast(
+        `Rebalanced ${s.updated} rows · stock ${s.allocated_available.toLocaleString()} · missing ${s.remaining_missing_qty.toLocaleString()}`,
+        "success",
+        2400
+      );
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to rebalance materials from inventory";
+      onError?.(msg);
+      addToast(msg, "error", 2600);
+    } finally {
+      setRebalancingLedgerMaterials(false);
+    }
+  }, [
+    isLoggedIn,
+    selectedLedgerProjectId,
+    rebalanceUseSelectedStation,
+    selectedStationId,
+    rebalanceInventoryScope,
+    rebalanceLookbackDays,
+    rebalanceStrategy,
+    rebalanceWarehouseScope,
+    addToast,
+    refreshLedger,
+    onError,
+  ]);
+
+  const handleSyncLedgerBlueprintPoolFromAssets = useCallback(async () => {
+    if (!isLoggedIn || selectedLedgerProjectId <= 0) return;
+    setSyncingLedgerBlueprintPool(true);
+    try {
+      const locationIDs = rebalanceUseSelectedStation && selectedStationId > 0
+        ? [selectedStationId]
+        : [];
+      const resp = await syncAuthIndustryProjectBlueprintPool(selectedLedgerProjectId, {
+        scope: rebalanceInventoryScope,
+        default_bpc_runs: Math.max(1, Math.min(1000, Math.round(blueprintSyncDefaultBPCRuns || 1))),
+        location_ids: locationIDs,
+      });
+      const s = resp.summary;
+      const bpChars = s.blueprints_endpoint_characters ?? 0;
+      const fallbackChars = s.assets_fallback_characters ?? 0;
+      const sourceNote = fallbackChars > 0
+        ? ` (bp:${bpChars} fallback:${fallbackChars})`
+        : bpChars > 0
+          ? ` (bp:${bpChars})`
+          : "";
+      addToast(
+        `BP sync: ${s.blueprints_upserted} upserted (${s.blueprints_detected} detected, ${s.assets_scanned} assets scanned${sourceNote})`,
+        "success",
+        2600
+      );
+      if (Array.isArray(s.warnings) && s.warnings.length > 0) {
+        addToast(s.warnings.slice(0, 2).join(" | "), "warning", 3200);
+      }
+      await refreshLedger(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to sync owned blueprints";
+      onError?.(msg);
+      addToast(msg, "error", 2600);
+    } finally {
+      setSyncingLedgerBlueprintPool(false);
+    }
+  }, [
+    isLoggedIn,
+    selectedLedgerProjectId,
+    rebalanceUseSelectedStation,
+    selectedStationId,
+    rebalanceInventoryScope,
+    blueprintSyncDefaultBPCRuns,
+    addToast,
+    refreshLedger,
+    onError,
+  ]);
+
+  const buildAutoPlanPatch = useCallback((): IndustryPlanPatch | null => {
+    if (!result || !selectedItem) {
+      return null;
+    }
+    const topBlueprintTypeID = result.material_tree?.blueprint?.blueprint_type_id ?? 0;
+    const taskName = `Build ${selectedItem.type_name}`;
+
+    const tasks = [
+      {
+        name: taskName,
+        activity: "manufacturing",
+        product_type_id: selectedItem.type_id,
+        target_runs: runs,
+        priority: 100,
+        status: "planned" as const,
+        constraints: {
+          me,
+          te,
+          system_name: systemName,
+          station_id: selectedStationId || 0,
+          blueprint_type_id: topBlueprintTypeID || 0,
+          blueprint_location_id: selectedStationId || 0,
+        },
+      },
+    ];
+
+    const jobs = [
+      {
+        activity: "manufacturing",
+        runs,
+        duration_seconds: result.manufacturing_time ?? 0,
+        cost_isk: result.total_job_cost ?? 0,
+        status: "planned" as const,
+        started_at: "",
+        finished_at: "",
+        notes: "Auto-seeded from Industry analyzer",
+      },
+    ];
+
+    const materials = (result.flat_materials ?? []).map((m) => ({
+      type_id: m.type_id,
+      type_name: m.type_name,
+      required_qty: m.quantity,
+      available_qty: 0,
+      buy_qty: m.quantity,
+      build_qty: 0,
+      unit_cost_isk: m.unit_price,
+      source: "market" as const,
+    }));
+
+    const blueprints = topBlueprintTypeID > 0
+      ? [
+          {
+            blueprint_type_id: topBlueprintTypeID,
+            blueprint_name: `${selectedItem.type_name} Blueprint`,
+            location_id: selectedStationId || 0,
+            quantity: 1,
+            me,
+            te,
+            is_bpo: ownBlueprint,
+            available_runs: 0,
+          },
+        ]
+      : [];
+
+    return {
+      replace: replaceLedgerPlanOnApply,
+      project_status: "planned",
+      tasks,
+      jobs,
+      materials,
+      blueprints,
+    };
+  }, [
+    result,
+    selectedItem,
+    runs,
+    me,
+    te,
+    systemName,
+    selectedStationId,
+    ownBlueprint,
+    replaceLedgerPlanOnApply,
+  ]);
+
+  const seedVisualPlanBuilderFromPatch = useCallback((patch: IndustryPlanPatch) => {
+    setPlanDraftTasks(Array.isArray(patch.tasks) ? patch.tasks : []);
+    setPlanDraftJobs(Array.isArray(patch.jobs) ? patch.jobs : []);
+    setPlanDraftMaterials(Array.isArray(patch.materials) ? patch.materials : []);
+    setPlanDraftBlueprints(Array.isArray(patch.blueprints) ? patch.blueprints : []);
+  }, []);
+
+  const seedVisualPlanBuilderFromSnapshot = useCallback((snapshot: IndustryProjectSnapshot) => {
+    const tasks: IndustryTaskPlanInput[] = (snapshot.tasks ?? []).map((task) => ({
+      parent_task_id: task.parent_task_id,
+      name: task.name,
+      activity: task.activity,
+      product_type_id: task.product_type_id,
+      target_runs: task.target_runs,
+      planned_start: task.planned_start,
+      planned_end: task.planned_end,
+      priority: task.priority,
+      status: task.status,
+      constraints: task.constraints,
+    }));
+
+    const jobs: IndustryJobPlanInput[] = (snapshot.jobs ?? []).map((job) => ({
+      task_id: job.task_id,
+      character_id: job.character_id,
+      facility_id: job.facility_id,
+      activity: job.activity,
+      runs: job.runs,
+      duration_seconds: job.duration_seconds,
+      cost_isk: job.cost_isk,
+      status: job.status,
+      started_at: job.started_at,
+      finished_at: job.finished_at,
+      external_job_id: job.external_job_id,
+      notes: job.notes,
+    }));
+
+    const materials: IndustryMaterialPlanInput[] = (snapshot.materials ?? []).map((material) => ({
+      task_id: material.task_id,
+      type_id: material.type_id,
+      type_name: material.type_name,
+      required_qty: material.required_qty,
+      available_qty: material.available_qty,
+      buy_qty: material.buy_qty,
+      build_qty: material.build_qty,
+      unit_cost_isk: material.unit_cost_isk,
+      source: material.source,
+    }));
+
+    const blueprints: IndustryBlueprintPoolInput[] = (snapshot.blueprints ?? []).map((bp) => ({
+      blueprint_type_id: bp.blueprint_type_id,
+      blueprint_name: bp.blueprint_name,
+      location_id: bp.location_id,
+      quantity: bp.quantity,
+      me: bp.me,
+      te: bp.te,
+      is_bpo: bp.is_bpo,
+      available_runs: bp.available_runs,
+    }));
+
+    setPlanDraftTasks(tasks);
+    setPlanDraftJobs(jobs);
+    setPlanDraftMaterials(materials);
+    setPlanDraftBlueprints(blueprints);
+  }, []);
+
+  const buildVisualPlanPatch = useCallback((): IndustryPlanPatch => {
+    const tasks = planDraftTasks
+      .filter((task) => (task.name ?? "").trim().length > 0)
+      .map((task) => ({
+        ...task,
+        name: task.name.trim(),
+      }));
+    const jobs = planDraftJobs.filter((job) => (job.activity ?? "").trim().length > 0);
+    const materials = planDraftMaterials.filter((material) => Number(material.type_id) > 0);
+    const blueprints = planDraftBlueprints.filter((bp) => Number(bp.blueprint_type_id) > 0);
+    return {
+      replace: replaceLedgerPlanOnApply,
+      project_status: "planned",
+      tasks,
+      jobs,
+      materials,
+      blueprints,
+    };
+  }, [planDraftTasks, planDraftJobs, planDraftMaterials, planDraftBlueprints, replaceLedgerPlanOnApply]);
+
+  const hasVisualPlanRows = useMemo(
+    () => planDraftTasks.length > 0 || planDraftJobs.length > 0 || planDraftMaterials.length > 0 || planDraftBlueprints.length > 0,
+    [planDraftTasks, planDraftJobs, planDraftMaterials, planDraftBlueprints]
+  );
+
+  const effectivePlanBuilderPageSize = Math.max(1, planBuilderPageSize);
+
+  const planBuilderTotalPages = useMemo(
+    () => ({
+      tasks: Math.max(1, Math.ceil(planDraftTasks.length / effectivePlanBuilderPageSize)),
+      jobs: Math.max(1, Math.ceil(planDraftJobs.length / effectivePlanBuilderPageSize)),
+      materials: Math.max(1, Math.ceil(planDraftMaterials.length / effectivePlanBuilderPageSize)),
+      blueprints: Math.max(1, Math.ceil(planDraftBlueprints.length / effectivePlanBuilderPageSize)),
+    }),
+    [
+      planDraftTasks.length,
+      planDraftJobs.length,
+      planDraftMaterials.length,
+      planDraftBlueprints.length,
+      effectivePlanBuilderPageSize,
+    ]
+  );
+
+  useEffect(() => {
+    setPlanBuilderPage((prev) => ({
+      tasks: Math.min(Math.max(1, prev.tasks || 1), planBuilderTotalPages.tasks),
+      jobs: Math.min(Math.max(1, prev.jobs || 1), planBuilderTotalPages.jobs),
+      materials: Math.min(Math.max(1, prev.materials || 1), planBuilderTotalPages.materials),
+      blueprints: Math.min(Math.max(1, prev.blueprints || 1), planBuilderTotalPages.blueprints),
+    }));
+  }, [planBuilderTotalPages]);
+
+  const taskPageStart = planBuilderCompactMode ? (planBuilderPage.tasks - 1) * effectivePlanBuilderPageSize : 0;
+  const jobPageStart = planBuilderCompactMode ? (planBuilderPage.jobs - 1) * effectivePlanBuilderPageSize : 0;
+  const materialPageStart = planBuilderCompactMode ? (planBuilderPage.materials - 1) * effectivePlanBuilderPageSize : 0;
+  const blueprintPageStart = planBuilderCompactMode ? (planBuilderPage.blueprints - 1) * effectivePlanBuilderPageSize : 0;
+
+  const visiblePlanDraftTasks = useMemo(
+    () => (planBuilderCompactMode
+      ? planDraftTasks.slice(taskPageStart, taskPageStart + effectivePlanBuilderPageSize)
+      : planDraftTasks),
+    [planBuilderCompactMode, planDraftTasks, taskPageStart, effectivePlanBuilderPageSize]
+  );
+
+  const visiblePlanDraftJobs = useMemo(
+    () => (planBuilderCompactMode
+      ? planDraftJobs.slice(jobPageStart, jobPageStart + effectivePlanBuilderPageSize)
+      : planDraftJobs),
+    [planBuilderCompactMode, planDraftJobs, jobPageStart, effectivePlanBuilderPageSize]
+  );
+
+  const visiblePlanDraftMaterials = useMemo(
+    () => (planBuilderCompactMode
+      ? planDraftMaterials.slice(materialPageStart, materialPageStart + effectivePlanBuilderPageSize)
+      : planDraftMaterials),
+    [planBuilderCompactMode, planDraftMaterials, materialPageStart, effectivePlanBuilderPageSize]
+  );
+
+  const visiblePlanDraftBlueprints = useMemo(
+    () => (planBuilderCompactMode
+      ? planDraftBlueprints.slice(blueprintPageStart, blueprintPageStart + effectivePlanBuilderPageSize)
+      : planDraftBlueprints),
+    [planBuilderCompactMode, planDraftBlueprints, blueprintPageStart, effectivePlanBuilderPageSize]
+  );
+
+  const planTaskBlueprintOptions = useMemo(() => (
+    planDraftBlueprints
+      .map((bp, idx) => {
+        const blueprintTypeID = Number(bp.blueprint_type_id) || 0;
+        const blueprintLocationID = Number(bp.location_id) || 0;
+        if (blueprintTypeID <= 0) return null;
+        const meValue = Number(bp.me) || 0;
+        const teValue = Number(bp.te) || 0;
+        const runsValue = Number(bp.available_runs) || 0;
+        const qtyValue = Number(bp.quantity) || 0;
+        const name = (bp.blueprint_name ?? "").trim();
+        const labelName = name || `BP ${blueprintTypeID}`;
+        const label = `${labelName} [${blueprintTypeID}] @${blueprintLocationID || "any"} ${bp.is_bpo ? "BPO" : "BPC"} runs:${runsValue} qty:${qtyValue} ME:${meValue} TE:${teValue}`;
+        return {
+          value: `${idx}:${blueprintTypeID}:${blueprintLocationID}`,
+          label,
+          blueprintTypeID,
+          blueprintLocationID,
+          me: meValue,
+          te: teValue,
+        };
+      })
+      .filter((row): row is {
+        value: string;
+        label: string;
+        blueprintTypeID: number;
+        blueprintLocationID: number;
+        me: number;
+        te: number;
+      } => row !== null)
+  ), [planDraftBlueprints]);
+
+  const planTaskBlueprintOptionByPair = useMemo(() => {
+    const byPair = new Map<string, string>();
+    for (const option of planTaskBlueprintOptions) {
+      const key = `${option.blueprintTypeID}:${option.blueprintLocationID}`;
+      if (!byPair.has(key)) {
+        byPair.set(key, option.value);
+      }
+    }
+    return byPair;
+  }, [planTaskBlueprintOptions]);
+
+  const planTaskBlueprintOptionByType = useMemo(() => {
+    const byType = new Map<number, string>();
+    for (const option of planTaskBlueprintOptions) {
+      if (!byType.has(option.blueprintTypeID)) {
+        byType.set(option.blueprintTypeID, option.value);
+      }
+    }
+    return byType;
+  }, [planTaskBlueprintOptions]);
+
+  const visualTaskBlueprintBindingStats = useMemo(() => {
+    let none = 0;
+    let exact = 0;
+    let fallback = 0;
+    let missing = 0;
+    for (const task of planDraftTasks) {
+      const bpTypeID = taskConstraintNumber(task.constraints, "blueprint_type_id");
+      const bpLocationID = taskConstraintNumber(task.constraints, "blueprint_location_id");
+      if (bpTypeID <= 0) {
+        none++;
+        continue;
+      }
+      if (planTaskBlueprintOptionByPair.has(`${bpTypeID}:${bpLocationID}`)) {
+        exact++;
+        continue;
+      }
+      if (planTaskBlueprintOptionByType.has(bpTypeID)) {
+        fallback++;
+        continue;
+      }
+      missing++;
+    }
+    return {
+      total: planDraftTasks.length,
+      none,
+      exact,
+      fallback,
+      missing,
+    };
+  }, [planDraftTasks, planTaskBlueprintOptionByPair, planTaskBlueprintOptionByType]);
+
+  const strictBlueprintApplyBlocked = useMemo(() => (
+    strictBlueprintBindingMode &&
+    useVisualPlanBuilder &&
+    hasVisualPlanRows &&
+    visualTaskBlueprintBindingStats.missing > 0
+  ), [
+    strictBlueprintBindingMode,
+    useVisualPlanBuilder,
+    hasVisualPlanRows,
+    visualTaskBlueprintBindingStats.missing,
+  ]);
+
+  const plannerWarningSourceLabel = useCallback((source: IndustryPlannerWarningSource): string => {
+    switch (source) {
+      case "preview":
+        return t("industryLedgerWarningSourcePreview");
+      case "apply":
+        return t("industryLedgerWarningSourceApply");
+      case "gate":
+        return t("industryLedgerWarningSourceGate");
+      default:
+        return source;
+    }
+  }, [t]);
+
+  const taskStatusBoard = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const task of ledgerSnapshot?.tasks ?? []) {
+      const key = String(task.status || "planned");
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return counts;
+  }, [ledgerSnapshot]);
+
+  const jobStatusBoard = useMemo(() => {
+    const counts: Record<string, number> = {};
+    if (ledgerSnapshot && ledgerSnapshot.jobs.length > 0) {
+      for (const job of ledgerSnapshot.jobs) {
+        const key = String(job.status || "planned");
+        counts[key] = (counts[key] || 0) + 1;
+      }
+      return counts;
+    }
+    if (ledgerData && ledgerData.entries.length > 0) {
+      for (const row of ledgerData.entries) {
+        const key = String(row.status || "planned");
+        counts[key] = (counts[key] || 0) + 1;
+      }
+      return counts;
+    }
+    if (ledgerData) {
+      counts.planned = ledgerData.planned || 0;
+      counts.active = ledgerData.active || 0;
+      counts.completed = ledgerData.completed || 0;
+      counts.failed = ledgerData.failed || 0;
+      counts.cancelled = ledgerData.cancelled || 0;
+    }
+    return counts;
+  }, [ledgerSnapshot, ledgerData]);
+
+  const taskStatusTotal = useMemo(
+    () => Object.values(taskStatusBoard).reduce((sum, value) => sum + (Number(value) || 0), 0),
+    [taskStatusBoard]
+  );
+  const taskStatusDone = (taskStatusBoard.completed || 0) + (taskStatusBoard.cancelled || 0);
+  const taskStatusDonePct = taskStatusTotal > 0
+    ? Math.round((taskStatusDone / taskStatusTotal) * 100)
+    : 0;
+
+  const jobStatusTotal = useMemo(
+    () => Object.values(jobStatusBoard).reduce((sum, value) => sum + (Number(value) || 0), 0),
+    [jobStatusBoard]
+  );
+  const jobStatusDone = (jobStatusBoard.completed || 0) + (jobStatusBoard.cancelled || 0) + (jobStatusBoard.failed || 0);
+  const jobStatusDonePct = jobStatusTotal > 0
+    ? Math.round((jobStatusDone / jobStatusTotal) * 100)
+    : 0;
+
+  const materialCoverageTotals = useMemo(() => {
+    let required = 0;
+    let stock = 0;
+    let buy = 0;
+    let build = 0;
+    let missing = 0;
+    for (const row of ledgerSnapshot?.material_diff ?? []) {
+      required += Number(row.required_qty) || 0;
+      stock += Number(row.available_qty) || 0;
+      buy += Number(row.buy_qty) || 0;
+      build += Number(row.build_qty) || 0;
+      missing += Number(row.missing_qty) || 0;
+    }
+    return { required, stock, buy, build, missing };
+  }, [ledgerSnapshot]);
+  const activeJobCount = jobStatusBoard.active || 0;
+  const hasPlanSeedSource = Boolean(result && selectedItem);
+
+  const taskDependencyBoard = useMemo<IndustryTaskDependencyBoard>(() => {
+    const tasks = ledgerSnapshot?.tasks ?? [];
+    const byID = new Map<number, typeof tasks[number]>();
+    for (const task of tasks) {
+      byID.set(task.id, task);
+    }
+
+    const childrenByParent = new Map<number, number[]>();
+    const indegreeByID = new Map<number, number>();
+    const durationSecByID = new Map<number, number>();
+    const predecessorByID = new Map<number, number>();
+    const parentByTaskID: Record<number, number> = {};
+    const parentMissingByTaskID: Record<number, boolean> = {};
+    const rows: Array<{
+      child_id: number;
+      child_name: string;
+      child_status: string;
+      parent_id: number;
+      parent_name: string;
+      parent_status: string;
+      parent_missing: boolean;
+    }> = [];
+    const orphanTaskIDs = new Set<number>();
+    let edgeCount = 0;
+    let selfLinkCount = 0;
+
+    for (const task of tasks) {
+      indegreeByID.set(task.id, 0);
+      const startMs = new Date(task.planned_start || "").getTime();
+      const endMs = new Date(task.planned_end || "").getTime();
+      const duration = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+        ? Math.round((endMs - startMs) / 1000)
+        : 0;
+      durationSecByID.set(task.id, duration);
+    }
+
+    for (const task of tasks) {
+      const parentID = Number(task.parent_task_id) || 0;
+      if (parentID <= 0) {
+        continue;
+      }
+      if (parentID === task.id) {
+        selfLinkCount++;
+        rows.push({
+          child_id: task.id,
+          child_name: task.name || `Task ${task.id}`,
+          child_status: task.status || "planned",
+          parent_id: parentID,
+          parent_name: "self",
+          parent_status: task.status || "planned",
+          parent_missing: true,
+        });
+        parentByTaskID[task.id] = parentID;
+        parentMissingByTaskID[task.id] = true;
+        continue;
+      }
+      const parent = byID.get(parentID);
+      if (!parent) {
+        orphanTaskIDs.add(task.id);
+        rows.push({
+          child_id: task.id,
+          child_name: task.name || `Task ${task.id}`,
+          child_status: task.status || "planned",
+          parent_id: parentID,
+          parent_name: `Missing ${parentID}`,
+          parent_status: "missing",
+          parent_missing: true,
+        });
+        parentByTaskID[task.id] = parentID;
+        parentMissingByTaskID[task.id] = true;
+        continue;
+      }
+      const children = childrenByParent.get(parentID) ?? [];
+      children.push(task.id);
+      childrenByParent.set(parentID, children);
+      indegreeByID.set(task.id, (indegreeByID.get(task.id) || 0) + 1);
+      edgeCount++;
+      parentByTaskID[task.id] = parentID;
+      rows.push({
+        child_id: task.id,
+        child_name: task.name || `Task ${task.id}`,
+        child_status: task.status || "planned",
+        parent_id: parent.id,
+        parent_name: parent.name || `Task ${parent.id}`,
+        parent_status: parent.status || "planned",
+        parent_missing: false,
+      });
+    }
+
+    const rootCount = tasks.filter((task) => (indegreeByID.get(task.id) || 0) === 0).length;
+    const leafCount = tasks.filter((task) => !(childrenByParent.get(task.id)?.length)).length;
+
+    const indegreeWorking = new Map(indegreeByID);
+    const queue: number[] = [];
+    const depthByID = new Map<number, number>();
+    const pathSecByID = new Map<number, number>();
+    for (const task of tasks) {
+      if ((indegreeWorking.get(task.id) || 0) === 0) {
+        queue.push(task.id);
+        depthByID.set(task.id, 1);
+        pathSecByID.set(task.id, durationSecByID.get(task.id) || 0);
+      }
+    }
+    let processed = 0;
+    while (queue.length > 0) {
+      const currentID = queue.shift() || 0;
+      if (!currentID) continue;
+      processed++;
+      const currentDepth = depthByID.get(currentID) || 1;
+      const currentPathSec = pathSecByID.get(currentID) || (durationSecByID.get(currentID) || 0);
+      const children = childrenByParent.get(currentID) ?? [];
+      for (const childID of children) {
+        const nextDepth = Math.max(depthByID.get(childID) || 1, currentDepth + 1);
+        depthByID.set(childID, nextDepth);
+        const childDuration = durationSecByID.get(childID) || 0;
+        const existingPath = pathSecByID.get(childID) || childDuration;
+        const candidatePath = currentPathSec + childDuration;
+        if (candidatePath > existingPath || (candidatePath === existingPath && !predecessorByID.has(childID))) {
+          pathSecByID.set(childID, candidatePath);
+          predecessorByID.set(childID, currentID);
+        }
+        const nextIn = (indegreeWorking.get(childID) || 0) - 1;
+        indegreeWorking.set(childID, nextIn);
+        if (nextIn === 0) {
+          queue.push(childID);
+        }
+      }
+    }
+
+    const maxDepth = depthByID.size > 0
+      ? Math.max(...Array.from(depthByID.values()))
+      : 0;
+    const criticalPathSec = pathSecByID.size > 0
+      ? Math.max(...Array.from(pathSecByID.values()))
+      : 0;
+    let criticalEndTaskID = 0;
+    for (const [taskID, pathSec] of pathSecByID.entries()) {
+      if (pathSec === criticalPathSec) {
+        criticalEndTaskID = taskID;
+      }
+    }
+    const criticalTaskIDSet = new Set<number>();
+    let walkID = criticalEndTaskID;
+    while (walkID > 0 && !criticalTaskIDSet.has(walkID)) {
+      criticalTaskIDSet.add(walkID);
+      walkID = predecessorByID.get(walkID) || 0;
+    }
+    const cycleCount = Math.max(0, tasks.length - processed);
+
+    rows.sort((a, b) => {
+      if (a.parent_missing !== b.parent_missing) return a.parent_missing ? -1 : 1;
+      return a.child_id - b.child_id;
+    });
+
+    return {
+      total_tasks: tasks.length,
+      total_edges: edgeCount,
+      roots: rootCount,
+      leaves: leafCount,
+      max_depth: maxDepth,
+      critical_path_sec: criticalPathSec,
+      orphans: orphanTaskIDs.size,
+      cycles: cycleCount,
+      self_links: selfLinkCount,
+      depth_by_task: Object.fromEntries(depthByID.entries()) as Record<number, number>,
+      parent_by_task: parentByTaskID,
+      parent_missing_by_task: parentMissingByTaskID,
+      critical_task_ids: criticalTaskIDSet,
+      rows,
+    };
+  }, [ledgerSnapshot]);
+
+  const togglePlanBuilderSection = useCallback((section: PlanBuilderSection) => {
+    setPlanBuilderCollapsed((prev) => ({ ...prev, [section]: !prev[section] }));
+  }, []);
+
+  const changePlanBuilderPage = useCallback((section: PlanBuilderSection, nextPage: number) => {
+    setPlanBuilderPage((prev) => ({ ...prev, [section]: Math.max(1, nextPage) }));
+  }, []);
+
+  const handleGeneratePlanDraft = useCallback(() => {
+    const patch = buildAutoPlanPatch();
+    if (!patch) {
+      addToast(t("industryLedgerRunAnalysisFirst"), "warning", 2200);
+      return;
+    }
+    seedVisualPlanBuilderFromPatch(patch);
+    setUseVisualPlanBuilder(true);
+    setLastLedgerPlanPreview(null);
+    setLastLedgerPlanPreviewPatch(null);
+    addToast(t("industryLedgerBuilderSeeded"), "success", 1600);
+  }, [buildAutoPlanPatch, seedVisualPlanBuilderFromPatch, addToast, t]);
+
+  const buildLedgerPlanPatchToSend = useCallback((): IndustryPlanPatch | null => {
+    let patch: IndustryPlanPatch | null = null;
+    if (useVisualPlanBuilder && hasVisualPlanRows) {
+      patch = buildVisualPlanPatch();
+    } else {
+      patch = buildAutoPlanPatch();
+    }
+    if (!patch) {
+      return null;
+    }
+    const schedulerPatch: IndustryPlanSchedulerInput = {
+      enabled: enablePlanScheduler,
+      slot_count: Math.max(1, schedulerSlotCount),
+      max_job_runs: Math.max(1, schedulerMaxRunsPerJob),
+      max_job_duration_seconds: Math.max(1, Math.round(schedulerMaxDurationHours * 3600)),
+      window_days: 30,
+      queue_status: schedulerQueueStatus,
+    };
+    return {
+      replace: patch.replace ?? replaceLedgerPlanOnApply,
+      project_status: patch.project_status ?? "planned",
+      tasks: Array.isArray(patch.tasks) ? patch.tasks : [],
+      jobs: Array.isArray(patch.jobs) ? patch.jobs : [],
+      materials: Array.isArray(patch.materials) ? patch.materials : [],
+      blueprints: Array.isArray(patch.blueprints) ? patch.blueprints : [],
+      scheduler: schedulerPatch,
+    };
+  }, [
+    useVisualPlanBuilder,
+    hasVisualPlanRows,
+    buildVisualPlanPatch,
+    buildAutoPlanPatch,
+    enablePlanScheduler,
+    schedulerSlotCount,
+    schedulerMaxRunsPerJob,
+    schedulerMaxDurationHours,
+    schedulerQueueStatus,
+    replaceLedgerPlanOnApply,
+  ]);
+
+  const currentLedgerPlanPatchSignature = useMemo(() => {
+    const patch = buildLedgerPlanPatchToSend();
+    return planPatchSignature(patch);
+  }, [buildLedgerPlanPatchToSend]);
+
+  const lastLedgerPreviewPatchSignature = useMemo(
+    () => planPatchSignature(lastLedgerPlanPreviewPatch),
+    [lastLedgerPlanPreviewPatch]
+  );
+
+  const isLastLedgerPreviewStale = useMemo(() => (
+    Boolean(
+      lastLedgerPlanPreview &&
+      lastLedgerPreviewPatchSignature &&
+      currentLedgerPlanPatchSignature &&
+      lastLedgerPreviewPatchSignature !== currentLedgerPlanPatchSignature
+    )
+  ), [
+    lastLedgerPlanPreview,
+    lastLedgerPreviewPatchSignature,
+    currentLedgerPlanPatchSignature,
+  ]);
+
+  const visibleLedgerTaskIDs = useMemo(
+    () => (ledgerSnapshot?.tasks ?? []).map((task) => task.id),
+    [ledgerSnapshot]
+  );
+
+  const selectedLedgerTaskIDSet = useMemo(
+    () => new Set(selectedLedgerTaskIDs),
+    [selectedLedgerTaskIDs]
+  );
+
+  const allVisibleLedgerTasksSelected = useMemo(() => (
+    visibleLedgerTaskIDs.length > 0 &&
+    visibleLedgerTaskIDs.every((taskID) => selectedLedgerTaskIDSet.has(taskID))
+  ), [visibleLedgerTaskIDs, selectedLedgerTaskIDSet]);
+
+  const handleSelectAllVisibleLedgerTasks = useCallback((selected: boolean) => {
+    if (!selected) {
+      setSelectedLedgerTaskIDs([]);
+      return;
+    }
+    setSelectedLedgerTaskIDs(visibleLedgerTaskIDs);
+  }, [visibleLedgerTaskIDs]);
+
+  const visibleLedgerJobIDs = useMemo(
+    () => (ledgerData?.entries ?? []).map((entry) => entry.job_id),
+    [ledgerData]
+  );
+
+  const selectedLedgerJobIDSet = useMemo(
+    () => new Set(selectedLedgerJobIDs),
+    [selectedLedgerJobIDs]
+  );
+
+  const allVisibleLedgerJobsSelected = useMemo(() => (
+    visibleLedgerJobIDs.length > 0 &&
+    visibleLedgerJobIDs.every((jobID) => selectedLedgerJobIDSet.has(jobID))
+  ), [visibleLedgerJobIDs, selectedLedgerJobIDSet]);
+
+  const handleSelectAllVisibleLedgerJobs = useCallback((selected: boolean) => {
+    if (!selected) {
+      setSelectedLedgerJobIDs([]);
+      return;
+    }
+    setSelectedLedgerJobIDs(visibleLedgerJobIDs);
+  }, [visibleLedgerJobIDs]);
+
+  const handleLoadLedgerSnapshotToBuilder = useCallback(() => {
+    if (!ledgerSnapshot) {
+      addToast(t("industryLedgerNoSnapshot"), "warning", 2000);
+      return;
+    }
+    seedVisualPlanBuilderFromSnapshot(ledgerSnapshot);
+    setUseVisualPlanBuilder(true);
+    setLastLedgerPlanPreview(null);
+    setLastLedgerPlanPreviewPatch(null);
+    addToast(t("industryLedgerSnapshotLoaded"), "success", 1800);
+  }, [ledgerSnapshot, seedVisualPlanBuilderFromSnapshot, addToast, t]);
+
+  const handlePreviewCurrentAnalysisToLedgerPlan = useCallback(async () => {
+    if (!isLoggedIn) return;
+    if (selectedLedgerProjectId <= 0) {
+      addToast(t("industryLedgerSelectProjectFirst"), "warning", 2000);
+      return;
+    }
+    const patchToSend = buildLedgerPlanPatchToSend();
+    if (!patchToSend) {
+      addToast(t("industryLedgerRunAnalysisFirst"), "warning", 2200);
+      return;
+    }
+    setPreviewingLedgerPlan(true);
+    try {
+      const preview = await previewAuthIndustryProjectPlan(selectedLedgerProjectId, patchToSend);
+      setLastLedgerPlanPreview(preview);
+      setLastLedgerPlanPreviewPatch(patchToSend);
+      const s = preview.summary;
+      const schedulerBit = s.scheduler_applied
+        ? ` split:${s.jobs_split_from ?? 0}->${s.jobs_planned_total ?? s.jobs_inserted}`
+        : "";
+      addToast(`${t("industryLedgerPreviewReady")}: tasks:${s.tasks_inserted} jobs:${s.jobs_inserted}${schedulerBit}`, "success", 2000);
+      const previewWarnings = [
+        ...(Array.isArray(preview.warnings) ? preview.warnings : []),
+        ...(Array.isArray(s.warnings) ? s.warnings : []),
+      ];
+      if (previewWarnings.length > 0) {
+        pushPlannerWarnings("preview", previewWarnings);
+        addToast(previewWarnings.slice(0, 2).join(" | "), "warning", 3600);
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to preview plan";
+      onError?.(msg);
+      addToast(msg, "error", 2600);
+    } finally {
+      setPreviewingLedgerPlan(false);
+    }
+  }, [
+    isLoggedIn,
+    selectedLedgerProjectId,
+    buildLedgerPlanPatchToSend,
+    addToast,
+    onError,
+    pushPlannerWarnings,
+    t,
+  ]);
+
+  const handleApplyCurrentAnalysisToLedgerPlan = useCallback(async (bypassStrictGate = false) => {
+    if (!isLoggedIn) return;
+    if (selectedLedgerProjectId <= 0) {
+      addToast(t("industryLedgerSelectProjectFirst"), "warning", 2000);
+      return;
+    }
+
+    const patchToSend = buildLedgerPlanPatchToSend();
+    if (!patchToSend) {
+      addToast(t("industryLedgerRunAnalysisFirst"), "warning", 2200);
+      return;
+    }
+    if (strictBlueprintApplyBlocked && !bypassStrictGate) {
+      const strictGateMessage = "Strict BP gate: fix missing bindings before Apply";
+      pushPlannerWarnings("gate", strictGateMessage);
+      addToast(strictGateMessage, "warning", 2600);
+      return;
+    }
+
+    const patchForApply: IndustryPlanPatch = bypassStrictGate
+      ? { ...patchToSend, strict_bp_bypass: true }
+      : patchToSend;
+
+    setApplyingLedgerPlan(true);
+    try {
+      if (bypassStrictGate) {
+        pushPlannerWarnings("gate", "Strict BP gate bypass requested for Apply Current");
+      }
+      const resp = await planAuthIndustryProject(selectedLedgerProjectId, patchForApply);
+      const summary = resp.summary;
+      const schedulerBit = summary.scheduler_applied
+        ? ` split:${summary.jobs_split_from ?? 0}->${summary.jobs_planned_total ?? summary.jobs_inserted}`
+        : "";
+      const summaryText = `tasks:${summary.tasks_inserted} jobs:${summary.jobs_inserted} mats:${summary.materials_upserted} bp:${summary.blueprints_upserted}${schedulerBit}`;
+      setLastLedgerPlanSummary(summaryText);
+      if (Array.isArray(summary.warnings) && summary.warnings.length > 0) {
+        pushPlannerWarnings("apply", summary.warnings);
+        addToast(summary.warnings.slice(0, 2).join(" | "), "warning", 3600);
+      }
+      setLastLedgerPlanPreview(null);
+      setLastLedgerPlanPreviewPatch(null);
+      addToast(t("industryLedgerPlanApplied"), "success", 1800);
+      await refreshLedger(selectedLedgerProjectId);
+      await refreshLedgerProjects(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to apply plan";
+      onError?.(msg);
+      addToast(msg, "error", 2600);
+    } finally {
+      setApplyingLedgerPlan(false);
+    }
+  }, [
+    isLoggedIn,
+    selectedLedgerProjectId,
+    buildLedgerPlanPatchToSend,
+    addToast,
+    onError,
+    refreshLedger,
+    refreshLedgerProjects,
+    pushPlannerWarnings,
+    strictBlueprintApplyBlocked,
+    t,
+  ]);
+
+  const handleApplyLastPreviewToLedgerPlan = useCallback(async (bypassStrictGate = false) => {
+    if (!isLoggedIn) return;
+    if (selectedLedgerProjectId <= 0) {
+      addToast(t("industryLedgerSelectProjectFirst"), "warning", 2000);
+      return;
+    }
+    if (!lastLedgerPlanPreviewPatch) {
+      addToast(t("industryLedgerRunPreviewFirst"), "warning", 2000);
+      return;
+    }
+    if (strictBlueprintApplyBlocked && !bypassStrictGate) {
+      const strictGateMessage = "Strict BP gate: fix missing bindings before Apply";
+      pushPlannerWarnings("gate", strictGateMessage);
+      addToast(strictGateMessage, "warning", 2600);
+      return;
+    }
+
+    const patchForApply: IndustryPlanPatch = bypassStrictGate
+      ? { ...lastLedgerPlanPreviewPatch, strict_bp_bypass: true }
+      : lastLedgerPlanPreviewPatch;
+
+    setApplyingLedgerPlan(true);
+    try {
+      if (bypassStrictGate) {
+        pushPlannerWarnings("gate", "Strict BP gate bypass requested for Apply Preview");
+      }
+      const resp = await planAuthIndustryProject(selectedLedgerProjectId, patchForApply);
+      const summary = resp.summary;
+      const schedulerBit = summary.scheduler_applied
+        ? ` split:${summary.jobs_split_from ?? 0}->${summary.jobs_planned_total ?? summary.jobs_inserted}`
+        : "";
+      const summaryText = `tasks:${summary.tasks_inserted} jobs:${summary.jobs_inserted} mats:${summary.materials_upserted} bp:${summary.blueprints_upserted}${schedulerBit}`;
+      setLastLedgerPlanSummary(summaryText);
+      if (Array.isArray(summary.warnings) && summary.warnings.length > 0) {
+        pushPlannerWarnings("apply", summary.warnings);
+        addToast(summary.warnings.slice(0, 2).join(" | "), "warning", 3600);
+      }
+      setLastLedgerPlanPreview(null);
+      setLastLedgerPlanPreviewPatch(null);
+      addToast(t("industryLedgerPreviewApplied"), "success", 1800);
+      await refreshLedger(selectedLedgerProjectId);
+      await refreshLedgerProjects(selectedLedgerProjectId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to apply preview";
+      onError?.(msg);
+      addToast(msg, "error", 2600);
+    } finally {
+      setApplyingLedgerPlan(false);
+    }
+  }, [
+    isLoggedIn,
+    selectedLedgerProjectId,
+    lastLedgerPlanPreviewPatch,
+    addToast,
+    onError,
+    refreshLedger,
+    refreshLedgerProjects,
+    pushPlannerWarnings,
+    strictBlueprintApplyBlocked,
+    t,
+  ]);
+
+  const addVisualTaskRow = useCallback(() => {
+    const topBlueprintTypeID = result?.material_tree?.blueprint?.blueprint_type_id ?? 0;
+    setPlanDraftTasks((prev) => [
+      ...prev,
+      {
+        name: selectedItem ? `Build ${selectedItem.type_name}` : "New task",
+        activity: "manufacturing",
+        product_type_id: selectedItem?.type_id ?? 0,
+        target_runs: runs,
+        priority: 100,
+        status: "planned",
+        constraints: {
+          me,
+          te,
+          station_id: selectedStationId || 0,
+          blueprint_type_id: topBlueprintTypeID || 0,
+          blueprint_location_id: selectedStationId || 0,
+        },
+      },
+    ]);
+  }, [selectedItem, runs, result, me, te, selectedStationId]);
+
+  const addVisualJobRow = useCallback(() => {
+    setPlanDraftJobs((prev) => [
+      ...prev,
+      {
+        activity: "manufacturing",
+        runs,
+        duration_seconds: result?.manufacturing_time ?? 0,
+        cost_isk: result?.total_job_cost ?? 0,
+        status: "planned",
+        notes: "",
+      },
+    ]);
+  }, [runs, result]);
+
+  const addVisualMaterialRow = useCallback(() => {
+    setPlanDraftMaterials((prev) => [
+      ...prev,
+      {
+        type_id: 0,
+        type_name: "",
+        required_qty: 0,
+        available_qty: 0,
+        buy_qty: 0,
+        build_qty: 0,
+        unit_cost_isk: 0,
+        source: "market",
+      },
+    ]);
+  }, []);
+
+  const addVisualBlueprintRow = useCallback(() => {
+    setPlanDraftBlueprints((prev) => [
+      ...prev,
+      {
+        blueprint_type_id: 0,
+        blueprint_name: "",
+        location_id: selectedStationId || 0,
+        quantity: 1,
+        me,
+        te,
+        is_bpo: ownBlueprint,
+        available_runs: 0,
+      },
+    ]);
+  }, [selectedStationId, me, te, ownBlueprint]);
+
+  const updateVisualTaskRow = useCallback((index: number, next: Partial<IndustryTaskPlanInput>) => {
+    setPlanDraftTasks((prev) => prev.map((row, i) => (i === index ? { ...row, ...next } : row)));
+  }, []);
+
+  const updateVisualTaskConstraints = useCallback((index: number, patch: Record<string, number>) => {
+    setPlanDraftTasks((prev) =>
+      prev.map((row, i) => {
+        if (i !== index) return row;
+        const constraints = taskConstraintRecord(row.constraints);
+        for (const [key, value] of Object.entries(patch)) {
+          constraints[key] = Number.isFinite(value) ? value : 0;
+        }
+        return { ...row, constraints };
+      })
+    );
+  }, []);
+
+  const updateVisualTaskConstraint = useCallback((index: number, key: string, value: number) => {
+    const normalized = Number.isFinite(value) ? value : 0;
+    updateVisualTaskConstraints(index, { [key]: normalized });
+  }, [updateVisualTaskConstraints]);
+
+  const autoFixVisualTaskBlueprintBindings = useCallback(() => {
+    if (planDraftTasks.length === 0) {
+      addToast("No task rows to fix", "warning", 1800);
+      return;
+    }
+    if (planTaskBlueprintOptions.length === 0) {
+      addToast("Add blueprint pool rows first", "warning", 2200);
+      return;
+    }
+
+    const optionsByType = new Map<number, typeof planTaskBlueprintOptions>();
+    for (const option of planTaskBlueprintOptions) {
+      const current = optionsByType.get(option.blueprintTypeID) ?? [];
+      current.push(option);
+      optionsByType.set(option.blueprintTypeID, current);
+    }
+
+    let fixed = 0;
+    let unresolved = 0;
+    const nextTasks = planDraftTasks.map((task) => {
+      const bpTypeID = taskConstraintNumber(task.constraints, "blueprint_type_id");
+      if (bpTypeID <= 0) {
+        return task;
+      }
+      const candidates = optionsByType.get(bpTypeID) ?? [];
+      if (candidates.length === 0) {
+        unresolved++;
+        return task;
+      }
+
+      const bpLocationID = taskConstraintNumber(task.constraints, "blueprint_location_id");
+      const stationID = taskConstraintNumber(task.constraints, "station_id");
+
+      const hasExact = candidates.some((option) => option.blueprintLocationID === bpLocationID);
+      if (hasExact) {
+        return task;
+      }
+
+      const selected =
+        (stationID > 0 ? candidates.find((option) => option.blueprintLocationID === stationID) : undefined) ??
+        (bpLocationID > 0 ? candidates.find((option) => option.blueprintLocationID === bpLocationID) : undefined) ??
+        candidates.find((option) => option.blueprintLocationID === 0) ??
+        candidates[0];
+
+      if (!selected) {
+        unresolved++;
+        return task;
+      }
+
+      const constraints = taskConstraintRecord(task.constraints);
+      constraints.blueprint_type_id = selected.blueprintTypeID;
+      constraints.blueprint_location_id = selected.blueprintLocationID;
+      constraints.me = selected.me;
+      constraints.te = selected.te;
+      if ((!constraints.station_id || Number(constraints.station_id) <= 0) && selected.blueprintLocationID > 0) {
+        constraints.station_id = selected.blueprintLocationID;
+      }
+      fixed++;
+      return {
+        ...task,
+        constraints,
+      };
+    });
+
+    if (fixed > 0) {
+      setPlanDraftTasks(nextTasks);
+    }
+
+    if (fixed > 0 && unresolved > 0) {
+      addToast(`BP bindings fixed: ${fixed}, unresolved: ${unresolved}`, "warning", 3000);
+      return;
+    }
+    if (fixed > 0) {
+      addToast(`BP bindings fixed: ${fixed}`, "success", 2200);
+      return;
+    }
+    if (unresolved > 0) {
+      addToast(`No matching pool rows for ${unresolved} bindings`, "warning", 2600);
+      return;
+    }
+    addToast("BP bindings are already aligned", "success", 1800);
+  }, [planDraftTasks, planTaskBlueprintOptions, addToast]);
+
+  const updateVisualJobRow = useCallback((index: number, next: Partial<IndustryJobPlanInput>) => {
+    setPlanDraftJobs((prev) => prev.map((row, i) => (i === index ? { ...row, ...next } : row)));
+  }, []);
+
+  const updateVisualMaterialRow = useCallback((index: number, next: Partial<IndustryMaterialPlanInput>) => {
+    setPlanDraftMaterials((prev) => prev.map((row, i) => (i === index ? { ...row, ...next } : row)));
+  }, []);
+
+  const updateVisualBlueprintRow = useCallback((index: number, next: Partial<IndustryBlueprintPoolInput>) => {
+    setPlanDraftBlueprints((prev) =>
+      prev.map((row, i) => {
+        if (i !== index) return row;
+        const merged: IndustryBlueprintPoolInput = { ...row, ...next };
+        if (merged.is_bpo) {
+          merged.available_runs = 0;
+        } else if ((merged.available_runs ?? 0) < 0) {
+          merged.available_runs = 0;
+        }
+        return merged;
+      })
+    );
+  }, []);
+
+  const removeVisualTaskRow = useCallback((index: number) => {
+    setPlanDraftTasks((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const removeVisualJobRow = useCallback((index: number) => {
+    setPlanDraftJobs((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const removeVisualMaterialRow = useCallback((index: number) => {
+    setPlanDraftMaterials((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const removeVisualBlueprintRow = useCallback((index: number) => {
+    setPlanDraftBlueprints((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const clearVisualPlanBuilder = useCallback(() => {
+    setPlanDraftTasks([]);
+    setPlanDraftJobs([]);
+    setPlanDraftMaterials([]);
+    setPlanDraftBlueprints([]);
+  }, []);
+
   // Search handler with debounce
   const handleSearch = useCallback((query: string) => {
     setSearchQuery(query);
@@ -167,28 +1924,40 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
     // Clear previous selection when user types new query
     setSelectedItem(null);
     clearTimeout(searchTimeoutRef.current);
+    searchAbortRef.current?.abort();
+    searchRequestSeqRef.current += 1;
+    const reqSeq = searchRequestSeqRef.current;
 
     if (!query.trim()) {
       setSearchResults([]);
       setShowDropdown(false);
+      setSearching(false);
       return;
     }
 
     searchTimeoutRef.current = setTimeout(async () => {
+      if (reqSeq !== searchRequestSeqRef.current) return;
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
       setSearching(true);
       try {
-        const results = await searchBuildableItems(query, 30);
+        const results = await searchBuildableItems(query, 30, controller.signal);
+        if (reqSeq !== searchRequestSeqRef.current) return;
         // Ensure we always have an array (API might return null)
         const safeResults = results ?? [];
         setSearchResults(safeResults);
         setShowDropdown(safeResults.length > 0);
         setHighlightedIndex(safeResults.length > 0 ? 0 : -1);
       } catch (e) {
+        if (reqSeq !== searchRequestSeqRef.current) return;
+        if (e instanceof Error && e.name === "AbortError") return;
         console.error("Search error:", e);
         setSearchResults([]);
         setShowDropdown(false);
       } finally {
-        setSearching(false);
+        if (reqSeq === searchRequestSeqRef.current) {
+          setSearching(false);
+        }
       }
     }, 200); // Faster debounce for better UX
   }, []);
@@ -269,7 +2038,9 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
       setResult(analysis);
       setProgress("");
     } catch (e: unknown) {
-      if (e instanceof Error && e.name !== "AbortError") {
+      if (e instanceof Error && e.name === "AbortError") {
+        setProgress("");
+      } else if (e instanceof Error) {
         setProgress(t("errorPrefix") + e.message);
         onError?.(e.message);
       }
@@ -278,8 +2049,220 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
     }
   }, [analyzing, selectedItem, runs, me, te, systemName, selectedStationId, facilityTax, structureBonus, brokerFee, salesTaxPercent, ownBlueprint, blueprintCost, blueprintIsBPO, t, onError]);
 
+  const clearPlanPreview = useCallback(() => {
+    setLastLedgerPlanPreview(null);
+    setLastLedgerPlanPreviewPatch(null);
+  }, []);
+
+  const operationsBoardsProps = useMemo(() => ({
+    ctx: {
+      jobsWorkspaceTab,
+      ledgerSnapshot,
+      rebalanceInventoryScope,
+      setRebalanceInventoryScope,
+      rebalanceLookbackDays,
+      setRebalanceLookbackDays,
+      rebalanceStrategy,
+      setRebalanceStrategy,
+      rebalanceWarehouseScope,
+      setRebalanceWarehouseScope,
+      blueprintSyncDefaultBPCRuns,
+      setBlueprintSyncDefaultBPCRuns,
+      syncingLedgerBlueprintPool,
+      handleSyncLedgerBlueprintPoolFromAssets,
+      rebalanceUseSelectedStation,
+      setRebalanceUseSelectedStation,
+      handleRebalanceLedgerMaterialsFromInventory,
+      rebalancingLedgerMaterials,
+      selectedLedgerTaskIDs,
+      bulkLedgerTaskPriority,
+      setBulkLedgerTaskPriority,
+      handleBulkSetLedgerTaskPriority,
+      updatingLedgerTasksBulk,
+      handleBulkSetLedgerTaskStatus,
+      setSelectedLedgerTaskIDs,
+      allVisibleLedgerTasksSelected,
+      handleSelectAllVisibleLedgerTasks,
+      selectedLedgerTaskIDSet,
+      toggleLedgerTaskSelection,
+      industryTaskStatusClass,
+      formatUtcShort,
+      handleSetLedgerTaskPriority,
+      updatingLedgerTaskId,
+      handleSetLedgerTaskStatus,
+      taskDependencyBoard,
+    },
+  }), [
+    jobsWorkspaceTab,
+    ledgerSnapshot,
+    rebalanceInventoryScope,
+    rebalanceLookbackDays,
+    rebalanceStrategy,
+    rebalanceWarehouseScope,
+    blueprintSyncDefaultBPCRuns,
+    syncingLedgerBlueprintPool,
+    handleSyncLedgerBlueprintPoolFromAssets,
+    rebalanceUseSelectedStation,
+    handleRebalanceLedgerMaterialsFromInventory,
+    rebalancingLedgerMaterials,
+    selectedLedgerTaskIDs,
+    bulkLedgerTaskPriority,
+    handleBulkSetLedgerTaskPriority,
+    updatingLedgerTasksBulk,
+    handleBulkSetLedgerTaskStatus,
+    allVisibleLedgerTasksSelected,
+    handleSelectAllVisibleLedgerTasks,
+    selectedLedgerTaskIDSet,
+    toggleLedgerTaskSelection,
+    handleSetLedgerTaskPriority,
+    updatingLedgerTaskId,
+    handleSetLedgerTaskStatus,
+    taskDependencyBoard,
+  ]);
+
+  const plannerBuilderProps = useMemo(() => ({
+    ctx: {
+      jobsWorkspaceTab,
+      useVisualPlanBuilder,
+      planBuilderCompactMode,
+      setPlanBuilderCompactMode,
+      planBuilderPageSize,
+      setPlanBuilderPageSize,
+      togglePlanBuilderSection,
+      planBuilderCollapsed,
+      planDraftTasks,
+      visualTaskBlueprintBindingStats,
+      visiblePlanDraftTasks,
+      taskPageStart,
+      taskConstraintNumber,
+      planTaskBlueprintOptionByPair,
+      planTaskBlueprintOptionByType,
+      planTaskBlueprintOptions,
+      updateVisualTaskRow,
+      removeVisualTaskRow,
+      updateVisualTaskConstraints,
+      updateVisualTaskConstraint,
+      planBuilderPage,
+      changePlanBuilderPage,
+      planBuilderTotalPages,
+      planDraftJobs,
+      visiblePlanDraftJobs,
+      jobPageStart,
+      updateVisualJobRow,
+      removeVisualJobRow,
+      planDraftMaterials,
+      visiblePlanDraftMaterials,
+      materialPageStart,
+      updateVisualMaterialRow,
+      removeVisualMaterialRow,
+      planDraftBlueprints,
+      visiblePlanDraftBlueprints,
+      blueprintPageStart,
+      updateVisualBlueprintRow,
+      removeVisualBlueprintRow,
+    },
+  }), [
+    jobsWorkspaceTab,
+    useVisualPlanBuilder,
+    planBuilderCompactMode,
+    planBuilderPageSize,
+    togglePlanBuilderSection,
+    planBuilderCollapsed,
+    planDraftTasks,
+    visualTaskBlueprintBindingStats,
+    visiblePlanDraftTasks,
+    taskPageStart,
+    taskConstraintNumber,
+    planTaskBlueprintOptionByPair,
+    planTaskBlueprintOptionByType,
+    planTaskBlueprintOptions,
+    updateVisualTaskRow,
+    removeVisualTaskRow,
+    updateVisualTaskConstraints,
+    updateVisualTaskConstraint,
+    planBuilderPage,
+    changePlanBuilderPage,
+    planBuilderTotalPages,
+    planDraftJobs,
+    visiblePlanDraftJobs,
+    jobPageStart,
+    updateVisualJobRow,
+    removeVisualJobRow,
+    planDraftMaterials,
+    visiblePlanDraftMaterials,
+    materialPageStart,
+    updateVisualMaterialRow,
+    removeVisualMaterialRow,
+    planDraftBlueprints,
+    visiblePlanDraftBlueprints,
+    blueprintPageStart,
+    updateVisualBlueprintRow,
+    removeVisualBlueprintRow,
+  ]);
+
+  const operationsJobsProps = useMemo(() => ({
+    ctx: {
+      jobsWorkspaceTab,
+      ledgerData,
+      formatISK,
+      industryJobStatusClass,
+      formatUtcShort,
+      selectedLedgerJobIDs,
+      updatingLedgerJobsBulk,
+      handleBulkSetLedgerJobStatus,
+      setSelectedLedgerJobIDs,
+      allVisibleLedgerJobsSelected,
+      handleSelectAllVisibleLedgerJobs,
+      selectedLedgerJobIDSet,
+      toggleLedgerJobSelection,
+      handleSetLedgerJobStatus,
+      updatingLedgerJobId,
+    },
+  }), [
+    jobsWorkspaceTab,
+    ledgerData,
+    selectedLedgerJobIDs,
+    updatingLedgerJobsBulk,
+    handleBulkSetLedgerJobStatus,
+    allVisibleLedgerJobsSelected,
+    handleSelectAllVisibleLedgerJobs,
+    selectedLedgerJobIDSet,
+    toggleLedgerJobSelection,
+    handleSetLedgerJobStatus,
+    updatingLedgerJobId,
+  ]);
+
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div className={`flex-1 flex flex-col min-h-0 ${industryInnerTab === "jobs" ? "overflow-y-auto eve-scrollbar" : ""}`}>
+      <div className="shrink-0 m-2 mb-0">
+        <div className="inline-flex rounded-sm border border-eve-border overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setIndustryInnerTab("analysis")}
+            className={`px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition-colors ${
+              industryInnerTab === "analysis"
+                ? "bg-eve-accent/20 text-eve-accent"
+                : "bg-eve-panel text-eve-dim hover:text-eve-text"
+            }`}
+          >
+            Analysis
+          </button>
+          <button
+            type="button"
+            onClick={() => setIndustryInnerTab("jobs")}
+            className={`px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition-colors ${
+              industryInnerTab === "jobs"
+                ? "bg-eve-accent/20 text-eve-accent"
+                : "bg-eve-panel text-eve-dim hover:text-eve-text"
+            }`}
+          >
+            Jobs
+          </button>
+        </div>
+      </div>
+
+      {industryInnerTab === "analysis" && (
+      <>
       {/* Settings Panel */}
       <div className="shrink-0 m-2">
         <TabSettingsPanel
@@ -504,144 +2487,153 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
           </div>
         </TabSettingsPanel>
       </div>
+      </>
+      )}
+
+      {/* Industry Ledger Panel (M1 foundation) */}
+      {industryInnerTab === "jobs" && (
+        <Suspense fallback={<div className="m-2 text-xs text-eve-dim">Loading jobs workspace...</div>}>
+          <IndustryJobsLedgerPanel
+            isLoggedIn={isLoggedIn}
+            ledgerProjectsLoading={ledgerProjectsLoading}
+            jobsWorkspaceTab={jobsWorkspaceTab}
+            setJobsWorkspaceTab={setJobsWorkspaceTab}
+            warningsCount={plannerWarnings.length}
+            missingBindings={visualTaskBlueprintBindingStats.missing}
+            activeJobs={activeJobCount}
+            projectHeaderProps={{
+              newLedgerProjectName,
+              setNewLedgerProjectName,
+              newLedgerProjectStrategy,
+              setNewLedgerProjectStrategy,
+              creatingLedgerProject,
+              handleCreateLedgerProject,
+              refreshLedgerProjects,
+              selectedLedgerProjectId,
+              setSelectedLedgerProjectId,
+              ledgerProjects,
+              ledgerLoading,
+              ledgerData,
+              ledgerSnapshotLoading,
+              ledgerSnapshot,
+              handleLoadLedgerSnapshotToBuilder,
+            }}
+            guidePanelProps={{
+              selectedProjectId: selectedLedgerProjectId,
+              hasPlanSeedSource,
+              hasVisualPlanRows,
+              hasPreview: Boolean(lastLedgerPlanPreviewPatch),
+              previewStale: isLastLedgerPreviewStale,
+              strictBlueprintApplyBlocked,
+              missingBindings: visualTaskBlueprintBindingStats.missing,
+              previewing: previewingLedgerPlan,
+              applying: applyingLedgerPlan,
+              lastPreviewPatchExists: Boolean(lastLedgerPlanPreviewPatch),
+              onGenerateDraft: handleGeneratePlanDraft,
+              onPreview: () => { void handlePreviewCurrentAnalysisToLedgerPlan(); },
+              onApplyPreview: () => { void handleApplyLastPreviewToLedgerPlan(); },
+              onApplyCurrent: () => { void handleApplyCurrentAnalysisToLedgerPlan(); },
+              onOpenPlanner: () => setJobsWorkspaceTab("planning"),
+              onOpenOperations: () => setJobsWorkspaceTab("operations"),
+            }}
+            planningActionsProps={{
+              jobsWorkspaceTab,
+              handleGeneratePlanDraft,
+              previewingLedgerPlan,
+              selectedLedgerProjectId,
+              hasVisualPlanRows,
+              result,
+              selectedItem,
+              handlePreviewCurrentAnalysisToLedgerPlan,
+              applyingLedgerPlan,
+              lastLedgerPlanPreviewPatch,
+              strictBlueprintApplyBlocked,
+              isLastLedgerPreviewStale,
+              handleApplyLastPreviewToLedgerPlan,
+              handleApplyCurrentAnalysisToLedgerPlan,
+              addVisualTaskRow,
+              addVisualJobRow,
+              addVisualMaterialRow,
+              addVisualBlueprintRow,
+              autoFixVisualTaskBlueprintBindings,
+              planDraftTasksLength: planDraftTasks.length,
+              planTaskBlueprintOptionsLength: planTaskBlueprintOptions.length,
+              visualTaskBlueprintBindingStatsMissing: visualTaskBlueprintBindingStats.missing,
+              visualTaskBlueprintBindingStatsFallback: visualTaskBlueprintBindingStats.fallback,
+              clearVisualPlanBuilder,
+              replaceLedgerPlanOnApply,
+              setReplaceLedgerPlanOnApply,
+              useVisualPlanBuilder,
+              setUseVisualPlanBuilder,
+              strictBlueprintBindingMode,
+              setStrictBlueprintBindingMode,
+              planDraftJobsLength: planDraftJobs.length,
+              planDraftMaterialsLength: planDraftMaterials.length,
+              planDraftBlueprintsLength: planDraftBlueprints.length,
+              lastLedgerPlanSummary,
+              lastLedgerPlanPreview,
+            }}
+            warningLogProps={{
+              warnings: plannerWarnings,
+              onClear: () => setPlannerWarnings([]),
+              sourceLabel: plannerWarningSourceLabel,
+            }}
+            workspaceStatusBoardsProps={{
+              jobsWorkspaceTab,
+              taskStatusDone,
+              taskStatusTotal,
+              taskStatusDonePct,
+              taskStatusBoard,
+              jobStatusDone,
+              jobStatusTotal,
+              jobStatusDonePct,
+              jobStatusBoard,
+              ledgerSnapshot,
+              materialCoverageTotals,
+            }}
+            dependencyBoardProps={{ board: taskDependencyBoard }}
+            schedulerPanelProps={{
+              jobsWorkspaceTab,
+              enablePlanScheduler,
+              setEnablePlanScheduler,
+              schedulerSlotCount,
+              setSchedulerSlotCount,
+              schedulerMaxRunsPerJob,
+              setSchedulerMaxRunsPerJob,
+              schedulerMaxDurationHours,
+              setSchedulerMaxDurationHours,
+              schedulerQueueStatus,
+              setSchedulerQueueStatus,
+            }}
+            planPreviewPanelProps={{
+              jobsWorkspaceTab,
+              lastLedgerPlanPreview,
+              isLastLedgerPreviewStale,
+              clearPlanPreview,
+            }}
+            operationsBoardsProps={operationsBoardsProps}
+            plannerBuilderProps={plannerBuilderProps}
+            operationsJobsProps={operationsJobsProps}
+          />
+        </Suspense>
+      )}
 
       {/* Results */}
-      {result && (
-        <div className="flex-1 min-h-0 m-2 mt-0 flex flex-col">
-          {/* Summary Cards */}
-          <div className="shrink-0 grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
-            <SummaryCard
-              label={t("industryMarketPrice")}
-              value={formatISK(result.market_buy_price ?? 0)}
-              subtext={`${(result.total_quantity ?? 0).toLocaleString()} ${t("industryUnits")}`}
-              color="text-eve-dim"
-            />
-            <SummaryCard
-              label={t("industryBuildCost")}
-              value={formatISK(result.optimal_build_cost ?? 0)}
-              subtext={result.blueprint_cost_included > 0
-                ? `${t("industryJobCost")}: ${formatISK(result.total_job_cost ?? 0)} · ${t("industryBPCostIncluded")}: ${formatISK(result.blueprint_cost_included)}`
-                : `${t("industryJobCost")}: ${formatISK(result.total_job_cost ?? 0)}`}
-              color="text-eve-accent"
-            />
-            <SummaryCard
-              label={t("industrySavings")}
-              value={formatISK(result.savings ?? 0)}
-              subtext={`${(result.savings_percent ?? 0).toFixed(1)}%`}
-              color={(result.savings ?? 0) > 0 ? "text-green-400" : "text-red-400"}
-            />
-            <SummaryCard
-              label={t("industryProfit")}
-              value={formatISK(result.profit ?? 0)}
-              subtext={`${(result.profit_percent ?? 0).toFixed(1)}% ROI`}
-              color={(result.profit ?? 0) > 0 ? "text-green-400" : "text-red-400"}
-            />
-          </div>
-
-          {/* ISK/hour and Manufacturing Time */}
-          <div className="shrink-0 grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
-            <SummaryCard
-              label={t("industryISKPerHour")}
-              value={formatISK(result.isk_per_hour ?? 0)}
-              color={(result.isk_per_hour ?? 0) > 0 ? "text-yellow-400" : "text-red-400"}
-            />
-            <SummaryCard
-              label={t("industryMfgTime")}
-              value={formatDuration(result.manufacturing_time ?? 0)}
-              color="text-eve-dim"
-            />
-            <SummaryCard
-              label={t("industrySellRevenue")}
-              value={formatISK(result.sell_revenue ?? 0)}
-              subtext={`-${salesTaxPercent}% tax -${brokerFee}% broker`}
-              color="text-eve-dim"
-            />
-            <SummaryCard
-              label={t("industryJobCost")}
-              value={formatISK(result.total_job_cost ?? 0)}
-              subtext={`SCI: ${((result.system_cost_index ?? 0) * 100).toFixed(2)}%`}
-              color="text-eve-dim"
-            />
-          </div>
-
-          {/* View Toggle + Export */}
-          <div className="shrink-0 flex items-center gap-2 mb-2 flex-wrap">
-            <button
-              onClick={() => setViewMode("tree")}
-              className={`px-3 py-1 text-xs rounded-sm transition-colors ${
-                viewMode === "tree"
-                  ? "bg-eve-accent/20 text-eve-accent border border-eve-accent/30"
-                  : "text-eve-dim hover:text-eve-text border border-eve-border"
-              }`}
-            >
-              {t("industryTreeView")}
-            </button>
-            <button
-              onClick={() => setViewMode("shopping")}
-              className={`px-3 py-1 text-xs rounded-sm transition-colors ${
-                viewMode === "shopping"
-                  ? "bg-eve-accent/20 text-eve-accent border border-eve-accent/30"
-                  : "text-eve-dim hover:text-eve-text border border-eve-border"
-              }`}
-            >
-              {t("industryShoppingList")}
-            </button>
-            {viewMode === "shopping" && result.flat_materials.length > 0 && (
-              <>
-                <button
-                  onClick={() => {
-                    const header = "Item\tQuantity\tUnit Price\tTotal\tVolume (m³)";
-                    const rows = result.flat_materials.map(
-                      (m) => `${m.type_name}\t${m.quantity}\t${m.unit_price}\t${m.total_price}\t${m.volume}`
-                    );
-                    navigator.clipboard.writeText([header, ...rows].join("\n"));
-                    addToast(t("copied"), "success", 2000);
-                  }}
-                  className="px-3 py-1 text-xs rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
-                >
-                  {t("industryExportClipboard")}
-                </button>
-                <button
-                  onClick={() => {
-                    const header = "Item,Quantity,Unit Price,Total,Volume (m³)";
-                    const rows = result.flat_materials.map(
-                      (m) => `"${(m.type_name || "").replace(/"/g, '""')}",${m.quantity},${m.unit_price},${m.total_price},${m.volume}`
-                    );
-                    const csv = "\uFEFF" + [header, ...rows].join("\n");
-                    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement("a");
-                    a.href = url;
-                    a.download = `industry-shopping-list-${new Date().toISOString().slice(0, 10)}.csv`;
-                    a.click();
-                    URL.revokeObjectURL(url);
-                    addToast(t("industryExportCSV"), "success", 2000);
-                  }}
-                  className="px-3 py-1 text-xs rounded-sm text-eve-dim hover:text-eve-accent border border-eve-border hover:border-eve-accent/30 transition-colors"
-                >
-                  {t("industryExportCSV")}
-                </button>
-              </>
-            )}
-          </div>
-
-          {/* Content */}
-          <div className="flex-1 min-h-0 overflow-auto border border-eve-border rounded-sm bg-eve-panel">
-            {viewMode === "tree" ? (
-              <MaterialTree node={result.material_tree} />
-            ) : (
-              <ShoppingList
-                materials={result.flat_materials}
-                regionId={result.region_id ?? 0}
-                onOpenExecutionPlan={setExecPlanMaterial}
-              />
-            )}
-          </div>
-        </div>
+      {industryInnerTab === "analysis" && result && (
+        <Suspense fallback={<div className="m-2 text-xs text-eve-dim">Loading analysis view...</div>}>
+          <IndustryAnalysisResultsPanel
+            result={result}
+            viewMode={viewMode}
+            setViewMode={setViewMode}
+            salesTaxPercent={salesTaxPercent}
+            brokerFee={brokerFee}
+            onOpenExecutionPlan={setExecPlanMaterial}
+          />
+        </Suspense>
       )}
 
       {/* Empty State */}
-      {!result && !analyzing && (
+      {industryInnerTab === "analysis" && !result && !analyzing && (
         <div className="flex-1 flex items-center justify-center min-h-[200px]">
           <EmptyState reason="no_item_selected" wikiSlug="Industry-Chain-Optimizer" />
         </div>
@@ -662,195 +2654,3 @@ export function IndustryTab({ onError, isLoggedIn = false }: Props) {
   );
 }
 
-// Summary Card Component
-function SummaryCard({
-  label,
-  value,
-  subtext,
-  color = "text-eve-accent",
-}: {
-  label: string;
-  value: string;
-  subtext?: string;
-  color?: string;
-}) {
-  return (
-    <div className="bg-eve-panel border border-eve-border rounded-sm p-3">
-      <div className="text-[10px] uppercase tracking-wider text-eve-dim mb-1">{label}</div>
-      <div className={`text-lg font-mono font-semibold ${color}`}>{value}</div>
-      {subtext && <div className="text-xs text-eve-dim">{subtext}</div>}
-    </div>
-  );
-}
-
-// Material Tree Component
-function MaterialTree({ node }: { node: MaterialNode }) {
-  return (
-    <div className="p-2">
-      <TreeNode node={node} />
-    </div>
-  );
-}
-
-function TreeNode({ node, level = 0 }: { node: MaterialNode; level?: number }) {
-  const [expanded, setExpanded] = useState(level < 2);
-  const hasChildren = node.children && node.children.length > 0;
-  const indent = level * 20;
-
-  return (
-    <div>
-      <div
-        className={`flex items-center py-1 px-2 hover:bg-eve-accent/5 rounded-sm ${
-          node.should_build ? "" : "opacity-70"
-        }`}
-        style={{ paddingLeft: Math.min(indent + 8, 120) }}
-      >
-        {/* Expand/Collapse Toggle */}
-        {hasChildren ? (
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="w-4 h-4 flex items-center justify-center text-eve-dim hover:text-eve-accent mr-1"
-          >
-            {expanded ? "▼" : "▶"}
-          </button>
-        ) : (
-          <span className="w-4 h-4 mr-1" />
-        )}
-
-        {/* Item Info */}
-        <span className="flex-1 text-sm text-eve-text truncate">
-          {node.type_name}
-          <span className="text-eve-dim ml-2">×{node.quantity.toLocaleString()}</span>
-        </span>
-
-        {/* Prices */}
-        <span className="text-xs text-eve-dim mx-2">
-          Buy: {formatISK(node.buy_price)}
-        </span>
-        {!node.is_base && (
-          <span className="text-xs text-eve-dim mx-2">
-            Build: {formatISK(node.build_cost)}
-          </span>
-        )}
-
-        {/* Decision Badge */}
-        {!node.is_base && (
-          <span
-            className={`text-[10px] px-2 py-0.5 rounded-sm ${
-              node.should_build
-                ? "bg-green-500/20 text-green-400"
-                : "bg-blue-500/20 text-blue-400"
-            }`}
-          >
-            {node.should_build ? "BUILD" : "BUY"}
-          </span>
-        )}
-        {node.is_base && (
-          <span className="text-[10px] px-2 py-0.5 rounded-sm bg-eve-dim/20 text-eve-dim">
-            BASE
-          </span>
-        )}
-      </div>
-
-      {/* Children */}
-      {expanded && hasChildren && (
-        <div>
-          {node.children!.map((child, i) => (
-            <TreeNode key={`${child.type_id}-${i}`} node={child} level={level + 1} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Shopping List Component
-function ShoppingList({
-  materials,
-  regionId,
-  onOpenExecutionPlan,
-}: {
-  materials: FlatMaterial[];
-  regionId: number;
-  onOpenExecutionPlan: (m: FlatMaterial) => void;
-}) {
-  const { t } = useI18n();
-  const totalCost = useMemo(() => 
-    materials.reduce((sum, m) => sum + m.total_price, 0), 
-    [materials]
-  );
-
-  const totalVolume = useMemo(() => 
-    materials.reduce((sum, m) => sum + m.volume, 0), 
-    [materials]
-  );
-
-  return (
-    <div>
-      <table className="w-full text-sm">
-        <thead className="sticky top-0 bg-eve-dark z-10">
-          <tr className="text-eve-dim text-[10px] uppercase tracking-wider border-b border-eve-border">
-            <th className="min-w-[32px] px-1 py-2" />
-            <th className="px-3 py-2 text-left font-medium">Item</th>
-            <th className="px-3 py-2 text-right font-medium">Quantity</th>
-            <th className="px-3 py-2 text-right font-medium">Unit Price</th>
-            <th className="px-3 py-2 text-right font-medium">Total</th>
-            <th className="px-3 py-2 text-right font-medium">Volume</th>
-          </tr>
-        </thead>
-        <tbody>
-          {materials.map((m, i) => (
-            <tr
-              key={m.type_id}
-              className={`border-b border-eve-border/50 hover:bg-eve-accent/5 ${
-                i % 2 === 0 ? "bg-eve-panel" : "bg-eve-dark"
-              }`}
-            >
-              <td className="px-1 py-1.5 text-center">
-                {regionId > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => onOpenExecutionPlan(m)}
-                    className="text-eve-dim hover:text-eve-accent transition-colors text-sm"
-                    title={t("execPlanTitle")}
-                  >
-                    📊
-                  </button>
-                )}
-              </td>
-              <td className="px-3 py-1.5 text-eve-text">{m.type_name}</td>
-              <td className="px-3 py-1.5 text-right font-mono text-eve-accent">
-                {m.quantity.toLocaleString()}
-              </td>
-              <td className="px-3 py-1.5 text-right font-mono text-eve-dim">
-                {formatISK(m.unit_price)}
-              </td>
-              <td className="px-3 py-1.5 text-right font-mono text-eve-accent">
-                {formatISK(m.total_price)}
-              </td>
-              <td className="px-3 py-1.5 text-right font-mono text-eve-dim">
-                {m.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} m³
-              </td>
-            </tr>
-          ))}
-        </tbody>
-        <tfoot className="bg-eve-dark border-t border-eve-border">
-          <tr>
-            <td className="px-1 py-2" />
-            <td className="px-3 py-2 text-eve-dim font-medium">Total</td>
-            <td className="px-3 py-2 text-right font-mono text-eve-accent font-semibold">
-              {materials.length} items
-            </td>
-            <td className="px-3 py-2" />
-            <td className="px-3 py-2 text-right font-mono text-eve-accent font-semibold">
-              {formatISK(totalCost)}
-            </td>
-            <td className="px-3 py-2 text-right font-mono text-eve-dim">
-              {totalVolume.toLocaleString(undefined, { maximumFractionDigits: 1 })} m³
-            </td>
-          </tr>
-        </tfoot>
-      </table>
-    </div>
-  );
-}

@@ -44,7 +44,11 @@ func TestBuildOrderIndex_HighestBuyWins(t *testing.T) {
 	if byType == nil {
 		t.Fatal("highestBuy[2] is nil")
 	}
-	entry := byType[200]
+	entries := byType[200]
+	if len(entries) == 0 {
+		t.Fatal("highestBuy[2][200] is empty")
+	}
+	entry := entries[0]
 	if entry.Price != 95 {
 		t.Errorf("highest buy for (sys=2, type=200) = %v, want 95", entry.Price)
 	}
@@ -77,11 +81,11 @@ func TestBuildOrderIndex_MultipleSystemsAndTypes(t *testing.T) {
 	}
 
 	// Highest buy: sys 10 type 1 = 105, sys 20 type 1 = 108
-	if idx.highestBuy[10][1].Price != 105 {
-		t.Errorf("highestBuy[10][1] = %v, want 105", idx.highestBuy[10][1].Price)
+	if idx.highestBuy[10][1][0].Price != 105 {
+		t.Errorf("highestBuy[10][1] = %v, want 105", idx.highestBuy[10][1][0].Price)
 	}
-	if idx.highestBuy[20][1].Price != 108 {
-		t.Errorf("highestBuy[20][1] = %v, want 108", idx.highestBuy[20][1].Price)
+	if idx.highestBuy[20][1][0].Price != 108 {
+		t.Errorf("highestBuy[20][1] = %v, want 108", idx.highestBuy[20][1][0].Price)
 	}
 }
 
@@ -112,7 +116,7 @@ func TestBuildOrderIndexWithFilters_ExcludeStructures(t *testing.T) {
 	if got := idx.cheapestSell[1][100].LocationID; got != 60003760 {
 		t.Fatalf("cheapestSell location = %d, want NPC station 60003760", got)
 	}
-	if got := idx.highestBuy[2][100].LocationID; got != 60008494 {
+	if got := idx.highestBuy[2][100][0].LocationID; got != 60008494 {
 		t.Fatalf("highestBuy location = %d, want NPC station 60008494", got)
 	}
 }
@@ -131,8 +135,55 @@ func TestBuildOrderIndexWithFilters_IncludeStructures(t *testing.T) {
 	if got := idx.cheapestSell[1][100].LocationID; got != 1_000_000_000_123 {
 		t.Fatalf("cheapestSell location = %d, want structure 1000000000123", got)
 	}
-	if got := idx.highestBuy[2][100].LocationID; got != 1_000_000_000_456 {
+	if got := idx.highestBuy[2][100][0].LocationID; got != 1_000_000_000_456 {
 		t.Fatalf("highestBuy location = %d, want structure 1000000000456", got)
+	}
+}
+
+func TestFindBestTrades_RespectsBuyMinVolume(t *testing.T) {
+	u := graph.NewUniverse()
+	u.AddGate(1, 2)
+	u.AddGate(2, 1)
+	u.SetRegion(1, 100)
+	u.SetRegion(2, 200)
+	u.SetSecurity(1, 1.0)
+	u.SetSecurity(2, 1.0)
+
+	s := &Scanner{
+		SDE: &sde.Data{
+			Universe: u,
+			Types: map[int32]*sde.ItemType{
+				34: {ID: 34, Name: "Tritanium", Volume: 1},
+			},
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Alpha", RegionID: 100, Security: 1.0},
+				2: {ID: 2, Name: "Beta", RegionID: 200, Security: 1.0},
+			},
+		},
+	}
+
+	sellOrders := []esi.MarketOrder{
+		{SystemID: 1, TypeID: 34, Price: 10, VolumeRemain: 100, LocationID: 1001},
+	}
+	buyOrders := []esi.MarketOrder{
+		{SystemID: 2, TypeID: 34, Price: 15, VolumeRemain: 100, MinVolume: 60, LocationID: 2001},
+		{SystemID: 2, TypeID: 34, Price: 14, VolumeRemain: 100, MinVolume: 1, LocationID: 2002},
+	}
+	idx := buildOrderIndex(sellOrders, buyOrders)
+
+	params := RouteParams{
+		CargoCapacity:    50, // below top order min_volume=60
+		MinMargin:        0,
+		SalesTaxPercent:  0,
+		BrokerFeePercent: 0,
+	}
+
+	hops := s.findBestTrades(idx, 1, params, 10)
+	if len(hops) == 0 {
+		t.Fatalf("expected fallback to a lower-price executable buy order")
+	}
+	if hops[0].SellPrice != 14 {
+		t.Fatalf("SellPrice = %f, want 14 (executable min_volume)", hops[0].SellPrice)
 	}
 }
 
@@ -309,5 +360,115 @@ func TestFindBestTrades_RanksByTotalProfit(t *testing.T) {
 	}
 	if hops[0].Profit != 500 {
 		t.Fatalf("top hop profit = %f, want 500", hops[0].Profit)
+	}
+}
+
+func TestFindBestTrades_AllowEmptyHops(t *testing.T) {
+	u := graph.NewUniverse()
+	u.AddGate(1, 2)
+	u.AddGate(2, 1)
+	u.AddGate(2, 3)
+	u.AddGate(3, 2)
+	u.SetRegion(1, 100)
+	u.SetRegion(2, 100)
+	u.SetRegion(3, 100)
+	u.SetSecurity(1, 1.0)
+	u.SetSecurity(2, 1.0)
+	u.SetSecurity(3, 1.0)
+
+	s := &Scanner{
+		SDE: &sde.Data{
+			Universe: u,
+			Types: map[int32]*sde.ItemType{
+				34: {ID: 34, Name: "Tritanium", Volume: 1},
+			},
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Alpha", RegionID: 100, Security: 1.0},
+				2: {ID: 2, Name: "Beta", RegionID: 100, Security: 1.0},
+				3: {ID: 3, Name: "Gamma", RegionID: 100, Security: 1.0},
+			},
+		},
+	}
+
+	sellOrders := []esi.MarketOrder{
+		{SystemID: 2, TypeID: 34, Price: 10, VolumeRemain: 100, LocationID: 2001},
+	}
+	buyOrders := []esi.MarketOrder{
+		{SystemID: 3, TypeID: 34, Price: 20, VolumeRemain: 100, LocationID: 3001},
+	}
+	idx := buildOrderIndex(sellOrders, buyOrders)
+
+	params := RouteParams{
+		CargoCapacity:    10,
+		MinMargin:        0,
+		SalesTaxPercent:  0,
+		BrokerFeePercent: 0,
+		AllowEmptyHops:   true,
+		MinISKPerJump:    40, // Profit=100 over 2 jumps (1 empty + 1 trade) => 50 ISK/jump
+	}
+
+	hops := s.findBestTrades(idx, 1, params, 10)
+	if len(hops) == 0 {
+		t.Fatalf("expected trade via empty hop source system")
+	}
+	top := hops[0]
+	if top.SystemID != 2 {
+		t.Fatalf("source system = %d, want 2", top.SystemID)
+	}
+	if top.EmptyJumps != 1 {
+		t.Fatalf("empty jumps = %d, want 1", top.EmptyJumps)
+	}
+	if top.Jumps != 1 {
+		t.Fatalf("trade jumps = %d, want 1", top.Jumps)
+	}
+}
+
+func TestFindBestTrades_MinISKPerJumpFiltersEmptyHopCandidate(t *testing.T) {
+	u := graph.NewUniverse()
+	u.AddGate(1, 2)
+	u.AddGate(2, 1)
+	u.AddGate(2, 3)
+	u.AddGate(3, 2)
+	u.SetRegion(1, 100)
+	u.SetRegion(2, 100)
+	u.SetRegion(3, 100)
+	u.SetSecurity(1, 1.0)
+	u.SetSecurity(2, 1.0)
+	u.SetSecurity(3, 1.0)
+
+	s := &Scanner{
+		SDE: &sde.Data{
+			Universe: u,
+			Types: map[int32]*sde.ItemType{
+				34: {ID: 34, Name: "Tritanium", Volume: 1},
+			},
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Alpha", RegionID: 100, Security: 1.0},
+				2: {ID: 2, Name: "Beta", RegionID: 100, Security: 1.0},
+				3: {ID: 3, Name: "Gamma", RegionID: 100, Security: 1.0},
+			},
+		},
+	}
+
+	sellOrders := []esi.MarketOrder{
+		{SystemID: 2, TypeID: 34, Price: 10, VolumeRemain: 100, LocationID: 2001},
+	}
+	buyOrders := []esi.MarketOrder{
+		{SystemID: 3, TypeID: 34, Price: 20, VolumeRemain: 100, LocationID: 3001},
+	}
+	idx := buildOrderIndex(sellOrders, buyOrders)
+
+	params := RouteParams{
+		CargoCapacity:    10,
+		MinMargin:        0,
+		SalesTaxPercent:  0,
+		BrokerFeePercent: 0,
+		AllowEmptyHops:   true,
+		MinISKPerJump:    80, // Candidate is 50 ISK/jump and should be filtered.
+	}
+
+	hops := s.findBestTrades(idx, 1, params, 10)
+	if len(hops) != 0 {
+		t.Fatalf("expected no hops, got %d", len(hops))
 	}
 }

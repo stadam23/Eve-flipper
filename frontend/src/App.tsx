@@ -23,6 +23,7 @@ import {
   updateConfig,
   scan,
   scanMultiRegion,
+  scanRegionalDayTrader,
   scanContracts,
   testAlertChannels,
   getWatchlist,
@@ -35,6 +36,8 @@ import { useEsiStatus } from "./lib/useEsiStatus";
 import type {
   ContractResult,
   FlipResult,
+  RegionalDayTradeHub,
+  RegionalDayTradeItem,
   RouteResult,
   ScanParams,
   StationCacheMeta,
@@ -58,6 +61,220 @@ type AlertChannels = {
   desktop: boolean;
 };
 
+type PatronEntry = {
+  name: string;
+  tier?: string;
+  since?: string;
+  note?: string;
+  url?: string;
+};
+
+type PatronFeed = {
+  updated_at?: string;
+  project?: string;
+  patrons?: unknown[];
+};
+
+const defaultPatronsURL = "https://ilyaux.github.io/eve-flipper-data/patrons.json";
+const patronsDataURL =
+  (import.meta.env.VITE_PATRONS_URL as string | undefined)?.trim() ||
+  defaultPatronsURL;
+
+function toRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object") return null;
+  return value as Record<string, unknown>;
+}
+
+function toNumber(value: unknown, fallback = 0): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function toInt(value: unknown, fallback = 0): number {
+  return Math.trunc(toNumber(value, fallback));
+}
+
+function toText(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function toNumberArray(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value
+    .map((entry) => toNumber(entry, Number.NaN))
+    .filter((entry) => Number.isFinite(entry));
+  return out.length > 0 ? out : undefined;
+}
+
+function normalizePatronEntries(value: unknown): PatronEntry[] {
+  if (!Array.isArray(value)) return [];
+  const out: PatronEntry[] = [];
+
+  for (const entry of value) {
+    if (typeof entry === "string") {
+      const name = entry.trim();
+      if (name !== "") out.push({ name });
+      continue;
+    }
+    const rec = toRecord(entry);
+    if (!rec) continue;
+    const name = toText(rec.name, "").trim();
+    if (name === "") continue;
+
+    const patron: PatronEntry = { name };
+    const tier = toText(rec.tier, "").trim();
+    if (tier !== "") patron.tier = tier;
+    const since = toText(rec.since, "").trim();
+    if (since !== "") patron.since = since;
+    const note = toText(rec.note, "").trim();
+    if (note !== "") patron.note = note;
+    const url = toText(rec.url, "").trim();
+    if (url !== "") patron.url = url;
+
+    out.push(patron);
+  }
+
+  return out;
+}
+
+function isFlipResultLike(value: unknown): value is FlipResult {
+  const rec = toRecord(value);
+  if (!rec) return false;
+  return toInt(rec.TypeID, 0) > 0;
+}
+
+function isLegacyRegionalItemLike(value: unknown): value is RegionalDayTradeItem {
+  const rec = toRecord(value);
+  if (!rec) return false;
+  return toInt(rec.type_id, 0) > 0;
+}
+
+function isLegacyRegionalHubLike(value: unknown): value is RegionalDayTradeHub {
+  const rec = toRecord(value);
+  return !!rec && Array.isArray(rec.items);
+}
+
+function legacyRegionalItemToFlip(
+  item: RegionalDayTradeItem,
+  hub?: RegionalDayTradeHub,
+): FlipResult {
+  const unitsToBuy = Math.max(0, toInt(item.purchase_units, 0));
+  const sellJumps = Math.max(0, toInt(item.jumps, 0));
+  const nowProfit = toNumber(item.target_now_profit, 0);
+  const periodProfit = toNumber(item.target_period_profit, nowProfit);
+  const demandPerDay = toNumber(item.target_demand_per_day, 0);
+  const volume = toNumber(item.item_volume, 0);
+  const perUnitNowProfit = unitsToBuy > 0 ? nowProfit / unitsToBuy : 0;
+  const dailyProfit = demandPerDay > 0 ? perUnitNowProfit * demandPerDay : 0;
+  const typeID = Math.max(0, toInt(item.type_id, 0));
+  const typeNameRaw = toText(item.type_name, "").trim();
+  const typeName = typeNameRaw !== "" ? typeNameRaw : `Type ${typeID}`;
+  const sourceSystemName = toText(item.source_system_name, "");
+  const targetSystemName = toText(item.target_system_name, "");
+  const buyStation = toText(item.source_station_name, sourceSystemName);
+  const sellStation = toText(item.target_station_name, targetSystemName);
+
+  const row: FlipResult = {
+    TypeID: typeID,
+    TypeName: typeName,
+    Volume: volume,
+    BuyPrice: toNumber(item.source_avg_price, 0),
+    BuyStation: buyStation,
+    BuySystemName: sourceSystemName,
+    BuySystemID: toInt(item.source_system_id, 0),
+    BuyRegionID: toInt(item.source_region_id, 0),
+    BuyRegionName: toText(item.source_region_name, ""),
+    BuyLocationID: toInt(item.source_location_id, 0),
+    SellPrice: toNumber(item.target_now_price, 0),
+    SellStation: sellStation,
+    SellSystemName: targetSystemName,
+    SellSystemID: toInt(item.target_system_id, 0),
+    SellRegionID: toInt(item.target_region_id, 0),
+    SellRegionName: toText(item.target_region_name, ""),
+    SellLocationID: toInt(item.target_location_id, 0),
+    ProfitPerUnit: perUnitNowProfit,
+    MarginPercent: toNumber(item.margin_now, 0),
+    UnitsToBuy: unitsToBuy,
+    BuyOrderRemain: toInt(item.target_supply_units, 0),
+    SellOrderRemain: toInt(item.source_units, 0),
+    TotalProfit: nowProfit,
+    ProfitPerJump: sellJumps > 0 ? nowProfit / sellJumps : nowProfit,
+    BuyJumps: 0,
+    SellJumps: sellJumps,
+    TotalJumps: sellJumps,
+    DailyVolume: Math.round(demandPerDay),
+    Velocity: 0,
+    PriceTrend: 0,
+    S2BPerDay: demandPerDay,
+    BuyCompetitors: 0,
+    SellCompetitors: 0,
+    DailyProfit: dailyProfit,
+    ExpectedBuyPrice: toNumber(item.source_avg_price, 0),
+    ExpectedSellPrice: toNumber(item.target_period_price, toNumber(item.target_now_price, 0)),
+    ExpectedProfit: periodProfit,
+    RealProfit: periodProfit,
+    DaySecurity: toNumber(hub?.security, 0),
+    DaySourceUnits: toInt(item.source_units, 0),
+    DayTargetDemandPerDay: demandPerDay,
+    DayTargetSupplyUnits: toInt(item.target_supply_units, 0),
+    DayTargetDOS: toNumber(item.target_dos, 0),
+    DayAssets: toInt(item.assets, 0),
+    DayActiveOrders: toInt(item.active_orders, 0),
+    DaySourceAvgPrice: toNumber(item.source_avg_price, 0),
+    DayTargetNowPrice: toNumber(item.target_now_price, 0),
+    DayTargetPeriodPrice: toNumber(item.target_period_price, toNumber(item.target_now_price, 0)),
+    DayNowProfit: nowProfit,
+    DayPeriodProfit: periodProfit,
+    DayROINow: toNumber(item.roi_now, 0),
+    DayROIPeriod: toNumber(item.roi_period, 0),
+    DayCapitalRequired: toNumber(item.capital_required, 0),
+    DayShippingCost: toNumber(item.shipping_cost, 0),
+    DayCategoryID: toInt(item.category_id, 0),
+    DayGroupID: toInt(item.group_id, 0),
+    DayGroupName: toText(item.group_name, ""),
+    DayIskPerM3Jump:
+      volume > 0 && sellJumps > 0
+        ? perUnitNowProfit / (volume * sellJumps)
+        : 0,
+    DayTradeScore: toNumber(item.trade_score, 0),
+    DayTargetLowestSell: toNumber(item.target_lowest_sell, 0),
+  };
+  const priceHistory = toNumberArray(item.target_price_history);
+  if (priceHistory) row.DayPriceHistory = priceHistory;
+  return row;
+}
+
+function normalizeRegionalResults(raw: unknown[]): FlipResult[] {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+
+  const out: FlipResult[] = [];
+
+  for (const entry of raw) {
+    if (isFlipResultLike(entry)) {
+      out.push(entry);
+      continue;
+    }
+
+    if (isLegacyRegionalItemLike(entry)) {
+      out.push(legacyRegionalItemToFlip(entry));
+      continue;
+    }
+
+    if (isLegacyRegionalHubLike(entry)) {
+      for (const item of entry.items) {
+        if (!isLegacyRegionalItemLike(item)) continue;
+        out.push(legacyRegionalItemToFlip(item, entry));
+      }
+    }
+  }
+
+  return out.filter((row) => row.TypeID > 0);
+}
+
 function App() {
   const { t } = useI18n();
 
@@ -74,13 +291,31 @@ function App() {
     sell_broker_fee_percent: 0,
     buy_sales_tax_percent: 0,
     sell_sales_tax_percent: 8,
+    min_item_profit: 0,
+    min_route_security: 0.45,
+    avg_price_period: 14,
+    shipping_cost_per_m3_jump: 0,
+    source_regions: [
+      "The Forge",
+      "Domain",
+      "Sinq Laison",
+      "Metropolis",
+      "Heimatar",
+    ],
+    target_market_system: "Jita",
+    target_market_location_id: 0,
     contract_hold_days: 7,
     contract_target_confidence: 80,
     exclude_rigs_with_ship: true,
     route_min_hops: 2,
     route_max_hops: 5,
+    route_target_system_name: "",
+    route_min_isk_per_jump: 0,
+    route_allow_empty_hops: false,
+    sell_order_mode: false,
   });
   const configLoadedRef = useRef(false);
+  const regionDefaultsAppliedRef = useRef(false);
 
   const [tab, setTabRaw] = useState<Tab>(() => {
     try {
@@ -141,10 +376,21 @@ function App() {
 
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState("");
+  const [regionRestorePrompt, setRegionRestorePrompt] = useState<{
+    ts: number;
+    results: FlipResult[];
+  } | null>(null);
+  const [autoRefreshRegion, setAutoRefreshRegion] = useState(false);
 
   const [showWatchlist, setShowWatchlist] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showPatrons, setShowPatrons] = useState(false);
   const [showCharacter, setShowCharacter] = useState(false);
+  const [patrons, setPatrons] = useState<PatronEntry[]>([]);
+  const [patronsLoading, setPatronsLoading] = useState(false);
+  const [patronsError, setPatronsError] = useState("");
+  const [patronsUpdatedAt, setPatronsUpdatedAt] = useState("");
+  const [patronsProject, setPatronsProject] = useState("");
   const [alertChannels, setAlertChannels] = useState<AlertChannels>({
     telegram: false,
     discord: false,
@@ -305,6 +551,32 @@ function App() {
     }
   }, [addToast, t, alertChannels.desktop]);
 
+  const loadPatrons = useCallback(async () => {
+    setPatronsLoading(true);
+    setPatronsError("");
+    try {
+      const res = await fetch(patronsDataURL, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const payload = (await res.json()) as PatronFeed;
+      setPatrons(normalizePatronEntries(payload?.patrons));
+      setPatronsUpdatedAt(toText(payload?.updated_at, ""));
+      setPatronsProject(toText(payload?.project, ""));
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : t("patronsFetchError");
+      setPatronsError(reason);
+      setPatrons([]);
+    } finally {
+      setPatronsLoading(false);
+    }
+  }, [t]);
+
+  useEffect(() => {
+    if (!showPatrons) return;
+    void loadPatrons();
+  }, [showPatrons, loadPatrons]);
+
   // Load config on mount
   useEffect(() => {
     getConfig()
@@ -331,6 +603,31 @@ function App() {
             cfg.sell_sales_tax_percent ??
             cfg.sales_tax_percent ??
             prev.sell_sales_tax_percent,
+          min_daily_volume: cfg.min_daily_volume ?? prev.min_daily_volume,
+          max_investment: cfg.max_investment ?? prev.max_investment,
+          min_item_profit: cfg.min_item_profit ?? prev.min_item_profit,
+          min_s2b_per_day: cfg.min_s2b_per_day ?? prev.min_s2b_per_day,
+          min_bfs_per_day: cfg.min_bfs_per_day ?? prev.min_bfs_per_day,
+          min_s2b_bfs_ratio:
+            cfg.min_s2b_bfs_ratio ?? prev.min_s2b_bfs_ratio,
+          max_s2b_bfs_ratio:
+            cfg.max_s2b_bfs_ratio ?? prev.max_s2b_bfs_ratio,
+          min_route_security: cfg.min_route_security ?? prev.min_route_security,
+          avg_price_period: cfg.avg_price_period ?? prev.avg_price_period,
+          min_period_roi: cfg.min_period_roi ?? prev.min_period_roi,
+          max_dos: cfg.max_dos ?? prev.max_dos,
+          min_demand_per_day:
+            cfg.min_demand_per_day ?? prev.min_demand_per_day,
+          shipping_cost_per_m3_jump:
+            cfg.shipping_cost_per_m3_jump ?? prev.shipping_cost_per_m3_jump,
+          source_regions: cfg.source_regions ?? prev.source_regions,
+          target_region: cfg.target_region ?? prev.target_region,
+          target_market_system:
+            cfg.target_market_system ?? prev.target_market_system,
+          target_market_location_id:
+            cfg.target_market_location_id ?? prev.target_market_location_id,
+          category_ids: cfg.category_ids ?? prev.category_ids,
+          sell_order_mode: cfg.sell_order_mode ?? prev.sell_order_mode,
         }));
         setAlertChannels({
           telegram: cfg.alert_telegram ?? false,
@@ -345,6 +642,25 @@ function App() {
       .finally(() => {
         configLoadedRef.current = true;
       });
+  }, []);
+
+  // On mount: check localStorage for a recent region scan (< 4 hours old) and offer restore
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("eve_flipper_region_scan");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { ts?: number; results?: unknown[] };
+      const normalized = normalizeRegionalResults(parsed?.results ?? []);
+      if (normalized.length === 0) {
+        localStorage.removeItem("eve_flipper_region_scan");
+        return;
+      }
+      const ageMs = Date.now() - (parsed.ts ?? 0);
+      if (ageMs > 4 * 60 * 60 * 1000) return; // older than 4 hours → skip
+      setRegionRestorePrompt({ ts: parsed.ts ?? Date.now(), results: normalized });
+    } catch {
+      // ignore parse errors
+    }
   }, []);
 
   // Save config on param change (debounced) — only after initial config is loaded
@@ -384,11 +700,104 @@ function App() {
       setContractScanCompleted(false);
     } else if (currentTab === "radius") {
       setRadiusResults([]);
-    } else {
+    } else if (currentTab === "region") {
       setRegionResults([]);
     }
 
     try {
+      const triggerDesktopAlerts = async (
+        rows: Array<{
+          TypeID: number;
+          TypeName: string;
+          MarginPercent: number;
+          TotalProfit: number;
+          ProfitPerUnit: number;
+          DailyVolume: number;
+        }>,
+      ) => {
+        if (!alertChannels.desktop || rows.length === 0) return;
+        try {
+          const wl = await getWatchlist();
+          const now = Date.now();
+          for (const item of wl) {
+            const metric =
+              item.alert_metric === "total_profit" ||
+              item.alert_metric === "profit_per_unit" ||
+              item.alert_metric === "daily_volume" ||
+              item.alert_metric === "margin_percent"
+                ? item.alert_metric
+                : "margin_percent";
+            const threshold = Math.max(
+              0,
+              item.alert_threshold ?? item.alert_min_margin ?? 0,
+            );
+            const enabled =
+              typeof item.alert_enabled === "boolean"
+                ? item.alert_enabled
+                : threshold > 0;
+            if (!enabled || threshold <= 0) continue;
+
+            const match = rows.find((r) => r.TypeID === item.type_id);
+            if (!match) continue;
+
+            const current =
+              metric === "margin_percent"
+                ? match.MarginPercent
+                : metric === "total_profit"
+                  ? match.TotalProfit
+                  : metric === "profit_per_unit"
+                    ? match.ProfitPerUnit
+                    : match.DailyVolume;
+
+            if (current < threshold) continue;
+
+            const cooldownKey = `${item.type_id}:${metric}:${threshold}`;
+            const lastSentAt =
+              desktopAlertCooldownRef.current.get(cooldownKey) ?? 0;
+            if (now - lastSentAt < 3_600_000) continue;
+            desktopAlertCooldownRef.current.set(cooldownKey, now);
+
+            const metricLabel =
+              metric === "margin_percent"
+                ? t("watchlistMetricMargin")
+                : metric === "total_profit"
+                  ? t("watchlistMetricTotalProfit")
+                  : metric === "profit_per_unit"
+                    ? t("watchlistMetricProfitPerUnit")
+                    : t("watchlistMetricDailyVolume");
+            const currentText =
+              metric === "margin_percent"
+                ? `${current.toFixed(2)}%`
+                : metric === "daily_volume"
+                  ? `${Math.round(current).toLocaleString()}`
+                  : formatISK(current);
+            const thresholdText =
+              metric === "margin_percent"
+                ? `${threshold.toFixed(2)}%`
+                : metric === "daily_volume"
+                  ? `${Math.round(threshold).toLocaleString()}`
+                  : formatISK(threshold);
+            const msg = `${match.TypeName}: ${metricLabel} ${currentText} >= ${thresholdText}`;
+
+            addToast(msg, "success");
+            if ("Notification" in window) {
+              if (Notification.permission === "granted") {
+                new Notification(t("appTitle"), { body: msg });
+              } else if (Notification.permission === "default") {
+                Notification.requestPermission().then((perm) => {
+                  if (perm === "granted") {
+                    new Notification(t("appTitle"), { body: msg });
+                  }
+                });
+              }
+            }
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : t("watchlistError");
+          addToast(`${t("watchlistError")}: ${reason}`, "error", 3000);
+        }
+      };
+
       if (currentTab === "contracts") {
         let meta: StationCacheMeta | undefined;
         const results = await scanContracts(
@@ -402,10 +811,9 @@ function App() {
         setContractResults(results);
         setContractCacheMeta(meta ?? null);
         setContractScanCompleted(true);
-      } else {
-        const scanFn = currentTab === "radius" ? scan : scanMultiRegion;
+      } else if (currentTab === "radius") {
         let meta: StationCacheMeta | undefined;
-        const results = await scanFn(
+        const results = await scan(
           params,
           setProgress,
           controller.signal,
@@ -413,96 +821,68 @@ function App() {
             meta = m;
           },
         );
-        if (currentTab === "radius") {
-          setRadiusResults(results);
-          setRadiusCacheMeta(meta ?? null);
-        } else {
-          setRegionResults(results);
-          setRegionCacheMeta(meta ?? null);
+        setRadiusResults(results);
+        setRadiusCacheMeta(meta ?? null);
+        await triggerDesktopAlerts(results);
+      } else if (currentTab === "region") {
+        let meta: StationCacheMeta | undefined;
+        const rows = await scanRegionalDayTrader(
+          params,
+          setProgress,
+          controller.signal,
+          (m) => {
+            meta = m;
+          },
+        );
+        const normalizedRows = normalizeRegionalResults(rows as unknown[]);
+        // Persist region scan results to localStorage for cross-session restore
+        try {
+          localStorage.setItem(
+            "eve_flipper_region_scan",
+            JSON.stringify({ ts: Date.now(), results: normalizedRows }),
+          );
+        } catch {
+          // ignore storage quota errors
         }
-        // Desktop alerts are local-only; external channels are handled by backend scan handlers.
-        if (alertChannels.desktop) {
-          try {
-            const wl = await getWatchlist();
-            const now = Date.now();
-            for (const item of wl) {
-              const metric =
-                item.alert_metric === "total_profit" ||
-                item.alert_metric === "profit_per_unit" ||
-                item.alert_metric === "daily_volume" ||
-                item.alert_metric === "margin_percent"
-                  ? item.alert_metric
-                  : "margin_percent";
-              const threshold = Math.max(
-                0,
-                item.alert_threshold ?? item.alert_min_margin ?? 0,
-              );
-              const enabled =
-                typeof item.alert_enabled === "boolean"
-                  ? item.alert_enabled
-                  : threshold > 0;
-              if (!enabled || threshold <= 0) continue;
+        setRegionResults(normalizedRows);
+        setRegionCacheMeta(meta ?? null);
 
-              const match = results.find((r) => r.TypeID === item.type_id);
-              if (!match) continue;
-
-              const current =
-                metric === "margin_percent"
-                  ? match.MarginPercent
-                  : metric === "total_profit"
-                    ? match.TotalProfit
-                    : metric === "profit_per_unit"
-                      ? match.ProfitPerUnit
-                      : match.DailyVolume;
-
-              if (current < threshold) continue;
-
-              const cooldownKey = `${item.type_id}:${metric}:${threshold}`;
-              const lastSentAt =
-                desktopAlertCooldownRef.current.get(cooldownKey) ?? 0;
-              if (now - lastSentAt < 3_600_000) continue;
-              desktopAlertCooldownRef.current.set(cooldownKey, now);
-
-              const metricLabel =
-                metric === "margin_percent"
-                  ? t("watchlistMetricMargin")
-                  : metric === "total_profit"
-                    ? t("watchlistMetricTotalProfit")
-                    : metric === "profit_per_unit"
-                      ? t("watchlistMetricProfitPerUnit")
-                      : t("watchlistMetricDailyVolume");
-              const currentText =
-                metric === "margin_percent"
-                  ? `${current.toFixed(2)}%`
-                  : metric === "daily_volume"
-                    ? `${Math.round(current).toLocaleString()}`
-                    : formatISK(current);
-              const thresholdText =
-                metric === "margin_percent"
-                  ? `${threshold.toFixed(2)}%`
-                  : metric === "daily_volume"
-                    ? `${Math.round(threshold).toLocaleString()}`
-                    : formatISK(threshold);
-              const msg = `${match.TypeName}: ${metricLabel} ${currentText} >= ${thresholdText}`;
-
-              addToast(msg, "success");
-              if ("Notification" in window) {
-                if (Notification.permission === "granted") {
-                  new Notification(t("appTitle"), { body: msg });
-                } else if (Notification.permission === "default") {
-                  Notification.requestPermission().then((perm) => {
-                    if (perm === "granted") {
-                      new Notification(t("appTitle"), { body: msg });
-                    }
-                  });
-                }
-              }
-            }
-          } catch (err) {
-            const reason = err instanceof Error ? err.message : t("watchlistError");
-            addToast(`${t("watchlistError")}: ${reason}`, "error", 3000);
-          }
-        }
+        const flatRows: Array<{
+          TypeID: number;
+          TypeName: string;
+          MarginPercent: number;
+          TotalProfit: number;
+          ProfitPerUnit: number;
+          DailyVolume: number;
+        }> = normalizedRows.map((row) => ({
+          TypeID: row.TypeID,
+          TypeName: row.TypeName,
+          MarginPercent: row.MarginPercent,
+          TotalProfit: row.DayNowProfit ?? row.TotalProfit ?? 0,
+          ProfitPerUnit:
+            row.ProfitPerUnit ??
+            (row.UnitsToBuy > 0
+              ? (row.DayNowProfit ?? row.TotalProfit ?? 0) / row.UnitsToBuy
+              : 0),
+          DailyVolume:
+            row.DailyVolume ??
+            Math.round(row.DayTargetDemandPerDay ?? 0),
+        }));
+        await triggerDesktopAlerts(flatRows);
+      } else {
+        // Keep old behavior for any legacy tab alias.
+        let meta: StationCacheMeta | undefined;
+        const results = await scanMultiRegion(
+          params,
+          setProgress,
+          controller.signal,
+          (m) => {
+            meta = m;
+          },
+        );
+        setRegionResults(results);
+        setRegionCacheMeta(meta ?? null);
+        await triggerDesktopAlerts(results);
       }
     } catch (e: unknown) {
       if (e instanceof Error && e.name !== "AbortError") {
@@ -513,25 +893,54 @@ function App() {
     }
   }, [scanning, tab, params, t, addToast, alertChannels]);
 
+  // Auto-refresh: when enabled and region cache expires, re-trigger scan automatically
+  useEffect(() => {
+    if (!autoRefreshRegion || tab !== "region") return;
+    const CHECK_INTERVAL = 15_000; // check every 15s
+    const timer = window.setInterval(() => {
+      if (scanning) return;
+      if (!regionCacheMeta?.next_expiry_at) return;
+      const expiresAt = Date.parse(regionCacheMeta.next_expiry_at);
+      if (Number.isFinite(expiresAt) && Date.now() >= expiresAt) {
+        void handleScan();
+      }
+    }, CHECK_INTERVAL);
+    return () => window.clearInterval(timer);
+  }, [autoRefreshRegion, tab, scanning, regionCacheMeta, handleScan]);
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (tab !== "region" || regionDefaultsAppliedRef.current) return;
+    setParams((prev) => {
+      const next = { ...prev };
+      if ((next.min_period_roi ?? 0) <= 0) next.min_period_roi = 3;
+      if ((next.min_demand_per_day ?? 0) <= 0) next.min_demand_per_day = 1;
+      if ((next.max_dos ?? 0) <= 0) next.max_dos = 180;
+      return next;
+    });
+    regionDefaultsAppliedRef.current = true;
+  }, [tab]);
 
   return (
     <div className="h-screen flex flex-col gap-1.5 sm:gap-3 p-1.5 sm:p-4 select-none overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
-            <img
-              src={logo}
-              alt="EVE Flipper logo"
-              className="w-4 h-4 shrink-0"
-            />
-            <h1 className="text-sm sm:text-lg font-semibold text-eve-accent tracking-wide uppercase truncate">
-              {t("appTitle")}
-            </h1>
-            <div className="hidden sm:flex items-center gap-1">
+          <div className="min-w-0 flex items-center gap-2 sm:gap-2.5 px-2 sm:px-2.5 py-1 bg-eve-panel border border-eve-border rounded-sm">
+            <div className="flex items-center justify-center w-6 h-6 rounded-sm bg-eve-dark border border-eve-border/70">
+              <img
+                src={logo}
+                alt="EVE Flipper logo"
+                className="w-4 h-4 shrink-0"
+              />
+            </div>
+            <div className="flex items-center gap-2 min-w-0">
+              <h1 className="text-sm sm:text-lg font-semibold text-eve-accent tracking-wide uppercase whitespace-nowrap">
+                {t("appTitle")}
+              </h1>
               <span
-                className="px-1.5 py-0.5 text-[10px] font-mono bg-eve-accent/10 text-eve-accent border border-eve-accent/30 rounded-sm"
+                className="hidden sm:inline-flex px-1.5 py-0.5 text-[10px] font-mono bg-eve-accent/10 text-eve-accent border border-eve-accent/30 rounded-sm"
                 title={
                   hasUpdate && latestVersion
                     ? t("versionUpdateHint", { latest: latestVersion })
@@ -545,7 +954,7 @@ function App() {
                   href="https://github.com/ilyaux/Eve-flipper/releases/latest"
                   target="_blank"
                   rel="noreferrer"
-                  className="px-1.5 py-0.5 text-[9px] uppercase tracking-wide rounded-sm bg-eve-warning/10 text-eve-warning border border-eve-warning/40 hover:bg-eve-warning/20 transition-colors"
+                  className="hidden sm:inline-flex px-1.5 py-0.5 text-[9px] uppercase tracking-wide rounded-sm bg-eve-warning/10 text-eve-warning border border-eve-warning/40 hover:bg-eve-warning/20 transition-colors"
                 >
                   {t("versionUpdateAvailable")}
                 </a>
@@ -570,7 +979,35 @@ function App() {
               </svg>
             </a>
             <a
-              href="https://discord.gg/Z9pXSGcJZE"
+              href="https://www.patreon.com/cw/EVEFlipper"
+              target="_blank"
+              rel="noreferrer"
+              className="p-1 rounded-sm hover:bg-eve-panel hover:text-eve-accent transition-colors"
+              aria-label={t("supportPatreon")}
+              title={t("supportPatreon")}
+            >
+            <svg
+              className="w-4 h-4"
+              viewBox="0 0 1080 1080"
+              fill="currentColor"
+              aria-hidden="true"
+            >
+              <path d="M1033.05 324.45c-.19-137.9-107.59-250.92-233.6-291.7-156.48-50.64-362.86-43.3-512.28 27.2-181.1 85.46-237.99 272.66-240.11 459.36-1.74 153.5 13.58 557.79 241.62 560.67 169.44 2.15 194.67-216.18 273.07-321.33 55.78-74.81 127.6-95.94 216.01-117.82 151.95-37.61 255.51-157.53 255.29-316.38z" />
+            </svg>
+          </a>
+            <button
+              type="button"
+              onClick={() => setShowPatrons(true)}
+              className="p-1 rounded-sm hover:bg-eve-panel hover:text-eve-accent transition-colors"
+              aria-label={t("patronsOpenList")}
+              title={t("patronsOpenList")}
+            >
+              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M16 11a4 4 0 1 0-3.999-4A4 4 0 0 0 16 11zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.67 0-8 1.34-8 4v2h10v-2c0-1.2.53-2.29 1.4-3.16A12.6 12.6 0 0 0 8 13zm8 0c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
+              </svg>
+            </button>
+            <a
+              href="https://discord.gg/rnR2bw6XXX"
               target="_blank"
               rel="noreferrer"
               className="p-1 rounded-sm hover:bg-eve-panel hover:text-eve-accent transition-colors"
@@ -584,6 +1021,16 @@ function App() {
               >
                 <path d="M13.545 2.907a13.2 13.2 0 0 0-3.257-1.011.05.05 0 0 0-.052.025c-.141.25-.297.577-.406.833a12.2 12.2 0 0 0-3.658 0 8 8 0 0 0-.412-.833.05.05 0 0 0-.052-.025c-1.125.194-2.22.534-3.257 1.011a.04.04 0 0 0-.021.018C.356 6.024-.213 9.047.066 12.032q.003.022.021.037a13.3 13.3 0 0 0 3.995 2.02.05.05 0 0 0 .056-.019q.463-.63.818-1.329a.05.05 0 0 0-.01-.059l-.018-.011a9 9 0 0 1-1.248-.595.05.05 0 0 1-.02-.066l.015-.019q.127-.095.248-.195a.05.05 0 0 1 .051-.007c2.619 1.196 5.454 1.196 8.041 0a.05.05 0 0 1 .053.007q.121.1.248.195a.05.05 0 0 1-.004.085 8 8 0 0 1-1.249.594.05.05 0 0 0-.03.03.05.05 0 0 0 .003.041c.24.465.515.909.817 1.329a.05.05 0 0 0 .056.019 13.2 13.2 0 0 0 4.001-2.02.05.05 0 0 0 .021-.037c.334-3.451-.559-6.449-2.366-9.106a.03.03 0 0 0-.02-.019m-8.198 7.307c-.789 0-1.438-.724-1.438-1.612s.637-1.613 1.438-1.613c.807 0 1.45.73 1.438 1.613 0 .888-.637 1.612-1.438 1.612m5.316 0c-.788 0-1.438-.724-1.438-1.612s.637-1.613 1.438-1.613c.807 0 1.451.73 1.438 1.613 0 .888-.631 1.612-1.438 1.612" />
               </svg>
+            </a>
+            <a
+              href="https://discord.gg/rnR2bw6XXX"
+              target="_blank"
+              rel="noreferrer"
+              className="group inline-flex items-center gap-1.5 h-7 px-2 rounded-sm border border-[#5865F2]/45 bg-[#5865F2]/12 text-[#9ca8ff] hover:bg-[#5865F2]/20 hover:text-[#c7ceff] transition-colors"
+              aria-label={t("discordCta")}
+              title={t("discordPitch")}
+            >
+              <span className="text-[10px] uppercase tracking-[0.14em]">{t("discordCta")}</span>
             </a>
           </div>
         </div>
@@ -813,21 +1260,59 @@ function App() {
             href="https://github.com/ilyaux/Eve-flipper"
             target="_blank"
             rel="noreferrer"
-            className="flex items-center justify-center h-9 w-9 bg-eve-panel border border-eve-border rounded-sm text-eve-dim"
+            className="flex items-center justify-center h-9 w-9 bg-eve-panel border border-eve-border rounded-sm text-eve-dim hover:text-eve-accent"
+            aria-label="GitHub"
           >
             <svg className="w-4 h-4" viewBox="0 0 16 16" fill="currentColor">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8" />
             </svg>
           </a>
           <a
-            href="https://discord.gg/Z9pXSGcJZE"
+            href="https://www.patreon.com/cw/EVEFlipper"
             target="_blank"
             rel="noreferrer"
-            className="flex items-center justify-center h-9 w-9 bg-eve-panel border border-eve-border rounded-sm text-eve-dim"
+            className="flex items-center justify-center h-9 w-9 bg-eve-panel border border-eve-border rounded-sm text-eve-dim hover:text-eve-accent"
+            aria-label={t("supportPatreon")}
+            title={t("supportPatreon")}
+          >
+            <svg className="w-4 h-4" viewBox="0 0 1080 1080" fill="currentColor">
+              <path d="M1033.05 324.45c-.19-137.9-107.59-250.92-233.6-291.7-156.48-50.64-362.86-43.3-512.28 27.2-181.1 85.46-237.99 272.66-240.11 459.36-1.74 153.5 13.58 557.79 241.62 560.67 169.44 2.15 194.67-216.18 273.07-321.33 55.78-74.81 127.6-95.94 216.01-117.82 151.95-37.61 255.51-157.53 255.29-316.38z" />
+            </svg>
+          </a>
+          <button
+            type="button"
+            onClick={() => {
+              setShowPatrons(true);
+              setMobileMenuOpen(false);
+            }}
+            className="flex items-center justify-center h-9 w-9 bg-eve-panel border border-eve-border rounded-sm text-eve-dim hover:text-eve-accent"
+            aria-label={t("patronsOpenList")}
+            title={t("patronsOpenList")}
+          >
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M16 11a4 4 0 1 0-3.999-4A4 4 0 0 0 16 11zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.67 0-8 1.34-8 4v2h10v-2c0-1.2.53-2.29 1.4-3.16A12.6 12.6 0 0 0 8 13zm8 0c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
+            </svg>
+          </button>
+          <a
+            href="https://discord.gg/rnR2bw6XXX"
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center justify-center h-9 w-9 bg-eve-panel border border-eve-border rounded-sm text-eve-dim hover:text-eve-accent"
+            aria-label="Discord"
           >
             <svg className="w-4 h-4 discord-icon-animated" viewBox="0 0 16 16" fill="currentColor">
               <path d="M13.545 2.907a13.2 13.2 0 0 0-3.257-1.011.05.05 0 0 0-.052.025c-.141.25-.297.577-.406.833a12.2 12.2 0 0 0-3.658 0 8 8 0 0 0-.412-.833.05.05 0 0 0-.052-.025c-1.125.194-2.22.534-3.257 1.011a.04.04 0 0 0-.021.018C.356 6.024-.213 9.047.066 12.032q.003.022.021.037a13.3 13.3 0 0 0 3.995 2.02.05.05 0 0 0 .056-.019q.463-.63.818-1.329a.05.05 0 0 0-.01-.059l-.018-.011a9 9 0 0 1-1.248-.595.05.05 0 0 1-.02-.066l.015-.019q.127-.095.248-.195a.05.05 0 0 1 .051-.007c2.619 1.196 5.454 1.196 8.041 0a.05.05 0 0 1 .053.007q.121.1.248.195a.05.05 0 0 1-.004.085 8 8 0 0 1-1.249.594.05.05 0 0 0-.03.03.05.05 0 0 0 .003.041c.24.465.515.909.817 1.329a.05.05 0 0 0 .056.019 13.2 13.2 0 0 0 4.001-2.02.05.05 0 0 0 .021-.037c.334-3.451-.559-6.449-2.366-9.106a.03.03 0 0 0-.02-.019m-8.198 7.307c-.789 0-1.438-.724-1.438-1.612s.637-1.613 1.438-1.613c.807 0 1.45.73 1.438 1.613 0 .888-.637 1.612-1.438 1.612m5.316 0c-.788 0-1.438-.724-1.438-1.612s.637-1.613 1.438-1.613c.807 0 1.451.73 1.438 1.613 0 .888-.631 1.612-1.438 1.612" />
             </svg>
+          </a>
+          <a
+            href="https://discord.gg/rnR2bw6XXX"
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center h-9 px-3 rounded-sm border border-[#5865F2]/45 bg-[#5865F2]/12 text-[#9ca8ff] text-[11px] uppercase tracking-[0.12em]"
+            aria-label={t("discordCta")}
+            title={t("discordPitch")}
+          >
+            {t("discordCta")}
           </a>
           <StatusBar />
         </div>
@@ -909,7 +1394,11 @@ function App() {
               <button
                 data-scan-button
                 onClick={handleScan}
-                disabled={!params.system_name}
+                disabled={
+                  tab === "region"
+                    ? !params.target_market_system?.trim()
+                    : !params.system_name
+                }
                 title="Ctrl+S"
                 className={`mr-1.5 sm:mr-3 px-3 sm:px-5 py-1.5 rounded-sm text-[10px] sm:text-xs font-semibold uppercase tracking-wider transition-all shrink-0
               ${
@@ -948,6 +1437,58 @@ function App() {
           <div
             className={`flex-1 min-h-0 flex flex-col ${tab === "region" ? "" : "hidden"}`}
           >
+            {/* Auto-refresh toggle for region tab */}
+            {tab === "region" && (
+              <div className="shrink-0 flex items-center gap-2 px-2 py-1 text-xs border-b border-eve-border/20">
+                <label className="inline-flex items-center gap-1.5 cursor-pointer select-none text-eve-dim hover:text-eve-text transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={autoRefreshRegion}
+                    onChange={(e) => setAutoRefreshRegion(e.target.checked)}
+                    className="accent-eve-accent"
+                  />
+                  Auto-refresh
+                </label>
+                {autoRefreshRegion && (
+                  <span className="flex items-center gap-1 text-eve-accent">
+                    <span className="w-1.5 h-1.5 rounded-full bg-eve-accent animate-pulse" />
+                    active
+                  </span>
+                )}
+              </div>
+            )}
+            {/* Restore prompt: offer to reload last scan from localStorage */}
+            {regionRestorePrompt && regionResults.length === 0 && !scanning && (
+              <div className="shrink-0 flex items-center gap-3 px-3 py-2 bg-eve-accent/10 border-b border-eve-accent/30 text-xs">
+                <span className="text-eve-accent">💾</span>
+                <span className="text-eve-text flex-1">
+                  Previous scan saved{" "}
+                  <span className="text-eve-dim">
+                    ({new Date(regionRestorePrompt.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })},{" "}
+                    {regionRestorePrompt.results.length} items)
+                  </span>
+                  . Restore it?
+                </span>
+                <button
+                  className="px-2 py-0.5 rounded bg-eve-accent/20 text-eve-accent hover:bg-eve-accent/40 transition-colors"
+                  onClick={() => {
+                    setRegionResults(regionRestorePrompt.results);
+                    setRegionRestorePrompt(null);
+                  }}
+                >
+                  Restore
+                </button>
+                <button
+                  className="px-2 py-0.5 rounded bg-transparent text-eve-dim hover:text-eve-text transition-colors"
+                  onClick={() => {
+                    setRegionRestorePrompt(null);
+                    localStorage.removeItem("eve_flipper_region_scan");
+                  }}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
             <ScanResultsTable
               results={regionResults}
               scanning={scanning && tab === "region"}
@@ -963,6 +1504,7 @@ function App() {
               sellSalesTaxPercent={params.sell_sales_tax_percent}
               isLoggedIn={authStatus.logged_in}
               showRegions
+              columnProfile="region_eveguru"
             />
           </div>
           <div
@@ -1014,7 +1556,7 @@ function App() {
             <WarTracker
               onError={(msg) => addToast(msg, "error")}
               onOpenRegionArbitrage={(regionName) => {
-                // Switch to Regional Arbitrage tab and set target region
+                // Switch to Regional Trade tab and set target region
                 setParams((p) => ({ ...p, target_region: regionName }));
                 setTab("region");
                 addToast(
@@ -1068,7 +1610,7 @@ function App() {
               setRadiusResults(results as FlipResult[]);
               setTab("radius");
             } else if (resultTab === "region") {
-              setRegionResults(results as FlipResult[]);
+              setRegionResults(normalizeRegionalResults(results));
               setTab("region");
             } else if (resultTab === "contracts") {
               setContractResults(results as ContractResult[]);
@@ -1103,11 +1645,18 @@ function App() {
                 "sell_sales_tax_percent",
                 "min_daily_volume",
                 "max_investment",
+                "min_item_profit",
+                "min_period_roi",
+                "max_dos",
+                "min_demand_per_day",
                 "min_s2b_per_day",
                 "min_bfs_per_day",
                 "min_s2b_bfs_ratio",
                 "max_s2b_bfs_ratio",
+                "avg_price_period",
+                "shipping_cost_per_m3_jump",
                 "min_route_security",
+                "source_regions",
                 "min_contract_price",
                 "max_contract_margin",
                 "min_priced_ratio",
@@ -1117,9 +1666,16 @@ function App() {
                 "contract_target_confidence",
                 "exclude_rigs_with_ship",
                 "target_region",
+                "target_market_system",
+                "target_market_location_id",
+                "category_ids",
+                "sell_order_mode",
                 "include_structures",
                 "route_min_hops",
                 "route_max_hops",
+                "route_target_system_name",
+                "route_min_isk_per_jump",
+                "route_allow_empty_hops",
               ];
               const filtered: Record<string, unknown> = {};
               for (const k of safeKeys) {
@@ -1143,6 +1699,104 @@ function App() {
             setShowHistory(false);
           }}
         />
+      </Modal>
+
+      <Modal
+        open={showPatrons}
+        onClose={() => setShowPatrons(false)}
+        title={t("patronsTitle")}
+        width="max-w-3xl"
+      >
+        <div className="p-4 sm:p-5">
+          <div className="flex flex-wrap items-center justify-end gap-2 mb-3">
+            <button
+              type="button"
+              onClick={() => void loadPatrons()}
+              disabled={patronsLoading}
+              className="px-2.5 py-1 text-xs bg-eve-panel border border-eve-border rounded-sm text-eve-dim hover:text-eve-accent disabled:opacity-60"
+            >
+              {t("patronsRefresh")}
+            </button>
+          </div>
+
+          {patronsLoading && (
+            <div className="py-8 text-center text-sm text-eve-dim">
+              {t("patronsLoading")}
+            </div>
+          )}
+
+          {!patronsLoading && patronsError !== "" && (
+            <div className="py-4 px-3 rounded-sm border border-eve-error/50 bg-eve-error/10 text-sm text-eve-error">
+              {t("patronsFetchError")}: {patronsError}
+            </div>
+          )}
+
+          {!patronsLoading && patronsError === "" && patrons.length === 0 && (
+            <div className="py-8 text-center text-sm text-eve-dim">
+              {t("patronsEmpty")}
+            </div>
+          )}
+
+          {!patronsLoading && patronsError === "" && patrons.length > 0 && (
+            <div>
+              <div className="text-xs text-eve-dim mb-2">
+                {t("patronsCountLabel", { count: patrons.length })}
+                {patronsUpdatedAt ? ` • ${t("patronsUpdatedAt", { date: patronsUpdatedAt })}` : ""}
+                {patronsProject ? ` • ${patronsProject}` : ""}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {patrons.map((patron, idx) => (
+                  <div
+                    key={`${patron.name}-${idx}`}
+                    className="rounded-sm border border-eve-border bg-eve-panel/60 px-3 py-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      {patron.url ? (
+                        <a
+                          href={patron.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-sm text-eve-accent hover:text-eve-accent-hover truncate"
+                        >
+                          {patron.name}
+                        </a>
+                      ) : (
+                        <span className="text-sm text-eve-text truncate">{patron.name}</span>
+                      )}
+                      {patron.tier && (
+                        <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded-sm border border-eve-accent/35 text-eve-accent">
+                          {patron.tier}
+                        </span>
+                      )}
+                    </div>
+                    {patron.since && (
+                      <div className="mt-1 text-[11px] text-eve-dim">
+                        {t("patronsSince")}: {patron.since}
+                      </div>
+                    )}
+                    {patron.note && (
+                      <div className="mt-1 text-[11px] text-eve-dim">{patron.note}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="mt-4 pt-3 border-t border-eve-border/50">
+            <a
+              href="https://www.patreon.com/cw/EVEFlipper"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-2 text-sm text-eve-accent hover:text-eve-accent-hover"
+            >
+              <svg className="w-4 h-4" viewBox="0 0 1080 1080" fill="currentColor" aria-hidden="true">
+                <path d="M1033.05 324.45c-.19-137.9-107.59-250.92-233.6-291.7-156.48-50.64-362.86-43.3-512.28 27.2-181.1 85.46-237.99 272.66-240.11 459.36-1.74 153.5 13.58 557.79 241.62 560.67 169.44 2.15 194.67-216.18 273.07-321.33 55.78-74.81 127.6-95.94 216.01-117.82 151.95-37.61 255.51-157.53 255.29-316.38z" />
+              </svg>
+              <span>{t("supportPatreon")}</span>
+            </a>
+          </div>
+        </div>
       </Modal>
 
       {/* Character Info Modal */}

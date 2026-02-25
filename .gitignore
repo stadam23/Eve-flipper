@@ -24,7 +24,7 @@ landing/
 /data/wiki-rag/
 /tmp/wiki-rag/
 /internal/api/data/wiki-rag/
-
+/scripts
 # SQLite database files
 flipper.db
 flipper.db-shm

@@ -17,25 +17,35 @@ const (
 	// MaxRouteSearchRegions limits how many nearest regions we load market orders from
 	// for route search. Keeps inter-region support while bounding ESI load.
 	MaxRouteSearchRegions = 12
+	// Allow at most this many deadhead jumps before a profitable hop.
+	maxEmptyHopJumps = MaxTradeJumps
+	// Limit candidate source systems when empty hops are enabled.
+	maxEmptyHopSources = 12
 )
 
 // orderIndex is a pre-built index of best sell/buy prices per system per type.
 type orderIndex struct {
 	// cheapestSell[systemID][typeID] = best sell order info
 	cheapestSell map[int32]map[int32]orderEntry
-	// highestBuy[systemID][typeID] = best buy order info
-	highestBuy map[int32]map[int32]orderEntry
+	// highestBuy[systemID][typeID] = best buy orders sorted by price desc
+	highestBuy map[int32]map[int32][]orderEntry
 }
 
 type orderEntry struct {
 	Price        float64
 	VolumeRemain int32
+	MinVolume    int32
 	LocationID   int64
 }
 
 type regionDistance struct {
 	regionID int32
 	dist     int
+}
+
+type sourceSystemCandidate struct {
+	systemID   int32
+	emptyJumps int
 }
 
 func selectClosestRouteRegions(systemRegion map[int32]int32, systems map[int32]int, maxRegions int) map[int32]bool {
@@ -83,7 +93,7 @@ func buildOrderIndex(sellOrders, buyOrders []esi.MarketOrder) *orderIndex {
 func buildOrderIndexWithFilters(sellOrders, buyOrders []esi.MarketOrder, includeStructures bool) *orderIndex {
 	idx := &orderIndex{
 		cheapestSell: make(map[int32]map[int32]orderEntry),
-		highestBuy:   make(map[int32]map[int32]orderEntry),
+		highestBuy:   make(map[int32]map[int32][]orderEntry),
 	}
 
 	for _, o := range sellOrders {
@@ -99,7 +109,12 @@ func buildOrderIndexWithFilters(sellOrders, buyOrders []esi.MarketOrder, include
 			idx.cheapestSell[o.SystemID] = byType
 		}
 		if cur, ok := byType[o.TypeID]; !ok || o.Price < cur.Price {
-			byType[o.TypeID] = orderEntry{o.Price, o.VolumeRemain, o.LocationID}
+			byType[o.TypeID] = orderEntry{
+				Price:        o.Price,
+				VolumeRemain: o.VolumeRemain,
+				MinVolume:    o.MinVolume,
+				LocationID:   o.LocationID,
+			}
 		}
 	}
 
@@ -112,24 +127,95 @@ func buildOrderIndexWithFilters(sellOrders, buyOrders []esi.MarketOrder, include
 		}
 		byType, ok := idx.highestBuy[o.SystemID]
 		if !ok {
-			byType = make(map[int32]orderEntry)
+			byType = make(map[int32][]orderEntry)
 			idx.highestBuy[o.SystemID] = byType
 		}
-		if cur, ok := byType[o.TypeID]; !ok || o.Price > cur.Price {
-			byType[o.TypeID] = orderEntry{o.Price, o.VolumeRemain, o.LocationID}
+		byType[o.TypeID] = append(byType[o.TypeID], orderEntry{
+			Price:        o.Price,
+			VolumeRemain: o.VolumeRemain,
+			MinVolume:    o.MinVolume,
+			LocationID:   o.LocationID,
+		})
+	}
+
+	// Normalize buy ladders: highest price first, then lowest min volume.
+	// Keep only the top levels to bound memory and evaluation cost.
+	const maxBuyLevelsPerSystemType = 8
+	for _, byType := range idx.highestBuy {
+		for typeID, entries := range byType {
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].Price == entries[j].Price {
+					if entries[i].MinVolume == entries[j].MinVolume {
+						return entries[i].VolumeRemain > entries[j].VolumeRemain
+					}
+					return entries[i].MinVolume < entries[j].MinVolume
+				}
+				return entries[i].Price > entries[j].Price
+			})
+			if len(entries) > maxBuyLevelsPerSystemType {
+				entries = entries[:maxBuyLevelsPerSystemType]
+			}
+			byType[typeID] = entries
 		}
 	}
 
 	return idx
 }
 
-// findBestTrades finds the best N trades: buy at fromSystem, sell at any other system.
-func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params RouteParams, topN int) []RouteHop {
-	sellsHere, ok := idx.cheapestSell[fromSystemID]
-	if !ok {
-		return nil
+func (s *Scanner) nearestTradeSourceSystems(
+	idx *orderIndex,
+	fromSystemID int32,
+	params RouteParams,
+) []sourceSystemCandidate {
+	sources := []sourceSystemCandidate{{systemID: fromSystemID, emptyJumps: 0}}
+	if !params.AllowEmptyHops {
+		return sources
 	}
 
+	var reachable map[int32]int
+	if params.MinRouteSecurity > 0 {
+		reachable = s.SDE.Universe.SystemsWithinRadiusMinSecurity(fromSystemID, maxEmptyHopJumps, params.MinRouteSecurity)
+	} else {
+		reachable = s.SDE.Universe.SystemsWithinRadius(fromSystemID, maxEmptyHopJumps)
+	}
+	if len(reachable) == 0 {
+		return sources
+	}
+
+	extra := make([]sourceSystemCandidate, 0, len(reachable))
+	for systemID, jumps := range reachable {
+		if systemID == fromSystemID || jumps <= 0 {
+			continue
+		}
+		if _, hasSell := idx.cheapestSell[systemID]; !hasSell {
+			continue
+		}
+		extra = append(extra, sourceSystemCandidate{systemID: systemID, emptyJumps: jumps})
+	}
+	sort.Slice(extra, func(i, j int) bool {
+		if extra[i].emptyJumps == extra[j].emptyJumps {
+			return extra[i].systemID < extra[j].systemID
+		}
+		return extra[i].emptyJumps < extra[j].emptyJumps
+	})
+	if len(extra) > maxEmptyHopSources {
+		extra = extra[:maxEmptyHopSources]
+	}
+	return append(sources, extra...)
+}
+
+// findBestTrades finds the best N trades: buy at fromSystem (or nearby with empty hops), sell at any other system.
+func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params RouteParams, topN int) []RouteHop {
+	sources := s.nearestTradeSourceSystems(idx, fromSystemID, params)
+	return s.findBestTradesFromSources(idx, sources, params, topN)
+}
+
+func (s *Scanner) findBestTradesFromSources(
+	idx *orderIndex,
+	sources []sourceSystemCandidate,
+	params RouteParams,
+	topN int,
+) []RouteHop {
 	buyCostMult, sellRevenueMult := tradeFeeMultipliers(tradeFeeInputs{
 		SplitTradeFees:       params.SplitTradeFees,
 		BrokerFeePercent:     params.BrokerFeePercent,
@@ -146,94 +232,116 @@ func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params Rou
 	}
 
 	var candidates []candidate
-
-	for typeID, sell := range sellsHere {
-		if isMarketDisabledType(typeID) {
-			continue
-		}
-		itemType, ok := s.SDE.Types[typeID]
-		if !ok || itemType.Volume <= 0 {
+	for _, source := range sources {
+		sellsHere, ok := idx.cheapestSell[source.systemID]
+		if !ok {
 			continue
 		}
 
-		unitsF := math.Floor(params.CargoCapacity / itemType.Volume)
-		if unitsF > math.MaxInt32 {
-			unitsF = math.MaxInt32
-		}
-		units := int32(unitsF)
-		if units <= 0 {
-			continue
-		}
-		if sell.VolumeRemain < units {
-			units = sell.VolumeRemain
-		}
-
-		// Find the best buy order for this type across all systems
-		for buySystemID, buysByType := range idx.highestBuy {
-			if buySystemID == fromSystemID {
+		for typeID, sell := range sellsHere {
+			if isMarketDisabledType(typeID) {
 				continue
 			}
-			buy, ok := buysByType[typeID]
-			if !ok {
+			itemType, ok := s.SDE.Types[typeID]
+			if !ok || itemType.Volume <= 0 {
 				continue
 			}
 
-			effectiveBuy := sell.Price * buyCostMult
-			effectiveSell := buy.Price * sellRevenueMult
-			profitPerUnit := effectiveSell - effectiveBuy
-			if profitPerUnit <= 0 {
+			unitsF := math.Floor(params.CargoCapacity / itemType.Volume)
+			if unitsF > math.MaxInt32 {
+				unitsF = math.MaxInt32
+			}
+			units := int32(unitsF)
+			if units <= 0 {
 				continue
 			}
-			margin := profitPerUnit / effectiveBuy * 100
-			if margin < params.MinMargin {
-				continue
+			if sell.VolumeRemain < units {
+				units = sell.VolumeRemain
 			}
 
-			actualUnits := units
-			if buy.VolumeRemain < actualUnits {
-				actualUnits = buy.VolumeRemain
-			}
-			if actualUnits <= 0 {
-				continue
-			}
+			// Find executable buy orders for this type across all destination systems.
+			for buySystemID, buysByType := range idx.highestBuy {
+				if buySystemID == source.systemID {
+					continue
+				}
+				buyEntries, ok := buysByType[typeID]
+				if !ok {
+					continue
+				}
 
-			profit := profitPerUnit * float64(actualUnits)
-			jumps := s.jumpsBetweenWithSecurity(fromSystemID, buySystemID, params.MinRouteSecurity)
-			if jumps <= 0 || jumps > MaxTradeJumps {
-				continue
-			}
+				for _, buy := range buyEntries {
+					effectiveBuy := sell.Price * buyCostMult
+					effectiveSell := buy.Price * sellRevenueMult
+					profitPerUnit := effectiveSell - effectiveBuy
+					if profitPerUnit <= 0 {
+						continue
+					}
+					margin := profitPerUnit / effectiveBuy * 100
+					if margin < params.MinMargin {
+						continue
+					}
 
-			regionID := int32(0)
-			if sys, ok := s.SDE.Systems[fromSystemID]; ok {
-				regionID = sys.RegionID
+					actualUnits := units
+					if buy.VolumeRemain < actualUnits {
+						actualUnits = buy.VolumeRemain
+					}
+					if actualUnits <= 0 {
+						continue
+					}
+					// ESI buy orders may require a minimum fill size.
+					if buy.MinVolume > 0 && actualUnits < buy.MinVolume {
+						continue
+					}
+
+					profit := profitPerUnit * float64(actualUnits)
+					tradeJumps := s.jumpsBetweenWithSecurity(source.systemID, buySystemID, params.MinRouteSecurity)
+					if tradeJumps <= 0 || tradeJumps > MaxTradeJumps {
+						continue
+					}
+					totalHopJumps := tradeJumps + source.emptyJumps
+					if totalHopJumps <= 0 {
+						continue
+					}
+					if params.MinISKPerJump > 0 && (profit/float64(totalHopJumps)) < params.MinISKPerJump {
+						continue
+					}
+
+					regionID := int32(0)
+					if sys, ok := s.SDE.Systems[source.systemID]; ok {
+						regionID = sys.RegionID
+					}
+					candidates = append(candidates, candidate{
+						hop: RouteHop{
+							SystemName:     s.systemName(source.systemID),
+							SystemID:       source.systemID,
+							RegionID:       regionID,
+							LocationID:     sell.LocationID,
+							EmptyJumps:     source.emptyJumps,
+							DestSystemID:   buySystemID,
+							DestSystemName: s.systemName(buySystemID),
+							DestLocationID: buy.LocationID,
+							TypeName:       itemType.Name,
+							TypeID:         typeID,
+							BuyPrice:       sell.Price,
+							SellPrice:      buy.Price,
+							Units:          actualUnits,
+							Profit:         profit,
+							Jumps:          tradeJumps,
+						},
+						score: profit,
+					})
+				}
 			}
-			candidates = append(candidates, candidate{
-				hop: RouteHop{
-					SystemName:     s.systemName(fromSystemID),
-					SystemID:       fromSystemID,
-					RegionID:       regionID,
-					LocationID:     sell.LocationID,
-					DestSystemID:   buySystemID,
-					DestSystemName: s.systemName(buySystemID),
-					DestLocationID: buy.LocationID,
-					TypeName:       itemType.Name,
-					TypeID:         typeID,
-					BuyPrice:       sell.Price,
-					SellPrice:      buy.Price,
-					Units:          actualUnits,
-					Profit:         profit,
-					Jumps:          jumps,
-				},
-				score: profit,
-			})
 		}
 	}
 
-	// Sort by total profit, take top N.
+	// Sort by total profit, tie-break by ISK/jump.
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].score == candidates[j].score {
-			leftPPJ := candidates[i].hop.Profit / float64(candidates[i].hop.Jumps)
-			rightPPJ := candidates[j].hop.Profit / float64(candidates[j].hop.Jumps)
+			leftJumps := candidates[i].hop.Jumps + candidates[i].hop.EmptyJumps
+			rightJumps := candidates[j].hop.Jumps + candidates[j].hop.EmptyJumps
+			leftPPJ := candidates[i].hop.Profit / float64(max(1, leftJumps))
+			rightPPJ := candidates[j].hop.Profit / float64(max(1, rightJumps))
 			return leftPPJ > rightPPJ
 		}
 		return candidates[i].score > candidates[j].score
@@ -251,7 +359,8 @@ func (s *Scanner) findBestTrades(idx *orderIndex, fromSystemID int32, params Rou
 
 // FindRoutes finds the most profitable multi-hop trade routes using beam search.
 func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]RouteResult, error) {
-	systemID, ok := s.SDE.SystemByName[strings.ToLower(params.SystemName)]
+	startName := strings.TrimSpace(params.SystemName)
+	systemID, ok := s.SDE.SystemByName[strings.ToLower(startName)]
 	if !ok {
 		return nil, fmt.Errorf("system not found: %s", params.SystemName)
 	}
@@ -280,6 +389,17 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		if regionID, ok := s.SDE.Universe.SystemRegion[sysID]; ok && regions[regionID] {
 			searchSystems[sysID] = dist
 		}
+	}
+
+	targetSystemID := int32(0)
+	targetSystemName := ""
+	if strings.TrimSpace(params.TargetSystemName) != "" {
+		targetID, found := s.SDE.SystemByName[strings.ToLower(strings.TrimSpace(params.TargetSystemName))]
+		if !found {
+			return nil, fmt.Errorf("target system not found: %s", params.TargetSystemName)
+		}
+		targetSystemID = targetID
+		targetSystemName = s.systemName(targetID)
 	}
 
 	progress(fmt.Sprintf("Fetching market orders from %d regions...", len(regions)))
@@ -339,10 +459,21 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		len(sellOrders), len(buyOrders), len(regions), len(searchSystems))
 	progress("Building order index...")
 	idx := buildOrderIndexWithFilters(sellOrders, buyOrders, params.IncludeStructures)
+	log.Printf(
+		"[Route] Search params: start=%s target=%s hops=%d-%d minMargin=%.2f minISK/jump=%.2f allowEmpty=%t",
+		startName,
+		targetSystemName,
+		params.MinHops,
+		params.MaxHops,
+		params.MinMargin,
+		params.MinISKPerJump,
+		params.AllowEmptyHops,
+	)
 
 	// Scale beam search parameters based on requested depth
 	beamWidth := 50    // keep top N partial routes per level
 	branchFactor := 10 // explore top N trades per system
+	cachedTradesPerSource := branchFactor * 4
 
 	type partialRoute struct {
 		hops        []RouteHop
@@ -351,9 +482,123 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		lastSystem  int32
 	}
 
+	sourceCandidatesBySystem := make(map[int32][]sourceSystemCandidate)
+	tradesBySourceSystem := make(map[int32][]RouteHop)
+
+	baseTradeParams := params
+	baseTradeParams.AllowEmptyHops = false
+	baseTradeParams.MinISKPerJump = 0
+
+	getSourceCandidates := func(fromSystemID int32) []sourceSystemCandidate {
+		if !params.AllowEmptyHops {
+			return []sourceSystemCandidate{{systemID: fromSystemID, emptyJumps: 0}}
+		}
+		if cached, ok := sourceCandidatesBySystem[fromSystemID]; ok {
+			return cached
+		}
+		candidates := s.nearestTradeSourceSystems(idx, fromSystemID, params)
+		sourceCandidatesBySystem[fromSystemID] = candidates
+		return candidates
+	}
+
+	getTradesFromSource := func(sourceSystemID int32, topN int) []RouteHop {
+		if topN <= 0 {
+			return nil
+		}
+		if cached, ok := tradesBySourceSystem[sourceSystemID]; ok {
+			if len(cached) > topN {
+				return cached[:topN]
+			}
+			return cached
+		}
+		cached := s.findBestTradesFromSources(
+			idx,
+			[]sourceSystemCandidate{{systemID: sourceSystemID, emptyJumps: 0}},
+			baseTradeParams,
+			cachedTradesPerSource,
+		)
+		tradesBySourceSystem[sourceSystemID] = cached
+		if len(cached) > topN {
+			return cached[:topN]
+		}
+		return cached
+	}
+
+	selectBestHopCandidates := func(fromSystemID int32, topN int) []RouteHop {
+		type hopCandidate struct {
+			hop RouteHop
+		}
+		raw := make([]hopCandidate, 0, topN*2)
+		for _, source := range getSourceCandidates(fromSystemID) {
+			perSourceTopN := topN
+			if source.emptyJumps > 0 {
+				perSourceTopN = max(2, topN/2)
+			}
+			for _, trade := range getTradesFromSource(source.systemID, perSourceTopN) {
+				hop := trade
+				hop.EmptyJumps = source.emptyJumps
+				totalHopJumps := hop.Jumps + hop.EmptyJumps
+				if totalHopJumps <= 0 {
+					continue
+				}
+				if params.MinISKPerJump > 0 && (hop.Profit/float64(totalHopJumps)) < params.MinISKPerJump {
+					continue
+				}
+				raw = append(raw, hopCandidate{hop: hop})
+			}
+		}
+		sort.Slice(raw, func(i, j int) bool {
+			if raw[i].hop.Profit == raw[j].hop.Profit {
+				leftJumps := max(1, raw[i].hop.Jumps+raw[i].hop.EmptyJumps)
+				rightJumps := max(1, raw[j].hop.Jumps+raw[j].hop.EmptyJumps)
+				return (raw[i].hop.Profit / float64(leftJumps)) > (raw[j].hop.Profit / float64(rightJumps))
+			}
+			return raw[i].hop.Profit > raw[j].hop.Profit
+		})
+		if len(raw) > topN {
+			raw = raw[:topN]
+		}
+
+		out := make([]RouteHop, len(raw))
+		for i, c := range raw {
+			out[i] = c.hop
+		}
+		return out
+	}
+
+	finalizeRoute := func(pr partialRoute) (RouteResult, bool) {
+		totalJumps := pr.totalJumps
+		targetJumps := 0
+		if targetSystemID != 0 {
+			targetJumps = s.jumpsBetweenWithSecurity(pr.lastSystem, targetSystemID, params.MinRouteSecurity)
+			if targetJumps == UnreachableJumps {
+				return RouteResult{}, false
+			}
+			totalJumps += targetJumps
+		}
+		if totalJumps <= 0 {
+			return RouteResult{}, false
+		}
+
+		profitPerJump := sanitizeFloat(pr.totalProfit / float64(totalJumps))
+		if params.MinISKPerJump > 0 && profitPerJump < params.MinISKPerJump {
+			return RouteResult{}, false
+		}
+
+		return RouteResult{
+			Hops:             copyHops(pr.hops),
+			TotalProfit:      pr.totalProfit,
+			TotalJumps:       totalJumps,
+			ProfitPerJump:    profitPerJump,
+			HopCount:         len(pr.hops),
+			TargetSystemName: targetSystemName,
+			TargetJumps:      targetJumps,
+		}, true
+	}
+
 	// Seed with initial trades from start system
 	progress("Exploring routes...")
-	initialTrades := s.findBestTrades(idx, systemID, params, branchFactor*3) // wider initial search
+	initialTrades := selectBestHopCandidates(systemID, branchFactor*3) // wider initial search
 	if len(initialTrades) == 0 {
 		progress("No profitable trades found")
 		return []RouteResult{}, nil
@@ -362,10 +607,11 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 	// Initialize beam with hop-1 routes
 	beam := make([]partialRoute, 0, len(initialTrades))
 	for _, hop := range initialTrades {
+		hopTravelJumps := hop.Jumps + hop.EmptyJumps
 		beam = append(beam, partialRoute{
 			hops:        []RouteHop{hop},
 			totalProfit: hop.Profit,
-			totalJumps:  hop.Jumps,
+			totalJumps:  hopTravelJumps,
 			lastSystem:  hop.DestSystemID,
 		})
 	}
@@ -382,41 +628,33 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		// Collect completed routes (if we've reached min depth)
 		if depth >= params.MinHops {
 			for _, pr := range beam {
-				ppj := sanitizeFloat(pr.totalProfit / float64(pr.totalJumps))
-				completedRoutes = append(completedRoutes, RouteResult{
-					Hops:          copyHops(pr.hops),
-					TotalProfit:   pr.totalProfit,
-					TotalJumps:    pr.totalJumps,
-					ProfitPerJump: ppj,
-					HopCount:      len(pr.hops),
-				})
+				if result, ok := finalizeRoute(pr); ok {
+					completedRoutes = append(completedRoutes, result)
+				}
 			}
 		}
 
 		var nextBeam []partialRoute
 		for _, pr := range beam {
-			trades := s.findBestTrades(idx, pr.lastSystem, params, branchFactor)
+			trades := selectBestHopCandidates(pr.lastSystem, branchFactor)
 			for _, hop := range trades {
-				// Avoid revisiting systems
-				revisit := false
-				for _, h := range pr.hops {
-					if h.SystemID == hop.DestSystemID {
-						revisit = true
-						break
-					}
+				// Avoid revisiting source/destination systems (except current source system).
+				if hop.SystemID != pr.lastSystem && routeVisitsSystem(pr.hops, hop.SystemID) {
+					continue
 				}
-				if revisit {
+				if routeVisitsSystem(pr.hops, hop.DestSystemID) {
 					continue
 				}
 
 				newHops := make([]RouteHop, len(pr.hops)+1)
 				copy(newHops, pr.hops)
 				newHops[len(pr.hops)] = hop
+				hopTravelJumps := hop.Jumps + hop.EmptyJumps
 
 				nextBeam = append(nextBeam, partialRoute{
 					hops:        newHops,
 					totalProfit: pr.totalProfit + hop.Profit,
-					totalJumps:  pr.totalJumps + hop.Jumps,
+					totalJumps:  pr.totalJumps + hopTravelJumps,
 					lastSystem:  hop.DestSystemID,
 				})
 				explored++
@@ -438,14 +676,9 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 	// Add final beam as completed routes
 	for _, pr := range beam {
 		if len(pr.hops) >= params.MinHops {
-			ppj := sanitizeFloat(pr.totalProfit / float64(pr.totalJumps))
-			completedRoutes = append(completedRoutes, RouteResult{
-				Hops:          pr.hops,
-				TotalProfit:   pr.totalProfit,
-				TotalJumps:    pr.totalJumps,
-				ProfitPerJump: ppj,
-				HopCount:      len(pr.hops),
-			})
+			if result, ok := finalizeRoute(pr); ok {
+				completedRoutes = append(completedRoutes, result)
+			}
 		}
 	}
 
@@ -503,6 +736,15 @@ func copyHops(hops []RouteHop) []RouteHop {
 	c := make([]RouteHop, len(hops))
 	copy(c, hops)
 	return c
+}
+
+func routeVisitsSystem(hops []RouteHop, systemID int32) bool {
+	for _, h := range hops {
+		if h.SystemID == systemID || h.DestSystemID == systemID {
+			return true
+		}
+	}
+	return false
 }
 
 // routeKey generates a unique string key for a route based on the sequence of systems and items.

@@ -912,6 +912,306 @@ func (d *DB) migrate() error {
 		logger.Info("DB", "Applied migration v24 (user trade-state persistence)")
 	}
 
+	if version < 25 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS industry_projects (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id     TEXT NOT NULL,
+				name        TEXT NOT NULL,
+				status      TEXT NOT NULL DEFAULT 'draft',
+				strategy    TEXT NOT NULL DEFAULT 'balanced',
+				notes       TEXT NOT NULL DEFAULT '',
+				params_json TEXT NOT NULL DEFAULT '{}',
+				created_at  TEXT NOT NULL,
+				updated_at  TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_industry_projects_user_updated
+				ON industry_projects(user_id, updated_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_industry_projects_user_status
+				ON industry_projects(user_id, status, updated_at DESC);
+
+			CREATE TABLE IF NOT EXISTS industry_tasks (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id          TEXT NOT NULL,
+				project_id       INTEGER NOT NULL REFERENCES industry_projects(id) ON DELETE CASCADE,
+				parent_task_id   INTEGER NOT NULL DEFAULT 0,
+				name             TEXT NOT NULL,
+				activity         TEXT NOT NULL,
+				product_type_id  INTEGER NOT NULL DEFAULT 0,
+				target_runs      INTEGER NOT NULL DEFAULT 0,
+				planned_start    TEXT NOT NULL DEFAULT '',
+				planned_end      TEXT NOT NULL DEFAULT '',
+				priority         INTEGER NOT NULL DEFAULT 0,
+				status           TEXT NOT NULL DEFAULT 'planned',
+				constraints_json TEXT NOT NULL DEFAULT '{}',
+				created_at       TEXT NOT NULL,
+				updated_at       TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_industry_tasks_user_project
+				ON industry_tasks(user_id, project_id, updated_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_industry_tasks_user_status
+				ON industry_tasks(user_id, project_id, status, priority DESC, updated_at DESC);
+
+			CREATE TABLE IF NOT EXISTS industry_jobs (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id          TEXT NOT NULL,
+				project_id       INTEGER NOT NULL REFERENCES industry_projects(id) ON DELETE CASCADE,
+				task_id          INTEGER NOT NULL DEFAULT 0,
+				character_id     INTEGER NOT NULL DEFAULT 0,
+				facility_id      INTEGER NOT NULL DEFAULT 0,
+				activity         TEXT NOT NULL,
+				runs             INTEGER NOT NULL DEFAULT 0,
+				duration_seconds INTEGER NOT NULL DEFAULT 0,
+				cost_isk         REAL NOT NULL DEFAULT 0,
+				status           TEXT NOT NULL DEFAULT 'planned',
+				started_at       TEXT NOT NULL DEFAULT '',
+				finished_at      TEXT NOT NULL DEFAULT '',
+				external_job_id  INTEGER NOT NULL DEFAULT 0,
+				notes            TEXT NOT NULL DEFAULT '',
+				created_at       TEXT NOT NULL,
+				updated_at       TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_industry_jobs_user_project
+				ON industry_jobs(user_id, project_id, updated_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_industry_jobs_user_status
+				ON industry_jobs(user_id, status, updated_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_industry_jobs_user_task
+				ON industry_jobs(user_id, project_id, task_id, updated_at DESC);
+
+			CREATE TABLE IF NOT EXISTS industry_material_plan (
+				id            INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id       TEXT NOT NULL,
+				project_id    INTEGER NOT NULL REFERENCES industry_projects(id) ON DELETE CASCADE,
+				task_id       INTEGER NOT NULL DEFAULT 0,
+				type_id       INTEGER NOT NULL,
+				type_name     TEXT NOT NULL DEFAULT '',
+				required_qty  INTEGER NOT NULL DEFAULT 0,
+				available_qty INTEGER NOT NULL DEFAULT 0,
+				buy_qty       INTEGER NOT NULL DEFAULT 0,
+				build_qty     INTEGER NOT NULL DEFAULT 0,
+				unit_cost_isk REAL NOT NULL DEFAULT 0,
+				source        TEXT NOT NULL DEFAULT 'market',
+				updated_at    TEXT NOT NULL
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_material_plan_user_scope
+				ON industry_material_plan(user_id, project_id, task_id, type_id);
+			CREATE INDEX IF NOT EXISTS idx_industry_material_plan_user_project
+				ON industry_material_plan(user_id, project_id, updated_at DESC);
+
+			CREATE TABLE IF NOT EXISTS industry_blueprint_pool (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id          TEXT NOT NULL,
+				project_id       INTEGER NOT NULL REFERENCES industry_projects(id) ON DELETE CASCADE,
+				blueprint_type_id INTEGER NOT NULL,
+				blueprint_name   TEXT NOT NULL DEFAULT '',
+				location_id      INTEGER NOT NULL DEFAULT 0,
+				quantity         INTEGER NOT NULL DEFAULT 0,
+				me               INTEGER NOT NULL DEFAULT 0,
+				te               INTEGER NOT NULL DEFAULT 0,
+				is_bpo           INTEGER NOT NULL DEFAULT 1,
+				available_runs   INTEGER NOT NULL DEFAULT 0,
+				updated_at       TEXT NOT NULL
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_blueprint_pool_user_scope
+				ON industry_blueprint_pool(user_id, project_id, blueprint_type_id, location_id, is_bpo);
+			CREATE INDEX IF NOT EXISTS idx_industry_blueprint_pool_user_project
+				ON industry_blueprint_pool(user_id, project_id, updated_at DESC);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (25);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v25: %w", err)
+		}
+		logger.Info("DB", "Applied migration v25 (industry ledger foundation)")
+	}
+
+	if version < 26 {
+		tx, err := d.sql.Begin()
+		if err != nil {
+			return fmt.Errorf("migration v26 begin: %w", err)
+		}
+		defer tx.Rollback()
+
+		if _, err := tx.Exec(`ALTER TABLE industry_jobs RENAME TO industry_jobs_legacy_v26;`); err != nil {
+			return fmt.Errorf("migration v26 rename jobs: %w", err)
+		}
+		if _, err := tx.Exec(`ALTER TABLE industry_tasks RENAME TO industry_tasks_legacy_v26;`); err != nil {
+			return fmt.Errorf("migration v26 rename tasks: %w", err)
+		}
+		if _, err := tx.Exec(`
+			DROP INDEX IF EXISTS idx_industry_jobs_user_project;
+			DROP INDEX IF EXISTS idx_industry_jobs_user_status;
+			DROP INDEX IF EXISTS idx_industry_jobs_user_task;
+			DROP INDEX IF EXISTS idx_industry_tasks_user_project;
+			DROP INDEX IF EXISTS idx_industry_tasks_user_status;
+		`); err != nil {
+			return fmt.Errorf("migration v26 drop legacy indexes: %w", err)
+		}
+
+		if _, err := tx.Exec(`
+			CREATE TABLE industry_tasks (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id          TEXT NOT NULL,
+				project_id       INTEGER NOT NULL REFERENCES industry_projects(id) ON DELETE CASCADE,
+				parent_task_id   INTEGER REFERENCES industry_tasks(id) ON DELETE SET NULL,
+				name             TEXT NOT NULL,
+				activity         TEXT NOT NULL,
+				product_type_id  INTEGER NOT NULL DEFAULT 0,
+				target_runs      INTEGER NOT NULL DEFAULT 0,
+				planned_start    TEXT NOT NULL DEFAULT '',
+				planned_end      TEXT NOT NULL DEFAULT '',
+				priority         INTEGER NOT NULL DEFAULT 0,
+				status           TEXT NOT NULL DEFAULT 'planned',
+				constraints_json TEXT NOT NULL DEFAULT '{}',
+				created_at       TEXT NOT NULL,
+				updated_at       TEXT NOT NULL
+			);
+			CREATE INDEX idx_industry_tasks_user_project
+				ON industry_tasks(user_id, project_id, updated_at DESC);
+			CREATE INDEX idx_industry_tasks_user_status
+				ON industry_tasks(user_id, project_id, status, priority DESC, updated_at DESC);
+		`); err != nil {
+			return fmt.Errorf("migration v26 create tasks: %w", err)
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO industry_tasks (
+				id, user_id, project_id, parent_task_id, name, activity, product_type_id, target_runs,
+				planned_start, planned_end, priority, status, constraints_json, created_at, updated_at
+			)
+			SELECT
+				t.id,
+				t.user_id,
+				t.project_id,
+				CASE
+					WHEN t.parent_task_id > 0
+					 AND EXISTS (
+						SELECT 1
+						  FROM industry_tasks_legacy_v26 p
+						 WHERE p.id = t.parent_task_id
+						   AND p.user_id = t.user_id
+						   AND p.project_id = t.project_id
+					 )
+					THEN t.parent_task_id
+					ELSE NULL
+				END,
+				t.name,
+				t.activity,
+				t.product_type_id,
+				t.target_runs,
+				t.planned_start,
+				t.planned_end,
+				t.priority,
+				t.status,
+				t.constraints_json,
+				t.created_at,
+				t.updated_at
+			FROM industry_tasks_legacy_v26 t;
+		`); err != nil {
+			return fmt.Errorf("migration v26 copy tasks: %w", err)
+		}
+
+		if _, err := tx.Exec(`
+			CREATE TABLE industry_jobs (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id          TEXT NOT NULL,
+				project_id       INTEGER NOT NULL REFERENCES industry_projects(id) ON DELETE CASCADE,
+				task_id          INTEGER REFERENCES industry_tasks(id) ON DELETE SET NULL,
+				character_id     INTEGER NOT NULL DEFAULT 0,
+				facility_id      INTEGER NOT NULL DEFAULT 0,
+				activity         TEXT NOT NULL,
+				runs             INTEGER NOT NULL DEFAULT 0,
+				duration_seconds INTEGER NOT NULL DEFAULT 0,
+				cost_isk         REAL NOT NULL DEFAULT 0,
+				status           TEXT NOT NULL DEFAULT 'planned',
+				started_at       TEXT NOT NULL DEFAULT '',
+				finished_at      TEXT NOT NULL DEFAULT '',
+				external_job_id  INTEGER NOT NULL DEFAULT 0,
+				notes            TEXT NOT NULL DEFAULT '',
+				created_at       TEXT NOT NULL,
+				updated_at       TEXT NOT NULL
+			);
+			CREATE INDEX idx_industry_jobs_user_project
+				ON industry_jobs(user_id, project_id, updated_at DESC);
+			CREATE INDEX idx_industry_jobs_user_status
+				ON industry_jobs(user_id, status, updated_at DESC);
+			CREATE INDEX idx_industry_jobs_user_task
+				ON industry_jobs(user_id, project_id, task_id, updated_at DESC);
+		`); err != nil {
+			return fmt.Errorf("migration v26 create jobs: %w", err)
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO industry_jobs (
+				id, user_id, project_id, task_id, character_id, facility_id, activity, runs,
+				duration_seconds, cost_isk, status, started_at, finished_at, external_job_id, notes, created_at, updated_at
+			)
+			SELECT
+				j.id,
+				j.user_id,
+				j.project_id,
+				CASE
+					WHEN j.task_id > 0
+					 AND EXISTS (
+						SELECT 1
+						  FROM industry_tasks t
+						 WHERE t.id = j.task_id
+						   AND t.user_id = j.user_id
+						   AND t.project_id = j.project_id
+					 )
+					THEN j.task_id
+					ELSE NULL
+				END,
+				j.character_id,
+				j.facility_id,
+				j.activity,
+				j.runs,
+				j.duration_seconds,
+				j.cost_isk,
+				j.status,
+				j.started_at,
+				j.finished_at,
+				j.external_job_id,
+				j.notes,
+				j.created_at,
+				j.updated_at
+			FROM industry_jobs_legacy_v26 j;
+		`); err != nil {
+			return fmt.Errorf("migration v26 copy jobs: %w", err)
+		}
+
+		if _, err := tx.Exec(`DROP TABLE industry_jobs_legacy_v26;`); err != nil {
+			return fmt.Errorf("migration v26 drop legacy jobs: %w", err)
+		}
+		if _, err := tx.Exec(`DROP TABLE industry_tasks_legacy_v26;`); err != nil {
+			return fmt.Errorf("migration v26 drop legacy tasks: %w", err)
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO schema_version (version) VALUES (26);`); err != nil {
+			return fmt.Errorf("migration v26 schema version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migration v26 commit: %w", err)
+		}
+		logger.Info("DB", "Applied migration v26 (industry task/job FK integrity)")
+	}
+
+	if version < 27 {
+		_, err := d.sql.Exec(`
+			CREATE TABLE IF NOT EXISTS regional_day_results (
+				id       INTEGER PRIMARY KEY AUTOINCREMENT,
+				scan_id  INTEGER NOT NULL REFERENCES scan_history(id) ON DELETE CASCADE,
+				row_json TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_regional_day_scan ON regional_day_results(scan_id);
+
+			INSERT OR IGNORE INTO schema_version (version) VALUES (27);
+		`)
+		if err != nil {
+			return fmt.Errorf("migration v27: %w", err)
+		}
+		logger.Info("DB", "Applied migration v27 (regional day-trader history rows)")
+	}
+
 	return nil
 }
 

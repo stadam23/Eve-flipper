@@ -9,6 +9,7 @@ import {
   exportPresets,
   importPresets,
   mapTabToPresetTab,
+  getPresetApplyBase,
   type SavedPreset,
   type BuiltinPreset,
 } from "@/lib/presets";
@@ -125,14 +126,14 @@ export function PresetPicker({ params, onApply, tab, builtinPresets, align = "le
     const presetParams = builtin?.params ?? custom?.params;
     if (!presetParams) return;
 
-    onApply({ ...params, ...presetParams });
+    onApply({ ...params, ...getPresetApplyBase(tab), ...presetParams });
     autoAppliedRef.current = applyKey;
   }, [activeKey, activePresetId, builtinPresets, onApply, params, tab]);
 
   const handleApply = useCallback(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (id: string, presetParams: Record<string, any>) => {
-      onApply({ ...params, ...presetParams });
+      onApply({ ...params, ...getPresetApplyBase(tab), ...presetParams });
       setActivePresetId(id);
       autoAppliedRef.current = `${tab}:${id}`;
       setOpen(false);

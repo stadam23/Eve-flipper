@@ -383,6 +383,11 @@
   z-index: 5;
 }
 
+/* Opt-out for tables where right-edge fade may cover narrow numeric columns. */
+.table-scroll-wrapper.table-scroll-no-fade::after {
+  display: none;
+}
+
 /* Safe area insets for notched phones */
 @supports (padding: env(safe-area-inset-bottom)) {
   body {

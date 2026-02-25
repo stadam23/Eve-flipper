@@ -26,17 +26,41 @@ type Config struct {
 	SellBrokerFeePercent float64 `json:"sell_broker_fee_percent"`
 	BuySalesTaxPercent   float64 `json:"buy_sales_tax_percent"`
 	SellSalesTaxPercent  float64 `json:"sell_sales_tax_percent"`
-	AlertTelegram        bool    `json:"alert_telegram"`
-	AlertDiscord         bool    `json:"alert_discord"`
-	AlertDesktop         bool    `json:"alert_desktop"`
-	AlertTelegramToken   string  `json:"alert_telegram_token"`
-	AlertTelegramChatID  string  `json:"alert_telegram_chat_id"`
-	AlertDiscordWebhook  string  `json:"alert_discord_webhook"`
-	Opacity              int     `json:"opacity"`
-	WindowX              int     `json:"window_x"`
-	WindowY              int     `json:"window_y"`
-	WindowW              int     `json:"window_w"`
-	WindowH              int     `json:"window_h"`
+
+	// Shared advanced scan filters.
+	MinDailyVolume   int64   `json:"min_daily_volume"`
+	MaxInvestment    float64 `json:"max_investment"`
+	MinItemProfit    float64 `json:"min_item_profit"`
+	MinS2BPerDay     float64 `json:"min_s2b_per_day"`
+	MinBfSPerDay     float64 `json:"min_bfs_per_day"`
+	MinS2BBfSRatio   float64 `json:"min_s2b_bfs_ratio"`
+	MaxS2BBfSRatio   float64 `json:"max_s2b_bfs_ratio"`
+	MinRouteSecurity float64 `json:"min_route_security"`
+
+	// Regional day-trader parameters.
+	AvgPricePeriod         int      `json:"avg_price_period"`
+	MinPeriodROI           float64  `json:"min_period_roi"`
+	MaxDOS                 float64  `json:"max_dos"`
+	MinDemandPerDay        float64  `json:"min_demand_per_day"`
+	ShippingCostPerM3Jump  float64  `json:"shipping_cost_per_m3_jump"`
+	SourceRegions          []string `json:"source_regions"`
+	TargetRegion           string   `json:"target_region"`
+	TargetMarketSystem     string   `json:"target_market_system"`
+	TargetMarketLocationID int64    `json:"target_market_location_id"`
+	CategoryIDs            []int32  `json:"category_ids"`
+	SellOrderMode          bool     `json:"sell_order_mode"`
+
+	AlertTelegram       bool   `json:"alert_telegram"`
+	AlertDiscord        bool   `json:"alert_discord"`
+	AlertDesktop        bool   `json:"alert_desktop"`
+	AlertTelegramToken  string `json:"alert_telegram_token"`
+	AlertTelegramChatID string `json:"alert_telegram_chat_id"`
+	AlertDiscordWebhook string `json:"alert_discord_webhook"`
+	Opacity             int    `json:"opacity"`
+	WindowX             int    `json:"window_x"`
+	WindowY             int    `json:"window_y"`
+	WindowW             int    `json:"window_w"`
+	WindowH             int    `json:"window_h"`
 }
 
 // Default returns a Config with sensible defaults.
@@ -53,9 +77,19 @@ func Default() *Config {
 		SellBrokerFeePercent: 0,
 		BuySalesTaxPercent:   0,
 		SellSalesTaxPercent:  8,
-		AlertDesktop:         true,
-		Opacity:              230,
-		WindowW:              800,
-		WindowH:              600,
+		MinRouteSecurity:     0.45,
+		AvgPricePeriod:       14,
+		SourceRegions: []string{
+			"The Forge",
+			"Domain",
+			"Sinq Laison",
+			"Metropolis",
+			"Heimatar",
+		},
+		TargetMarketSystem: "Jita",
+		AlertDesktop:       true,
+		Opacity:            230,
+		WindowW:            800,
+		WindowH:            600,
 	}
 }

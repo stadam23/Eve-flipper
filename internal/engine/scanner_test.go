@@ -437,6 +437,63 @@ func TestEstimateSideFlowsPerDay_MonotoneByBuyDepth(t *testing.T) {
 	}
 }
 
+func TestEstimateSideFlowsPerDay_NoBookDataFallsBackNeutral(t *testing.T) {
+	const total = 1_000.0
+	s2b, bfs := estimateSideFlowsPerDay(total, 0, 0)
+	if math.Abs((s2b+bfs)-total) > 1e-9 {
+		t.Fatalf("mass-balance broken: s2b+bfs=%f, want=%f", s2b+bfs, total)
+	}
+	if math.Abs(s2b-total*0.5) > 1e-9 {
+		t.Fatalf("S2B fallback=%f, want=%f", s2b, total*0.5)
+	}
+	if math.Abs(bfs-total*0.5) > 1e-9 {
+		t.Fatalf("BfS fallback=%f, want=%f", bfs, total*0.5)
+	}
+}
+
+func TestEstimateSideFlowsPerDay_OneSidedDepthUsesTailShare(t *testing.T) {
+	const total = 1_000.0
+	s2bBuyOnly, bfsBuyOnly := estimateSideFlowsPerDay(total, 500, 0)
+	s2bSellOnly, bfsSellOnly := estimateSideFlowsPerDay(total, 0, 500)
+
+	if math.Abs((s2bBuyOnly+bfsBuyOnly)-total) > 1e-9 || math.Abs((s2bSellOnly+bfsSellOnly)-total) > 1e-9 {
+		t.Fatalf("mass-balance broken for one-sided depth")
+	}
+	if math.Abs(s2bBuyOnly-total*(1-sideFlowMinShare)) > 1e-9 {
+		t.Fatalf("buy-only S2B=%f, want=%f", s2bBuyOnly, total*(1-sideFlowMinShare))
+	}
+	if math.Abs(s2bSellOnly-total*sideFlowMinShare) > 1e-9 {
+		t.Fatalf("sell-only S2B=%f, want=%f", s2bSellOnly, total*sideFlowMinShare)
+	}
+}
+
+func TestEstimateSideFlowsPerDay_HighCoverageUsesSplitSignal(t *testing.T) {
+	const total = 1_000.0
+	// Same 9:1 imbalance, different absolute depth.
+	lowDepthS2B, _ := estimateSideFlowsPerDay(total, 90, 10)
+	highDepthS2B, _ := estimateSideFlowsPerDay(total, 9_000, 1_000)
+
+	if highDepthS2B <= lowDepthS2B {
+		t.Fatalf("expected stronger split with higher coverage: low=%f high=%f", lowDepthS2B, highDepthS2B)
+	}
+	// Low coverage should stay close to neutral (0.5 * total).
+	if math.Abs(lowDepthS2B-total*0.5) > total*0.08 {
+		t.Fatalf("low-coverage split too far from neutral: got=%f neutral=%f", lowDepthS2B, total*0.5)
+	}
+}
+
+func TestReconcileSideFlowShare_ClampsExtremeShares(t *testing.T) {
+	high := reconcileSideFlowShare(0.5, 1.0, 1.0)
+	low := reconcileSideFlowShare(0.5, 0.0, 1.0)
+
+	if math.Abs(high-(1-sideFlowMinShare)) > 1e-9 {
+		t.Fatalf("high share clamp=%f, want=%f", high, 1-sideFlowMinShare)
+	}
+	if math.Abs(low-sideFlowMinShare) > 1e-9 {
+		t.Fatalf("low share clamp=%f, want=%f", low, sideFlowMinShare)
+	}
+}
+
 func TestExpectedProfitForPlans_LinearAndFeeSensitive(t *testing.T) {
 	planBuy := ExecutionPlanResult{ExpectedPrice: 100}
 	planSell := ExecutionPlanResult{ExpectedPrice: 120}

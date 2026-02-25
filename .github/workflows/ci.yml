@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Go unit tests
+        run: go test ./...
+
+      - name: Engine coverage gate (>= 70%)
+        run: |
+          go test ./internal/engine -coverprofile=engine.cover.out
+          COVERAGE="$(go tool cover -func engine.cover.out | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
+          echo "internal/engine coverage: ${COVERAGE}%"
+          awk -v coverage="${COVERAGE}" 'BEGIN { exit (coverage + 0 >= 70 ? 0 : 1) }'
+
+      - name: Frontend build gate
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build

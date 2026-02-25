@@ -86,56 +86,55 @@ func (s *Scanner) Scan(params ScanParams, progress func(string)) ([]FlipResult, 
 func (s *Scanner) ScanMultiRegion(params ScanParams, progress func(string)) ([]FlipResult, error) {
 	minSec := params.MinRouteSecurity
 
-	// If target region is specified, use it directly instead of radius search
-	if params.TargetRegionID > 0 {
-		progress(fmt.Sprintf("Searching target region %d...", params.TargetRegionID))
+	var buyRegions map[int32]bool
+	var buySystems map[int32]int
+	var buySystemsRadius map[int32]int
 
-		var buySystemsRadius map[int32]int
+	// Optional EveGuru-style source scope: explicit source regions.
+	if len(params.SourceRegionIDs) > 0 {
+		buyRegions = make(map[int32]bool, len(params.SourceRegionIDs))
+		for _, regionID := range params.SourceRegionIDs {
+			if regionID > 0 {
+				buyRegions[regionID] = true
+			}
+		}
+		buySystems = s.SDE.Universe.SystemsInRegions(buyRegions)
+		// With explicit source regions we don't have BFS precomputed from origin.
+		// calculateResults will fall back to shortest-path queries per source system.
+		buySystemsRadius = make(map[int32]int)
+		progress(fmt.Sprintf("Using source region scope: %d region(s)...", len(buyRegions)))
+	} else {
+		progress("Finding buy regions by radius...")
 		if minSec > 0 {
 			buySystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, minSec)
 		} else {
 			buySystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
 		}
-		buyRegions := s.SDE.Universe.RegionsInSet(buySystemsRadius)
-		buySystems := s.SDE.Universe.SystemsInRegions(buyRegions)
-
-		sellRegions := map[int32]bool{params.TargetRegionID: true}
-		sellSystems := s.SDE.Universe.SystemsInRegions(sellRegions)
-
-		progress(fmt.Sprintf("Fetching orders: buy from %d regions, sell to target region...", len(buyRegions)))
-		idx := s.fetchAndIndex(buyRegions, buySystems, sellRegions, sellSystems)
-		return s.calculateResults(params, idx, buySystemsRadius, progress)
+		buyRegions = s.SDE.Universe.RegionsInSet(buySystemsRadius)
+		buySystems = s.SDE.Universe.SystemsInRegions(buyRegions)
 	}
 
-	// Default behavior: search by radius
-	progress("Finding regions by radius...")
-	var buySystemsRadius, sellSystemsRadius map[int32]int
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if minSec > 0 {
-			buySystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.BuyRadius, minSec)
-		} else {
-			buySystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.BuyRadius)
-		}
-	}()
-	go func() {
-		defer wg.Done()
+	var sellRegions map[int32]bool
+	var sellSystems map[int32]int
+
+	// Destination side is either fixed target region or classic sell-radius scope.
+	if params.TargetRegionID > 0 {
+		sellRegions = map[int32]bool{params.TargetRegionID: true}
+		sellSystems = s.SDE.Universe.SystemsInRegions(sellRegions)
+		progress(fmt.Sprintf("Using target region %d for sell side...", params.TargetRegionID))
+	} else {
+		progress("Finding sell regions by radius...")
+		var sellSystemsRadius map[int32]int
 		if minSec > 0 {
 			sellSystemsRadius = s.SDE.Universe.SystemsWithinRadiusMinSecurity(params.CurrentSystemID, params.SellRadius, minSec)
 		} else {
 			sellSystemsRadius = s.SDE.Universe.SystemsWithinRadius(params.CurrentSystemID, params.SellRadius)
 		}
-	}()
-	wg.Wait()
+		sellRegions = s.SDE.Universe.RegionsInSet(sellSystemsRadius)
+		sellSystems = s.SDE.Universe.SystemsInRegions(sellRegions)
+	}
 
-	buyRegions := s.SDE.Universe.RegionsInSet(buySystemsRadius)
-	sellRegions := s.SDE.Universe.RegionsInSet(sellSystemsRadius)
-	buySystems := s.SDE.Universe.SystemsInRegions(buyRegions)
-	sellSystems := s.SDE.Universe.SystemsInRegions(sellRegions)
-
-	progress(fmt.Sprintf("Fetching orders from %d+%d regions...", len(buyRegions), len(sellRegions)))
+	progress(fmt.Sprintf("Fetching orders: buy from %d region(s), sell from %d region(s)...", len(buyRegions), len(sellRegions)))
 	idx := s.fetchAndIndex(buyRegions, buySystems, sellRegions, sellSystems)
 	return s.calculateResults(params, idx, buySystemsRadius, progress)
 }
@@ -163,6 +162,11 @@ type locKey struct {
 	locationID int64
 }
 
+type sysTypeKey struct {
+	typeID   int32
+	systemID int32
+}
+
 // scanIndex holds pre-built maps from the streaming fetch phase.
 // Built concurrently while orders are still arriving from ESI.
 type scanIndex struct {
@@ -174,6 +178,13 @@ type scanIndex struct {
 	// Used for S2B/BfS split so both sides come from the same market context.
 	sellSideBuyDepthByType  map[int32]int64
 	sellSideSellDepthByType map[int32]int64
+	// Destination sell-book supply for regional day-trader metrics.
+	// Indexed by (type, location) and (type, system) to support station/system scopes.
+	sellSideSellDepthByLoc        map[locKey]int64
+	sellSideSellDepthByTypeSystem map[sysTypeKey]int64
+	// Minimum sell order price at destination — used by "sell order mode" in the regional day trader.
+	sellSideSellMinPriceByLoc        map[locKey]float64
+	sellSideSellMinPriceByTypeSystem map[sysTypeKey]float64
 	// Raw orders kept for execution plan (indexed by location+type).
 	sellOrders []esi.MarketOrder
 	buyOrders  []esi.MarketOrder
@@ -262,12 +273,16 @@ func (s *Scanner) fetchAndIndex(
 	sellSideSellCh := s.fetchOrdersStream(sellRegions, "sell", sellSystems)
 
 	idx := &scanIndex{
-		sellByType:              make(map[int32][]sellInfo),
-		sellCounts:              make(map[locKey]int),
-		buyByType:               make(map[int32][]buyInfo),
-		buyCounts:               make(map[locKey]int),
-		sellSideBuyDepthByType:  make(map[int32]int64),
-		sellSideSellDepthByType: make(map[int32]int64),
+		sellByType:                       make(map[int32][]sellInfo),
+		sellCounts:                       make(map[locKey]int),
+		buyByType:                        make(map[int32][]buyInfo),
+		buyCounts:                        make(map[locKey]int),
+		sellSideBuyDepthByType:           make(map[int32]int64),
+		sellSideSellDepthByType:          make(map[int32]int64),
+		sellSideSellDepthByLoc:           make(map[locKey]int64),
+		sellSideSellDepthByTypeSystem:    make(map[sysTypeKey]int64),
+		sellSideSellMinPriceByLoc:        make(map[locKey]float64),
+		sellSideSellMinPriceByTypeSystem: make(map[sysTypeKey]float64),
 	}
 
 	var wg sync.WaitGroup
@@ -315,12 +330,23 @@ func (s *Scanner) fetchAndIndex(
 		}
 	}()
 
-	// Consumer 3: collect sell-side sell-book depth by type (for side-flow split only).
+	// Consumer 3: collect sell-side sell-book depth and minimum ask price by type.
+	// Depth is used for S2B/BfS split; min price is used by sell-order mode in regional day trader.
 	go func() {
 		defer wg.Done()
 		for batch := range sellSideSellCh {
 			for _, o := range batch {
 				idx.sellSideSellDepthByType[o.TypeID] += int64(o.VolumeRemain)
+				locK := locKey{o.TypeID, o.LocationID}
+				idx.sellSideSellDepthByLoc[locK] += int64(o.VolumeRemain)
+				if cur, ok := idx.sellSideSellMinPriceByLoc[locK]; !ok || o.Price < cur {
+					idx.sellSideSellMinPriceByLoc[locK] = o.Price
+				}
+				sysK := sysTypeKey{o.TypeID, o.SystemID}
+				idx.sellSideSellDepthByTypeSystem[sysK] += int64(o.VolumeRemain)
+				if cur, ok := idx.sellSideSellMinPriceByTypeSystem[sysK]; !ok || o.Price < cur {
+					idx.sellSideSellMinPriceByTypeSystem[sysK] = o.Price
+				}
 			}
 		}
 	}()
@@ -365,6 +391,8 @@ func (s *Scanner) calculateResults(
 	bestPairs := make(map[pairKey]*FlipResult)
 
 	minSec := params.MinRouteSecurity
+	targetMarketSystemID := params.TargetMarketSystemID
+	targetMarketLocationID := params.TargetMarketLocationID
 
 	// Pre-filter: for each type, keep only the cheapest sell per location
 	// and the most expensive buy per location to reduce cross-join iterations.
@@ -473,6 +501,12 @@ func (s *Scanner) calculateResults(
 		// Cross-join deduplicated locations (much smaller than raw order count)
 		for sellLocID, sell := range bestSellByLoc {
 			for buyLocID, buy := range bestBuyByLoc {
+				if targetMarketLocationID > 0 && buyLocID != targetMarketLocationID {
+					continue
+				}
+				if targetMarketSystemID > 0 && buy.SystemID != targetMarketSystemID {
+					continue
+				}
 				if buy.Price <= sell.Price {
 					continue
 				}
@@ -533,6 +567,27 @@ func (s *Scanner) calculateResults(
 					profitPerJump = totalProfit / float64(totalJumps)
 				}
 
+				targetSellSupply := int64(0)
+				targetLowestSell := 0.0
+				switch {
+				case targetMarketLocationID > 0:
+					locK := locKey{typeID, targetMarketLocationID}
+					targetSellSupply = idx.sellSideSellDepthByLoc[locK]
+					targetLowestSell = idx.sellSideSellMinPriceByLoc[locK]
+				case targetMarketSystemID > 0:
+					sysK := sysTypeKey{typeID, buy.SystemID}
+					targetSellSupply = idx.sellSideSellDepthByTypeSystem[sysK]
+					targetLowestSell = idx.sellSideSellMinPriceByTypeSystem[sysK]
+				default:
+					// In unconstrained mode keep metric local to the chosen liquidation location first.
+					locK := locKey{typeID, buyLocID}
+					targetSellSupply = idx.sellSideSellDepthByLoc[locK]
+					targetLowestSell = idx.sellSideSellMinPriceByLoc[locK]
+					if targetSellSupply <= 0 {
+						targetSellSupply = idx.sellSideSellDepthByType[typeID]
+					}
+				}
+
 				buyRegionID := int32(0)
 				if sys, ok := s.SDE.Systems[sell.SystemID]; ok {
 					buyRegionID = sys.RegionID
@@ -543,39 +598,41 @@ func (s *Scanner) calculateResults(
 				}
 
 				result := FlipResult{
-					TypeID:          typeID,
-					TypeName:        itemType.Name,
-					Volume:          itemType.Volume,
-					BuyPrice:        sell.Price,
-					BestAskPrice:    sell.Price,
-					BestAskQty:      sell.BestPriceVolume,
-					BuyStation:      "",
-					BuySystemName:   s.systemName(sell.SystemID),
-					BuySystemID:     sell.SystemID,
-					BuyRegionID:     buyRegionID,
-					BuyRegionName:   s.regionName(buyRegionID),
-					BuyLocationID:   sellLocID,
-					SellPrice:       buy.Price,
-					BestBidPrice:    buy.Price,
-					BestBidQty:      buy.BestPriceVolume,
-					SellStation:     "",
-					SellSystemName:  s.systemName(buy.SystemID),
-					SellSystemID:    buy.SystemID,
-					SellRegionID:    sellRegionID,
-					SellRegionName:  s.regionName(sellRegionID),
-					SellLocationID:  buyLocID,
-					ProfitPerUnit:   profitPerUnit,
-					MarginPercent:   margin,
-					UnitsToBuy:      units,
-					BuyOrderRemain:  buy.VolumeRemain,
-					SellOrderRemain: sell.VolumeRemain,
-					TotalProfit:     totalProfit,
-					ProfitPerJump:   sanitizeFloat(profitPerJump),
-					BuyJumps:        buyJumps,
-					SellJumps:       sellJumps,
-					TotalJumps:      totalJumps,
-					BuyCompetitors:  sell.OrderCount,
-					SellCompetitors: buy.OrderCount,
+					TypeID:           typeID,
+					TypeName:         itemType.Name,
+					Volume:           itemType.Volume,
+					BuyPrice:         sell.Price,
+					BestAskPrice:     sell.Price,
+					BestAskQty:       sell.BestPriceVolume,
+					BuyStation:       "",
+					BuySystemName:    s.systemName(sell.SystemID),
+					BuySystemID:      sell.SystemID,
+					BuyRegionID:      buyRegionID,
+					BuyRegionName:    s.regionName(buyRegionID),
+					BuyLocationID:    sellLocID,
+					SellPrice:        buy.Price,
+					BestBidPrice:     buy.Price,
+					BestBidQty:       buy.BestPriceVolume,
+					SellStation:      "",
+					SellSystemName:   s.systemName(buy.SystemID),
+					SellSystemID:     buy.SystemID,
+					SellRegionID:     sellRegionID,
+					SellRegionName:   s.regionName(sellRegionID),
+					SellLocationID:   buyLocID,
+					ProfitPerUnit:    profitPerUnit,
+					MarginPercent:    margin,
+					UnitsToBuy:       units,
+					BuyOrderRemain:   buy.VolumeRemain,
+					SellOrderRemain:  sell.VolumeRemain,
+					TotalProfit:      totalProfit,
+					ProfitPerJump:    sanitizeFloat(profitPerJump),
+					BuyJumps:         buyJumps,
+					SellJumps:        sellJumps,
+					TotalJumps:       totalJumps,
+					BuyCompetitors:   sell.OrderCount,
+					SellCompetitors:  buy.OrderCount,
+					TargetSellSupply: targetSellSupply,
+					TargetLowestSell: targetLowestSell,
 				}
 				bestPairs[pk] = &result
 			}
@@ -907,27 +964,99 @@ func estimateFlipDailyExecutableUnitsPerDay(unitsToBuy int32, s2bPerDay, bfsPerD
 	return boundByFlow
 }
 
-// estimateSideFlowsPerDay splits total traded daily flow into S2B and BfS parts
-// using current book imbalance as a proxy for aggressor-side pressure.
-// It preserves mass-balance: S2B + BfS = totalPerDay.
+const (
+	// Flow split fallback when no directional split signal is available.
+	sideFlowNeutralShare = 0.5
+	// Keep both sides non-zero even under extreme split to avoid brittle
+	// downstream behavior from noisy snapshots.
+	sideFlowMinShare = 0.03
+	// Coverage thresholds for trusting split signal:
+	// low=0.25x daily turnover, high=4x daily turnover.
+	sideFlowCoverageLow  = 0.25
+	sideFlowCoverageHigh = 4.0
+)
+
+// estimateSideFlowsPerDay performs a split+reconcile model:
+// 1) infer directional split signal from buy/sell book depths;
+// 2) estimate confidence in that signal from depth coverage;
+// 3) reconcile to CCP total daily volume so mass-balance is exact.
+//
+// Mass-balance invariant: S2B + BfS == totalPerDay.
 func estimateSideFlowsPerDay(totalPerDay float64, buyDepth, sellDepth int64) (float64, float64) {
 	if totalPerDay <= 0 {
 		return 0, 0
 	}
-	switch {
-	case buyDepth <= 0 && sellDepth <= 0:
-		half := totalPerDay / 2
-		return half, totalPerDay - half
-	case buyDepth <= 0:
-		return 0, totalPerDay
-	case sellDepth <= 0:
-		return totalPerDay, 0
-	default:
-		totalDepth := float64(buyDepth + sellDepth)
-		s2b := totalPerDay * float64(buyDepth) / totalDepth
-		bfs := totalPerDay - s2b
-		return s2b, bfs
+
+	buy := math.Max(float64(buyDepth), 0)
+	sell := math.Max(float64(sellDepth), 0)
+
+	// No book data at all: neutral fallback.
+	if buy <= 0 && sell <= 0 {
+		s2b := totalPerDay * sideFlowNeutralShare
+		return s2b, totalPerDay - s2b
 	}
+	// One-sided depth: keep both sides alive via tail clamp, but reflect direction.
+	if buy <= 0 {
+		s2b := totalPerDay * sideFlowMinShare
+		return s2b, totalPerDay - s2b
+	}
+	if sell <= 0 {
+		s2b := totalPerDay * (1 - sideFlowMinShare)
+		return s2b, totalPerDay - s2b
+	}
+
+	signalShare := sideFlowSplitSignalShare(buy, sell)
+	signalConfidence := sideFlowSplitSignalConfidence(totalPerDay, buy, sell)
+	reconciledShare := reconcileSideFlowShare(sideFlowNeutralShare, signalShare, signalConfidence)
+
+	s2b := totalPerDay * reconciledShare
+	bfs := totalPerDay - s2b
+	return s2b, bfs
+}
+
+// sideFlowSplitSignalShare derives directional split from depth imbalance.
+// Square-root damping reduces overreaction to very large book asymmetries.
+func sideFlowSplitSignalShare(buyDepth, sellDepth float64) float64 {
+	if buyDepth <= 0 || sellDepth <= 0 {
+		return sideFlowNeutralShare
+	}
+	bw := math.Sqrt(buyDepth)
+	sw := math.Sqrt(sellDepth)
+	if bw+sw <= 0 {
+		return sideFlowNeutralShare
+	}
+	return bw / (bw + sw)
+}
+
+// sideFlowSplitSignalConfidence estimates trust in split signal based on
+// depth coverage relative to daily traded volume.
+func sideFlowSplitSignalConfidence(totalPerDay, buyDepth, sellDepth float64) float64 {
+	if totalPerDay <= 0 || buyDepth <= 0 || sellDepth <= 0 {
+		return 0
+	}
+	depthCoverage := (buyDepth + sellDepth) / math.Max(totalPerDay, 1)
+	return normalize(
+		math.Log10(depthCoverage+1),
+		math.Log10(1+sideFlowCoverageLow),
+		math.Log10(1+sideFlowCoverageHigh),
+	)
+}
+
+// reconcileSideFlowShare blends neutral prior with split signal by confidence,
+// then clamps tails to keep both sides alive under noisy market snapshots.
+func reconcileSideFlowShare(priorShare, signalShare, confidence float64) float64 {
+	if priorShare <= 0 || priorShare >= 1 {
+		priorShare = sideFlowNeutralShare
+	}
+	conf := clamp01(confidence)
+	share := priorShare*(1-conf) + signalShare*conf
+	if share < sideFlowMinShare {
+		return sideFlowMinShare
+	}
+	if share > 1-sideFlowMinShare {
+		return 1 - sideFlowMinShare
+	}
+	return share
 }
 
 // findSafeExecutionQuantity returns the largest executable and profitable quantity

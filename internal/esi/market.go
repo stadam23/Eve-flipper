@@ -12,6 +12,7 @@ type MarketOrder struct {
 	SystemID     int32   `json:"system_id"`
 	Price        float64 `json:"price"`
 	VolumeRemain int32   `json:"volume_remain"`
+	MinVolume    int32   `json:"min_volume"`
 	IsBuyOrder   bool    `json:"is_buy_order"`
 	RegionID     int32   `json:"-"` // set by us
 }

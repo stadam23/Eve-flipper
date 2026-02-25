@@ -1,4 +1,56 @@
-import type { AlertHistoryEntry, AppConfig, AppStatus, AuthStatus, CharacterInfo, CharacterRoles, ContractDetails, ContractResult, CorpDashboard, CorpIndustryJob, CorpJournalEntry, CorpMarketOrderDetail, CorpMember, CorpMiningEntry, DemandRegionResponse, DemandRegionsResponse, ExecutionPlanResult, FlipResult, HotZonesResponse, OptimizerDiagnostic, OrderDeskResponse, PLEXDashboard, PortfolioPnL, PortfolioOptimization, RegionOpportunities, RouteResult, ScanParams, ScanRecord, StationAIChatRequest, StationAIChatResponse, StationAIStreamMessage, StationCacheMeta, StationCommandResponse, StationInfo, StationsResponse, StationTrade, StationTradeState, StationTradeStateMode, UndercutStatus, WatchlistItem } from "./types";
+import type {
+  AlertHistoryEntry,
+  AppConfig,
+  AppStatus,
+  AuthStatus,
+  CharacterInfo,
+  CharacterRoles,
+  ContractDetails,
+  ContractResult,
+  CorpDashboard,
+  CorpIndustryJob,
+  CorpJournalEntry,
+  CorpMarketOrderDetail,
+  CorpMember,
+  CorpMiningEntry,
+  DemandRegionResponse,
+  DemandRegionsResponse,
+  ExecutionPlanResult,
+  FlipResult,
+  HotZonesResponse,
+  IndustryJob,
+  IndustryJobStatus,
+  IndustryLedger,
+  IndustryMaterialPlanRecord,
+  IndustryPlanPatch,
+  IndustryPlanPreview,
+  IndustryPlanSummary,
+  IndustryProject,
+  IndustryProjectSnapshot,
+  IndustryTaskRecord,
+  IndustryTaskStatus,
+  OptimizerDiagnostic,
+  OrderDeskResponse,
+  PLEXDashboard,
+  PortfolioPnL,
+  PortfolioOptimization,
+  RegionOpportunities,
+  RouteResult,
+  ScanParams,
+  ScanRecord,
+  StationAIChatRequest,
+  StationAIChatResponse,
+  StationAIStreamMessage,
+  StationCacheMeta,
+  StationCommandResponse,
+  StationInfo,
+  StationsResponse,
+  StationTrade,
+  StationTradeState,
+  StationTradeStateMode,
+  UndercutStatus,
+  WatchlistItem,
+} from "./types";
 
 const BASE = import.meta.env.VITE_API_URL || "";
 
@@ -165,6 +217,35 @@ export async function scanMultiRegion(
   );
 }
 
+export async function scanRegionalDayTrader(
+  params: ScanParams,
+  onProgress: (msg: string) => void,
+  signal?: AbortSignal,
+  onMeta?: (meta: StationCacheMeta | undefined) => void,
+  onSummary?: (summary: { count: number; targetRegionName: string; periodDays: number }) => void,
+): Promise<FlipResult[]> {
+  return streamNdjson<FlipResult>(
+    `${BASE}/api/scan/regional-day`,
+    params,
+    onProgress,
+    signal,
+    "Regional day trader scan failed",
+    (msg) => {
+      onMeta?.(msg.cache_meta);
+      const raw = msg as {
+        count?: number;
+        target_region_name?: string;
+        period_days?: number;
+      };
+      onSummary?.({
+        count: raw.count ?? 0,
+        targetRegionName: raw.target_region_name ?? "",
+        periodDays: raw.period_days ?? 14,
+      });
+    },
+  );
+}
+
 export async function scanContracts(
   params: ScanParams,
   onProgress: (msg: string) => void,
@@ -192,8 +273,10 @@ export async function findRoutes(
     `${BASE}/api/route/find`,
     {
       system_name: params.system_name,
+      target_system_name: params.route_target_system_name,
       cargo_capacity: params.cargo_capacity,
       min_margin: params.min_margin,
+      min_isk_per_jump: params.route_min_isk_per_jump,
       sales_tax_percent: params.sales_tax_percent,
       broker_fee_percent: params.broker_fee_percent,
       split_trade_fees: params.split_trade_fees,
@@ -204,6 +287,7 @@ export async function findRoutes(
       min_hops: minHops,
       max_hops: maxHops,
       min_route_security: params.min_route_security,
+      allow_empty_hops: params.route_allow_empty_hops,
       include_structures: params.include_structures,
     },
     onProgress,
@@ -432,6 +516,357 @@ export async function rebootStationCache(): Promise<{
     method: "POST",
   });
   return handleResponse<{ ok: boolean; cleared: number; rebooted_at?: string }>(res);
+}
+
+// --- Industry Ledger (auth) ---
+
+export interface IndustryProjectsResponse {
+  projects: IndustryProject[];
+  count: number;
+}
+
+export async function getAuthIndustryProjects(params?: {
+  status?: string;
+  limit?: number;
+}): Promise<IndustryProjectsResponse> {
+  const qp = new URLSearchParams();
+  if (params?.status) qp.set("status", params.status);
+  if (params?.limit != null && params.limit > 0) qp.set("limit", String(params.limit));
+  const qs = qp.toString();
+  const res = await fetch(`${BASE}/api/auth/industry/projects${qs ? `?${qs}` : ""}`);
+  const data = await handleResponse<IndustryProjectsResponse>(res);
+  return {
+    projects: Array.isArray(data.projects) ? data.projects : [],
+    count: Number.isFinite(data.count) ? data.count : 0,
+  };
+}
+
+export interface IndustryProjectCreatePayload {
+  name: string;
+  status?: string;
+  strategy?: "conservative" | "balanced" | "aggressive";
+  notes?: string;
+  params?: unknown;
+}
+
+export interface IndustryProjectCreateResponse {
+  ok: boolean;
+  project: IndustryProject;
+}
+
+export async function createAuthIndustryProject(
+  payload: IndustryProjectCreatePayload
+): Promise<IndustryProjectCreateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<IndustryProjectCreateResponse>(res);
+}
+
+export async function getAuthIndustryProjectSnapshot(
+  projectID: number
+): Promise<IndustryProjectSnapshot> {
+  const res = await fetch(`${BASE}/api/auth/industry/projects/${projectID}/snapshot`);
+  const data = await handleResponse<IndustryProjectSnapshot>(res);
+  return {
+    ...data,
+    tasks: Array.isArray(data.tasks) ? data.tasks : [],
+    jobs: Array.isArray(data.jobs) ? data.jobs : [],
+    materials: Array.isArray(data.materials) ? data.materials : [],
+    blueprints: Array.isArray(data.blueprints) ? data.blueprints : [],
+    material_diff: Array.isArray(data.material_diff) ? data.material_diff : [],
+  };
+}
+
+export interface IndustryProjectPlanResponse {
+  ok: boolean;
+  summary: IndustryPlanSummary;
+}
+
+export async function planAuthIndustryProject(
+  projectID: number,
+  patch: IndustryPlanPatch
+): Promise<IndustryProjectPlanResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/projects/${projectID}/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  return handleResponse<IndustryProjectPlanResponse>(res);
+}
+
+export async function previewAuthIndustryProjectPlan(
+  projectID: number,
+  patch: IndustryPlanPatch
+): Promise<IndustryPlanPreview> {
+  const res = await fetch(`${BASE}/api/auth/industry/projects/${projectID}/plan/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const data = await handleResponse<IndustryPlanPreview>(res);
+  return {
+    ...data,
+    tasks: Array.isArray(data.tasks) ? data.tasks : [],
+    jobs: Array.isArray(data.jobs) ? data.jobs : [],
+    warnings: Array.isArray(data.warnings) ? data.warnings : [],
+  };
+}
+
+export interface IndustryProjectMaterialRebalancePayload {
+  scope?: "single" | "all";
+  character_id?: number;
+  lookback_days?: number;
+  strategy?: "preserve" | "buy" | "build";
+  warehouse_scope?: "global" | "location_first" | "strict_location";
+  location_ids?: number[];
+}
+
+export interface IndustryProjectMaterialRebalanceResponse {
+  ok: boolean;
+  materials: IndustryMaterialPlanRecord[];
+  summary: {
+    project_id: number;
+    updated: number;
+    scope: "single" | "all";
+    lookback_days: number;
+    strategy: "preserve" | "buy" | "build";
+    warehouse_scope: "global" | "location_first" | "strict_location";
+    transactions: number;
+    positions_total: number;
+    positions_used: number;
+    stock_types: number;
+    stock_units: number;
+    allocated_available: number;
+    remaining_missing_qty: number;
+    location_filter_count: number;
+  };
+}
+
+export async function rebalanceAuthIndustryProjectMaterials(
+  projectID: number,
+  payload: IndustryProjectMaterialRebalancePayload
+): Promise<IndustryProjectMaterialRebalanceResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/projects/${projectID}/materials/rebalance`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+  const data = await handleResponse<IndustryProjectMaterialRebalanceResponse>(res);
+  return {
+    ...data,
+    materials: Array.isArray(data.materials) ? data.materials : [],
+  };
+}
+
+export interface IndustryProjectBlueprintSyncPayload {
+  scope?: "single" | "all";
+  character_id?: number;
+  location_ids?: number[];
+  default_bpc_runs?: number;
+}
+
+export interface IndustryProjectBlueprintSyncResponse {
+  ok: boolean;
+  summary: {
+    project_id: number;
+    scope: "single" | "all";
+    characters: number;
+    characters_used: number;
+    blueprints_endpoint_characters?: number;
+    assets_fallback_characters?: number;
+    blueprint_rows_scanned?: number;
+    assets_scanned: number;
+    blueprints_detected: number;
+    blueprints_upserted: number;
+    default_bpc_runs: number;
+    location_filter_count: number;
+    warnings: string[];
+  };
+}
+
+export async function syncAuthIndustryProjectBlueprintPool(
+  projectID: number,
+  payload: IndustryProjectBlueprintSyncPayload
+): Promise<IndustryProjectBlueprintSyncResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/projects/${projectID}/blueprints/sync`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+  return handleResponse<IndustryProjectBlueprintSyncResponse>(res);
+}
+
+export interface IndustryJobStatusUpdatePayload {
+  job_id: number;
+  status: IndustryJobStatus;
+  started_at?: string;
+  finished_at?: string;
+  notes?: string;
+}
+
+export interface IndustryJobStatusUpdateResponse {
+  ok: boolean;
+  job: IndustryJob;
+}
+
+export async function updateAuthIndustryJobStatus(
+  payload: IndustryJobStatusUpdatePayload
+): Promise<IndustryJobStatusUpdateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/jobs/status`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<IndustryJobStatusUpdateResponse>(res);
+}
+
+export interface IndustryTaskStatusUpdatePayload {
+  task_id: number;
+  status: IndustryTaskStatus;
+  priority?: number;
+}
+
+export interface IndustryTaskStatusUpdateResponse {
+  ok: boolean;
+  task: IndustryTaskRecord;
+}
+
+export async function updateAuthIndustryTaskStatus(
+  payload: IndustryTaskStatusUpdatePayload
+): Promise<IndustryTaskStatusUpdateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/tasks/status`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<IndustryTaskStatusUpdateResponse>(res);
+}
+
+export interface IndustryTaskBulkStatusUpdatePayload {
+  task_ids: number[];
+  status: IndustryTaskStatus;
+  priority?: number;
+}
+
+export interface IndustryTaskBulkStatusUpdateResponse {
+  ok: boolean;
+  updated: number;
+  tasks: IndustryTaskRecord[];
+}
+
+export async function updateAuthIndustryTaskStatusBulk(
+  payload: IndustryTaskBulkStatusUpdatePayload
+): Promise<IndustryTaskBulkStatusUpdateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/tasks/status/bulk`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await handleResponse<IndustryTaskBulkStatusUpdateResponse>(res);
+  return {
+    ...data,
+    tasks: Array.isArray(data.tasks) ? data.tasks : [],
+    updated: Number.isFinite(data.updated) ? data.updated : 0,
+  };
+}
+
+export interface IndustryTaskPriorityUpdatePayload {
+  task_id: number;
+  priority: number;
+}
+
+export interface IndustryTaskPriorityUpdateResponse {
+  ok: boolean;
+  task: IndustryTaskRecord;
+}
+
+export async function updateAuthIndustryTaskPriority(
+  payload: IndustryTaskPriorityUpdatePayload
+): Promise<IndustryTaskPriorityUpdateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/tasks/priority`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<IndustryTaskPriorityUpdateResponse>(res);
+}
+
+export interface IndustryTaskBulkPriorityUpdatePayload {
+  task_ids: number[];
+  priority: number;
+}
+
+export interface IndustryTaskBulkPriorityUpdateResponse {
+  ok: boolean;
+  updated: number;
+  tasks: IndustryTaskRecord[];
+}
+
+export async function updateAuthIndustryTaskPriorityBulk(
+  payload: IndustryTaskBulkPriorityUpdatePayload
+): Promise<IndustryTaskBulkPriorityUpdateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/tasks/priority/bulk`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await handleResponse<IndustryTaskBulkPriorityUpdateResponse>(res);
+  return {
+    ...data,
+    tasks: Array.isArray(data.tasks) ? data.tasks : [],
+    updated: Number.isFinite(data.updated) ? data.updated : 0,
+  };
+}
+
+export interface IndustryJobBulkStatusUpdatePayload {
+  job_ids: number[];
+  status: IndustryJobStatus;
+  started_at?: string;
+  finished_at?: string;
+  notes?: string;
+}
+
+export interface IndustryJobBulkStatusUpdateResponse {
+  ok: boolean;
+  updated: number;
+  jobs: IndustryJob[];
+}
+
+export async function updateAuthIndustryJobStatusBulk(
+  payload: IndustryJobBulkStatusUpdatePayload
+): Promise<IndustryJobBulkStatusUpdateResponse> {
+  const res = await fetch(`${BASE}/api/auth/industry/jobs/status/bulk`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await handleResponse<IndustryJobBulkStatusUpdateResponse>(res);
+  return {
+    ...data,
+    jobs: Array.isArray(data.jobs) ? data.jobs : [],
+    updated: Number.isFinite(data.updated) ? data.updated : 0,
+  };
+}
+
+export async function getAuthIndustryLedger(params?: {
+  project_id?: number;
+  status?: IndustryJobStatus;
+  limit?: number;
+}): Promise<IndustryLedger> {
+  const qp = new URLSearchParams();
+  if (params?.project_id != null && params.project_id > 0) qp.set("project_id", String(params.project_id));
+  if (params?.status) qp.set("status", params.status);
+  if (params?.limit != null && params.limit > 0) qp.set("limit", String(params.limit));
+  const qs = qp.toString();
+  const res = await fetch(`${BASE}/api/auth/industry/ledger${qs ? `?${qs}` : ""}`);
+  const data = await handleResponse<IndustryLedger>(res);
+  return {
+    ...data,
+    entries: Array.isArray(data.entries) ? data.entries : [],
+  };
 }
 
 export async function stationAIChat(
@@ -821,8 +1256,8 @@ export async function analyzeIndustry(
   return result;
 }
 
-export async function searchBuildableItems(query: string, limit = 20): Promise<BuildableItem[]> {
-  const res = await fetch(`${BASE}/api/industry/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+export async function searchBuildableItems(query: string, limit = 20, signal?: AbortSignal): Promise<BuildableItem[]> {
+  const res = await fetch(`${BASE}/api/industry/search?q=${encodeURIComponent(query)}&limit=${limit}`, { signal });
   return handleResponse<BuildableItem[]>(res);
 }
 

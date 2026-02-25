@@ -43,6 +43,8 @@ type Client struct {
 
 	// EVERef structure name fallback (loaded at startup)
 	everefNames sync.Map // int64 -> string
+	// Known structure -> solar_system_id mappings from ESI/EVERef.
+	structureSystems sync.Map // int64 -> int32
 
 	// Health check cache
 	healthMu      sync.RWMutex
@@ -114,14 +116,15 @@ func (c *Client) LoadEVERefStructures() {
 			return
 		}
 
-		count := 0
 		for idStr, s := range raw {
 			id, err := strconv.ParseInt(idStr, 10, 64)
 			if err != nil || s.Name == "" {
 				continue
 			}
 			c.everefNames.Store(id, s.Name)
-			count++
+			if s.SystemID > 0 {
+				c.structureSystems.Store(id, s.SystemID)
+			}
 		}
 
 	}()
@@ -287,6 +290,9 @@ func (c *Client) StructureName(structureID int64, accessToken string) string {
 	if err := c.AuthGetJSON(url, accessToken, &info); err == nil && info.Name != "" {
 		log.Printf("[ESI] Resolved structure %d → %q", structureID, info.Name)
 		c.stationCache.Store(structureID, info.Name)
+		if info.SolarSystemID > 0 {
+			c.structureSystems.Store(structureID, info.SolarSystemID)
+		}
 		if c.stationStore != nil {
 			c.stationStore.SetStation(structureID, info.Name)
 		}
@@ -307,6 +313,19 @@ func (c *Client) StructureName(structureID int64, accessToken string) string {
 	// (e.g., when token is refreshed or structure becomes accessible)
 	name := fmt.Sprintf("Structure %d", structureID)
 	return name
+}
+
+// StructureSystemID returns known solar_system_id for a structure from local caches.
+func (c *Client) StructureSystemID(structureID int64) (int32, bool) {
+	if structureID <= 0 {
+		return 0, false
+	}
+	if v, ok := c.structureSystems.Load(structureID); ok {
+		if sid, okCast := v.(int32); okCast && sid > 0 {
+			return sid, true
+		}
+	}
+	return 0, false
 }
 
 // StructureInfo holds details about a player-owned structure.
