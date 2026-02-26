@@ -1460,6 +1460,9 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	if v, ok := patch["min_demand_per_day"]; ok {
 		json.Unmarshal(v, &cfg.MinDemandPerDay)
 	}
+	if v, ok := patch["purchase_demand_days"]; ok {
+		json.Unmarshal(v, &cfg.PurchaseDemandDays)
+	}
 	if v, ok := patch["shipping_cost_per_m3_jump"]; ok {
 		json.Unmarshal(v, &cfg.ShippingCostPerM3Jump)
 	}
@@ -1591,6 +1594,9 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.MinDemandPerDay < 0 {
 		cfg.MinDemandPerDay = 0
+	}
+	if cfg.PurchaseDemandDays < 0 {
+		cfg.PurchaseDemandDays = 0
 	}
 	if cfg.ShippingCostPerM3Jump < 0 {
 		cfg.ShippingCostPerM3Jump = 0
@@ -1857,6 +1863,7 @@ type scanRequest struct {
 	MinPeriodROI           float64  `json:"min_period_roi"`
 	MaxDOS                 float64  `json:"max_dos"`
 	MinDemandPerDay        float64  `json:"min_demand_per_day"`
+	PurchaseDemandDays     float64  `json:"purchase_demand_days"`
 	MinS2BPerDay           float64  `json:"min_s2b_per_day"`
 	MinBfSPerDay           float64  `json:"min_bfs_per_day"`
 	MinS2BBfSRatio         float64  `json:"min_s2b_bfs_ratio"`
@@ -1961,6 +1968,7 @@ func (s *Server) parseScanParams(req scanRequest) (engine.ScanParams, error) {
 		MinPeriodROI:               req.MinPeriodROI,
 		MaxDOS:                     req.MaxDOS,
 		MinDemandPerDay:            req.MinDemandPerDay,
+		PurchaseDemandDays:         req.PurchaseDemandDays,
 		MinS2BPerDay:               req.MinS2BPerDay,
 		MinBfSPerDay:               req.MinBfSPerDay,
 		MinS2BBfSRatio:             req.MinS2BBfSRatio,
@@ -3574,6 +3582,7 @@ func (s *Server) regionalDayParamsFromHistory(record *db.ScanRecord) (engine.Sca
 		MinPeriodROI:           req.MinPeriodROI,
 		MaxDOS:                 req.MaxDOS,
 		MinDemandPerDay:        req.MinDemandPerDay,
+		PurchaseDemandDays:     req.PurchaseDemandDays,
 		MinS2BPerDay:           req.MinS2BPerDay,
 		MinBfSPerDay:           req.MinBfSPerDay,
 		MinS2BBfSRatio:         req.MinS2BBfSRatio,

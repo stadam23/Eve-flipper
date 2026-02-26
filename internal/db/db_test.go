@@ -450,6 +450,7 @@ func TestDB_ConfigRoundTrip(t *testing.T) {
 		MinPeriodROI:           12.5,
 		MaxDOS:                 4.5,
 		MinDemandPerDay:        7,
+		PurchaseDemandDays:     0.5,
 		ShippingCostPerM3Jump:  123,
 		SourceRegions:          []string{"The Forge", "Domain"},
 		TargetRegion:           "Domain",
@@ -486,8 +487,8 @@ func TestDB_ConfigRoundTrip(t *testing.T) {
 	if got.WindowW != 1024 || got.WindowH != 768 {
 		t.Errorf("LoadConfig window = %dx%d", got.WindowW, got.WindowH)
 	}
-	if got.AvgPricePeriod != 21 || got.MaxDOS != 4.5 || got.MinDemandPerDay != 7 {
-		t.Errorf("LoadConfig region thresholds mismatch: avg=%d max_dos=%v min_demand=%v", got.AvgPricePeriod, got.MaxDOS, got.MinDemandPerDay)
+	if got.AvgPricePeriod != 21 || got.MaxDOS != 4.5 || got.MinDemandPerDay != 7 || got.PurchaseDemandDays != 0.5 {
+		t.Errorf("LoadConfig region thresholds mismatch: avg=%d max_dos=%v min_demand=%v purchase_days=%v", got.AvgPricePeriod, got.MaxDOS, got.MinDemandPerDay, got.PurchaseDemandDays)
 	}
 	if got.TargetMarketSystem != "Jita" || got.TargetMarketLocationID != 60003760 {
 		t.Errorf("LoadConfig target market mismatch: system=%q location=%d", got.TargetMarketSystem, got.TargetMarketLocationID)

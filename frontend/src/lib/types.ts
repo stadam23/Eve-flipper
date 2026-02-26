@@ -411,6 +411,7 @@ export interface ScanParams {
   min_period_roi?: number;
   max_dos?: number;
   min_demand_per_day?: number;
+  purchase_demand_days?: number;
   min_s2b_per_day?: number;
   min_bfs_per_day?: number;
   min_s2b_bfs_ratio?: number;
@@ -474,6 +475,7 @@ export interface AppConfig {
   min_period_roi?: number;
   max_dos?: number;
   min_demand_per_day?: number;
+  purchase_demand_days?: number;
   shipping_cost_per_m3_jump?: number;
   source_regions?: string[];
   target_region?: string;

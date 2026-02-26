@@ -101,6 +101,18 @@ func regionalPeriodDays(params ScanParams) int {
 	return defaultRegionalPeriodDays
 }
 
+func regionalPurchaseDemandDays(params ScanParams) float64 {
+	if params.PurchaseDemandDays > 0 {
+		return params.PurchaseDemandDays
+	}
+	// Sell-order mode is less immediate and usually sized below 1 full demand day.
+	// Align default behavior with common "0.5 DoD" workflow.
+	if params.SellOrderMode {
+		return 0.5
+	}
+	return 1.0
+}
+
 func (s *Scanner) historyEntries(regionID int32, typeID int32) []esi.HistoryEntry {
 	if regionID <= 0 || typeID <= 0 {
 		return nil
@@ -310,10 +322,18 @@ func (s *Scanner) BuildRegionalDayTrader(
 		targetDemandPerDay := blendedRegionalDemandPerDay(row, targetStats, periodDays)
 
 		purchaseUnits := row.UnitsToBuy
+		if params.SellOrderMode && row.SellOrderRemain > 0 {
+			// In sell-order mode we are not constrained by destination buy-book L1 depth.
+			// Base size on source-side executable availability.
+			purchaseUnits = row.SellOrderRemain
+		}
 		if targetDemandPerDay > 0 {
-			// Cap purchase to daily demand. Use ceiling so items with low but non-zero
-			// demand (e.g. 0.3/day) are capped to 1 unit rather than skipped entirely.
-			demandCap := int32(math.Ceil(targetDemandPerDay))
+			demandDays := regionalPurchaseDemandDays(params)
+			demandCap := int32(math.Ceil(targetDemandPerDay * demandDays))
+			// Keep tiny but non-zero demand executable.
+			if demandCap <= 0 {
+				demandCap = 1
+			}
 			if demandCap < purchaseUnits {
 				purchaseUnits = demandCap
 			}
@@ -419,7 +439,8 @@ func (s *Scanner) BuildRegionalDayTrader(
 				roiPeriod = -maxROIPct
 			}
 		}
-		if params.MinMargin > 0 && marginNow < params.MinMargin && marginPeriod < params.MinMargin {
+		// MinOrderMargin must be executable "now" margin, not period expectation.
+		if params.MinMargin > 0 && marginNow < params.MinMargin {
 			continue
 		}
 		if params.MinPeriodROI > 0 && roiPeriod < params.MinPeriodROI {

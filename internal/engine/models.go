@@ -192,11 +192,14 @@ type ScanParams struct {
 	MinPeriodROI    float64 // 0 = no filter (min period ROI % for regional day trader)
 	MaxDOS          float64 // 0 = no filter (max days-of-supply at target for regional day trader)
 	MinDemandPerDay float64 // 0 = no filter (min demand units/day at target for regional day trader)
-	MinS2BPerDay    float64 // 0 = no filter
-	MinBfSPerDay    float64 // 0 = no filter
-	MinS2BBfSRatio  float64 // 0 = no filter
-	MaxS2BBfSRatio  float64 // 0 = no filter
-	AvgPricePeriod  int     // 0 = default period (14 days for regional day trader)
+	// PurchaseDemandDays controls target purchase volume as N days of target demand.
+	// Example: 0.5 means "buy half of one demand-day". <=0 uses mode-specific defaults.
+	PurchaseDemandDays float64
+	MinS2BPerDay       float64 // 0 = no filter
+	MinBfSPerDay       float64 // 0 = no filter
+	MinS2BBfSRatio     float64 // 0 = no filter
+	MaxS2BBfSRatio     float64 // 0 = no filter
+	AvgPricePeriod     int     // 0 = default period (14 days for regional day trader)
 	// Heuristic hauling cost model: ISK per (m3 * jump) used by regional day trader scoring.
 	ShippingCostPerM3Jump float64 // 0 = disabled
 	// Optional source-side region constraints for regional day trader.

@@ -602,6 +602,7 @@ export const en = {
     presetImported: "Imported",
     presetRegionSafe: "Beginner Safe",
     presetRegionNormal: "Beginner Balanced",
+    presetRegionEGLike: "EG Like",
     presetRegionWide: "Beginner Wide",
     presetRegionQuick: "Quick Scan",
     presetRegionDeep: "Deep Scan",

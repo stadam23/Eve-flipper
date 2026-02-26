@@ -112,6 +112,101 @@ func TestBuildRegionalDayTrader_GroupsAndCalculates(t *testing.T) {
 	}
 }
 
+func TestBuildRegionalDayTrader_PurchaseUnitsBehaviorByRevenueMode(t *testing.T) {
+	now := time.Now().UTC()
+	sourceHistory := []esi.HistoryEntry{
+		{Date: now.AddDate(0, 0, -1).Format("2006-01-02"), Average: 100, Volume: 300},
+		{Date: now.Format("2006-01-02"), Average: 100, Volume: 300},
+	}
+	targetHistory := []esi.HistoryEntry{
+		// avgDailyVolume over 14 days = (525+525)/14 = 75
+		{Date: now.AddDate(0, 0, -1).Format("2006-01-02"), Average: 200, Volume: 525},
+		{Date: now.Format("2006-01-02"), Average: 200, Volume: 525},
+	}
+
+	hp := &testHistoryProvider{
+		store: map[string][]esi.HistoryEntry{
+			"1:34": sourceHistory,
+			"2:34": targetHistory,
+		},
+	}
+	scanner := &Scanner{
+		SDE: &sde.Data{
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Src", RegionID: 1, Security: 0.9},
+				2: {ID: 2, Name: "Dst", RegionID: 2, Security: 0.9},
+			},
+			Regions: map[int32]*sde.Region{
+				1: {ID: 1, Name: "Source"},
+				2: {ID: 2, Name: "Target"},
+			},
+		},
+		History: hp,
+	}
+
+	flips := []FlipResult{
+		{
+			TypeID:          34,
+			TypeName:        "Sigil",
+			Volume:          5000,
+			BuyPrice:        100,
+			SellPrice:       220,
+			BuySystemID:     1,
+			BuySystemName:   "Src",
+			BuyRegionID:     1,
+			BuyRegionName:   "Source",
+			SellSystemID:    2,
+			SellSystemName:  "Dst",
+			SellRegionID:    2,
+			SellRegionName:  "Target",
+			UnitsToBuy:      4,
+			SellOrderRemain: 55,
+			BuyOrderRemain:  4,
+			SellJumps:       5,
+		},
+	}
+
+	t.Run("instant_mode_keeps_units_to_buy_bound", func(t *testing.T) {
+		hubs, totalItems, _, _ := scanner.BuildRegionalDayTrader(
+			ScanParams{
+				AvgPricePeriod:     14,
+				PurchaseDemandDays: 0.5,
+				SellOrderMode:      false,
+			},
+			flips,
+			nil,
+			nil,
+		)
+		if len(hubs) != 1 || totalItems != 1 {
+			t.Fatalf("unexpected shape: hubs=%d items=%d", len(hubs), totalItems)
+		}
+		if got := hubs[0].Items[0].PurchaseUnits; got != 4 {
+			t.Fatalf("purchase_units = %d, want 4 in instant mode", got)
+		}
+	})
+
+	t.Run("sell_order_mode_uses_source_liquidity_and_demand_window", func(t *testing.T) {
+		hubs, totalItems, _, _ := scanner.BuildRegionalDayTrader(
+			ScanParams{
+				AvgPricePeriod:     14,
+				PurchaseDemandDays: 0.5,
+				SellOrderMode:      true,
+			},
+			flips,
+			nil,
+			nil,
+		)
+		if len(hubs) != 1 || totalItems != 1 {
+			t.Fatalf("unexpected shape: hubs=%d items=%d", len(hubs), totalItems)
+		}
+		// demand/day = 75, purchase window = 0.5 day => ceil(37.5) = 38
+		// source liquidity is 55, so expected purchase is 38.
+		if got := hubs[0].Items[0].PurchaseUnits; got != 38 {
+			t.Fatalf("purchase_units = %d, want 38 in sell-order mode", got)
+		}
+	})
+}
+
 func TestBuildRegionalDayTrader_MinItemProfitFiltersRows(t *testing.T) {
 	scanner := &Scanner{
 		SDE: &sde.Data{
@@ -162,6 +257,79 @@ func TestBuildRegionalDayTrader_MinItemProfitFiltersRows(t *testing.T) {
 	}
 	if totalItems != 0 {
 		t.Fatalf("totalItems = %d, want 0", totalItems)
+	}
+}
+
+func TestBuildRegionalDayTrader_MinMarginUsesNowMarginInInstantMode(t *testing.T) {
+	now := time.Now().UTC()
+	sourceHistory := []esi.HistoryEntry{
+		{Date: now.AddDate(0, 0, -1).Format("2006-01-02"), Average: 100, Volume: 200},
+		{Date: now.Format("2006-01-02"), Average: 100, Volume: 200},
+	}
+	targetHistory := []esi.HistoryEntry{
+		{Date: now.AddDate(0, 0, -1).Format("2006-01-02"), Average: 200, Volume: 200},
+		{Date: now.Format("2006-01-02"), Average: 200, Volume: 200},
+	}
+
+	hp := &testHistoryProvider{
+		store: map[string][]esi.HistoryEntry{
+			"10:9001": sourceHistory,
+			"20:9001": targetHistory,
+		},
+	}
+
+	scanner := &Scanner{
+		SDE: &sde.Data{
+			Systems: map[int32]*sde.SolarSystem{
+				1: {ID: 1, Name: "Src", RegionID: 10, Security: 0.9},
+				2: {ID: 2, Name: "Dst", RegionID: 20, Security: 0.9},
+			},
+			Regions: map[int32]*sde.Region{
+				10: {ID: 10, Name: "Source"},
+				20: {ID: 20, Name: "Target"},
+			},
+		},
+		History: hp,
+	}
+
+	// Now margin is negative (80 vs 100), but period margin is positive (history ~200).
+	// MinMargin should filter this row out in instant mode.
+	flips := []FlipResult{
+		{
+			TypeID:           9001,
+			TypeName:         "Margin Leakage Probe",
+			Volume:           1,
+			BuyPrice:         100,
+			ExpectedBuyPrice: 100,
+			SellPrice:        80,
+			BuySystemID:      1,
+			BuySystemName:    "Src",
+			BuyRegionID:      10,
+			BuyRegionName:    "Source",
+			SellSystemID:     2,
+			SellSystemName:   "Dst",
+			SellRegionID:     20,
+			SellRegionName:   "Target",
+			UnitsToBuy:       10,
+			SellOrderRemain:  100,
+			TargetSellSupply: 100,
+			S2BPerDay:        10,
+			SellJumps:        1,
+		},
+	}
+
+	hubs, totalItems, _, _ := scanner.BuildRegionalDayTrader(
+		ScanParams{
+			MinMargin:      15,
+			AvgPricePeriod: 14,
+			SellOrderMode:  false,
+		},
+		flips,
+		nil,
+		nil,
+	)
+	if len(hubs) != 0 || totalItems != 0 {
+		t.Fatalf("expected row to be filtered by now-margin, got hubs=%d items=%d", len(hubs), totalItems)
 	}
 }
 
@@ -621,7 +789,7 @@ func TestBuildRegionalDayTrader_ROIUsesStricterFloorInSellOrderMode(t *testing.T
 			SellRegionID:     20,
 			SellRegionName:   "Target",
 			UnitsToBuy:       1,
-			SellOrderRemain:  10,
+			SellOrderRemain:  1,
 			BuyOrderRemain:   10,
 			SellJumps:        1,
 		},

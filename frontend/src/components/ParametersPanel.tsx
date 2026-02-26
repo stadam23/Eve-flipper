@@ -510,7 +510,7 @@ export function ParametersPanel({
                 <div className="text-[9px] uppercase tracking-widest text-eve-accent/70 font-bold mb-2 flex items-center gap-1.5">
                   <span className="text-eve-accent">◈</span> Filters
                 </div>
-                <div className="grid grid-cols-3 lg:grid-cols-6 gap-2">
+                <div className="grid grid-cols-3 lg:grid-cols-7 gap-2">
                   <Field label={t("minItemProfit")}>
                     <NumberInput value={params.min_item_profit ?? 0} onChange={(v) => set("min_item_profit", v)} min={0} max={999999999999} />
                   </Field>
@@ -522,6 +522,9 @@ export function ParametersPanel({
                   </Field>
                   <Field label={t("minDemandPerDay")} hint={t("minDemandPerDayHint")}>
                     <NumberInput value={params.min_demand_per_day ?? 0} onChange={(v) => set("min_demand_per_day", v)} min={0} max={999999} step={0.5} />
+                  </Field>
+                  <Field label={t("purchaseDemandDays")} hint={t("purchaseDemandDaysHint")}>
+                    <NumberInput value={params.purchase_demand_days ?? 0.5} onChange={(v) => set("purchase_demand_days", v)} min={0} max={30} step={0.1} />
                   </Field>
                   <Field label={t("avgPricePeriod")}>
                     <NumberInput value={params.avg_price_period ?? 14} onChange={(v) => set("avg_price_period", Math.round(v))} min={1} max={365} />

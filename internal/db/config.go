@@ -111,6 +111,9 @@ func (d *DB) LoadConfigForUser(userID string) *config.Config {
 	if v, ok := m["min_demand_per_day"]; ok {
 		cfg.MinDemandPerDay, _ = strconv.ParseFloat(v, 64)
 	}
+	if v, ok := m["purchase_demand_days"]; ok {
+		cfg.PurchaseDemandDays, _ = strconv.ParseFloat(v, 64)
+	}
 	if v, ok := m["shipping_cost_per_m3_jump"]; ok {
 		cfg.ShippingCostPerM3Jump, _ = strconv.ParseFloat(v, 64)
 	}
@@ -218,6 +221,7 @@ func (d *DB) SaveConfigForUser(userID string, cfg *config.Config) error {
 		"min_period_roi":            fmt.Sprintf("%g", cfg.MinPeriodROI),
 		"max_dos":                   fmt.Sprintf("%g", cfg.MaxDOS),
 		"min_demand_per_day":        fmt.Sprintf("%g", cfg.MinDemandPerDay),
+		"purchase_demand_days":      fmt.Sprintf("%g", cfg.PurchaseDemandDays),
 		"shipping_cost_per_m3_jump": fmt.Sprintf("%g", cfg.ShippingCostPerM3Jump),
 		"source_regions":            sourceRegionsJSON,
 		"target_region":             cfg.TargetRegion,

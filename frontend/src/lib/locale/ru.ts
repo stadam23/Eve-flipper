@@ -602,6 +602,7 @@ export const ru = {
     presetImported: "Импортировано",
     presetRegionSafe: "Новичок: безопасный",
     presetRegionNormal: "Новичок: баланс",
+    presetRegionEGLike: "EG Like",
     presetRegionWide: "Новичок: широкий",
     presetRegionQuick: "Быстрый скан",
     presetRegionDeep: "Глубокий скан",

@@ -42,6 +42,7 @@ type Config struct {
 	MinPeriodROI           float64  `json:"min_period_roi"`
 	MaxDOS                 float64  `json:"max_dos"`
 	MinDemandPerDay        float64  `json:"min_demand_per_day"`
+	PurchaseDemandDays     float64  `json:"purchase_demand_days"`
 	ShippingCostPerM3Jump  float64  `json:"shipping_cost_per_m3_jump"`
 	SourceRegions          []string `json:"source_regions"`
 	TargetRegion           string   `json:"target_region"`
@@ -79,6 +80,7 @@ func Default() *Config {
 		SellSalesTaxPercent:  8,
 		MinRouteSecurity:     0.45,
 		AvgPricePeriod:       14,
+		PurchaseDemandDays:   0.5,
 		SourceRegions: []string{
 			"The Forge",
 			"Domain",
