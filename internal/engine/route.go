@@ -48,6 +48,31 @@ type sourceSystemCandidate struct {
 	emptyJumps int
 }
 
+func routeMinISKPerJumpPass(
+	minISKPerJump float64,
+	profit float64,
+	totalJumps int,
+	allowByTargetProgress bool,
+) bool {
+	if totalJumps <= 0 {
+		return false
+	}
+	if minISKPerJump <= 0 {
+		return true
+	}
+	if (profit / float64(totalJumps)) >= minISKPerJump {
+		return true
+	}
+	return allowByTargetProgress
+}
+
+func routeFilterJumpCountForTarget(totalTradeJumps, targetJumps int, hasTarget bool) int {
+	if hasTarget {
+		return max(1, totalTradeJumps)
+	}
+	return max(1, totalTradeJumps+targetJumps)
+}
+
 func selectClosestRouteRegions(systemRegion map[int32]int32, systems map[int32]int, maxRegions int) map[int32]bool {
 	minDistByRegion := make(map[int32]int)
 	for systemID, dist := range systems {
@@ -401,6 +426,29 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		targetSystemID = targetID
 		targetSystemName = s.systemName(targetID)
 	}
+	targetDistanceBySystem := make(map[int32]int)
+	distanceToTarget := func(systemID int32) int {
+		if targetSystemID == 0 {
+			return 0
+		}
+		if dist, ok := targetDistanceBySystem[systemID]; ok {
+			return dist
+		}
+		dist := s.jumpsBetweenWithSecurity(systemID, targetSystemID, params.MinRouteSecurity)
+		targetDistanceBySystem[systemID] = dist
+		return dist
+	}
+	hopAdvancesTowardTarget := func(fromSystemID, destSystemID int32) bool {
+		if targetSystemID == 0 {
+			return false
+		}
+		fromDist := distanceToTarget(fromSystemID)
+		destDist := distanceToTarget(destSystemID)
+		if fromDist == UnreachableJumps || destDist == UnreachableJumps {
+			return false
+		}
+		return destDist < fromDist
+	}
 
 	progress(fmt.Sprintf("Fetching market orders from %d regions...", len(regions)))
 
@@ -538,10 +586,13 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 				hop := trade
 				hop.EmptyJumps = source.emptyJumps
 				totalHopJumps := hop.Jumps + hop.EmptyJumps
-				if totalHopJumps <= 0 {
-					continue
-				}
-				if params.MinISKPerJump > 0 && (hop.Profit/float64(totalHopJumps)) < params.MinISKPerJump {
+				allowBelowThreshold := hopAdvancesTowardTarget(fromSystemID, hop.DestSystemID)
+				if !routeMinISKPerJumpPass(
+					params.MinISKPerJump,
+					hop.Profit,
+					totalHopJumps,
+					allowBelowThreshold,
+				) {
 					continue
 				}
 				raw = append(raw, hopCandidate{hop: hop})
@@ -581,8 +632,12 @@ func (s *Scanner) FindRoutes(params RouteParams, progress func(string)) ([]Route
 		}
 
 		profitPerJump := sanitizeFloat(pr.totalProfit / float64(totalJumps))
-		if params.MinISKPerJump > 0 && profitPerJump < params.MinISKPerJump {
-			return RouteResult{}, false
+		filterJumps := routeFilterJumpCountForTarget(pr.totalJumps, targetJumps, targetSystemID != 0)
+		if params.MinISKPerJump > 0 {
+			filterProfitPerJump := sanitizeFloat(pr.totalProfit / float64(filterJumps))
+			if filterProfitPerJump < params.MinISKPerJump {
+				return RouteResult{}, false
+			}
 		}
 
 		return RouteResult{

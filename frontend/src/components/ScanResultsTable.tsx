@@ -827,6 +827,8 @@ export function ScanResultsTable({
   const [ignoredSelectedKeys, setIgnoredSelectedKeys] = useState<Set<string>>(new Set());
   const [cacheNowTs, setCacheNowTs] = useState<number>(Date.now());
   const [lastScanTs, setLastScanTs] = useState<number>(Date.now());
+  const [cacheStaleSuppressedUntilTs, setCacheStaleSuppressedUntilTs] =
+    useState<number>(0);
   const [cacheRebooting, setCacheRebooting] = useState(false);
   const [collapsedRegionGroups, setCollapsedRegionGroups] = useState<Set<string>>(
     new Set(),
@@ -1053,7 +1055,6 @@ export function ScanResultsTable({
 
   const resetColumns = useCallback(() => {
     setColumnOrder(allColumnDefs.map((col) => col.key));
-    setHiddenColumns(new Set());
   }, [allColumnDefs]);
 
   // ── Data pipeline: index → filter → sort ──
@@ -1434,11 +1435,20 @@ export function ScanResultsTable({
     () => Math.floor((cacheView.nextExpiryAt - cacheNowTs) / 1000),
     [cacheNowTs, cacheView.nextExpiryAt],
   );
+  const isCacheStale = useMemo(
+    () =>
+      cacheSecondsLeft <= 0 && cacheNowTs >= cacheStaleSuppressedUntilTs,
+    [cacheNowTs, cacheSecondsLeft, cacheStaleSuppressedUntilTs],
+  );
 
   const cacheBadgeText = useMemo(() => {
-    if (cacheSecondsLeft <= 0) return t("cacheStale");
+    if (isCacheStale) return t("cacheStale");
     return t("cacheLabel", { time: formatCountdown(cacheSecondsLeft) });
-  }, [cacheSecondsLeft, t]);
+  }, [cacheSecondsLeft, isCacheStale, t]);
+
+  useEffect(() => {
+    setCacheStaleSuppressedUntilTs(0);
+  }, [cacheView.currentRevision]);
 
   const refreshHiddenStates = useCallback(
     async (currentRevision?: number) => {
@@ -1688,7 +1698,11 @@ export function ScanResultsTable({
     setCacheRebooting(true);
     try {
       const res = await rebootStationCache();
-      setLastScanTs(Date.now());
+      const nowTs = Date.now();
+      setLastScanTs(nowTs);
+      setCacheNowTs(nowTs);
+      // Give backend cache reboot a short grace period before stale marker returns.
+      setCacheStaleSuppressedUntilTs(nowTs + 45_000);
       addToast(t("cacheRebooted", { count: res.cleared }), "success", 2400);
       addToast(t("cacheRebootRescanHint"), "info", 2600);
     } catch (e: unknown) {
@@ -1859,7 +1873,7 @@ export function ScanResultsTable({
               {t("selected", { count: selectedIds.size })}
             </span>
           )}
-          {!scanning && results.length > 0 && cacheSecondsLeft <= 0 && (
+          {!scanning && results.length > 0 && isCacheStale && (
             <span className="text-red-300">| {t("cacheStaleHint")}</span>
           )}
         </div>
@@ -1940,7 +1954,7 @@ export function ScanResultsTable({
               }}
               disabled={cacheRebooting}
               className={`px-2 py-0.5 rounded-sm border bg-eve-dark/40 text-[11px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                cacheSecondsLeft <= 0
+                isCacheStale
                   ? "border-red-500/60 text-red-300 hover:bg-red-900/20"
                   : "border-eve-border/60 text-eve-dim hover:border-eve-accent/50 hover:text-eve-accent"
               }`}
@@ -1951,7 +1965,7 @@ export function ScanResultsTable({
             <button
               type="button"
               className={`px-2 py-0.5 rounded-sm border text-[11px] font-mono transition-colors ${
-                cacheSecondsLeft <= 0
+                isCacheStale
                   ? "border-red-500/50 text-red-300 bg-red-950/30"
                   : "border-eve-border/60 text-eve-accent bg-eve-dark/40 hover:border-eve-accent/50"
               }`}
@@ -2199,12 +2213,25 @@ export function ScanResultsTable({
                 {t("columnsReset")}
               </button>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-1.5">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-1.5">
               {orderedColumnDefs.map((col, idx) => {
                 const visible = !hiddenColumns.has(col.key);
                 return (
                   <div
                     key={col.key}
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                        e.preventDefault();
+                        moveColumn(col.key, -1);
+                      } else if (
+                        e.key === "ArrowRight" ||
+                        e.key === "ArrowDown"
+                      ) {
+                        e.preventDefault();
+                        moveColumn(col.key, 1);
+                      }
+                    }}
                     className="flex items-center gap-1 rounded-sm border border-eve-border/40 bg-eve-panel/60 px-2 py-1"
                   >
                     <label className="flex items-center gap-1.5 min-w-0 flex-1">
@@ -2225,7 +2252,7 @@ export function ScanResultsTable({
                       className="px-1 rounded-sm border border-eve-border/40 disabled:opacity-30 disabled:cursor-not-allowed"
                       title={t("columnsMoveLeft")}
                     >
-                      ↑
+                      ←
                     </button>
                     <button
                       type="button"
@@ -2234,7 +2261,7 @@ export function ScanResultsTable({
                       className="px-1 rounded-sm border border-eve-border/40 disabled:opacity-30 disabled:cursor-not-allowed"
                       title={t("columnsMoveRight")}
                     >
-                      ↓
+                      →
                     </button>
                   </div>
                 );

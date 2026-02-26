@@ -144,9 +144,13 @@ export function IndustryMaterialDiffPanel({
     a.href = url;
     a.download = filename;
     document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      a.click();
+    } finally {
+      // remove() is safe even if node was detached by browser/runtime internals
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
   };
 
   const handleExportMaterialCSV = () => {

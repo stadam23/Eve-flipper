@@ -472,3 +472,27 @@ func TestFindBestTrades_MinISKPerJumpFiltersEmptyHopCandidate(t *testing.T) {
 		t.Fatalf("expected no hops, got %d", len(hops))
 	}
 }
+
+func TestRouteMinISKPerJumpPass(t *testing.T) {
+	if !routeMinISKPerJumpPass(0, 10, 1, false) {
+		t.Fatalf("expected pass when threshold disabled")
+	}
+	if routeMinISKPerJumpPass(100, 50, 1, false) {
+		t.Fatalf("expected fail below threshold without target-progress bypass")
+	}
+	if !routeMinISKPerJumpPass(100, 50, 1, true) {
+		t.Fatalf("expected pass below threshold when target-progress bypass is allowed")
+	}
+}
+
+func TestRouteFilterJumpCountForTarget(t *testing.T) {
+	if got := routeFilterJumpCountForTarget(7, 4, false); got != 11 {
+		t.Fatalf("without target: got %d jumps, want 11", got)
+	}
+	if got := routeFilterJumpCountForTarget(7, 4, true); got != 7 {
+		t.Fatalf("with target: got %d jumps, want 7 (exclude tail deadhead)", got)
+	}
+	if got := routeFilterJumpCountForTarget(0, 3, true); got != 1 {
+		t.Fatalf("with target and zero trade jumps: got %d, want floor 1", got)
+	}
+}

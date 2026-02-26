@@ -294,6 +294,7 @@ function App() {
     min_item_profit: 0,
     min_route_security: 0.45,
     avg_price_period: 14,
+    purchase_demand_days: 0.5,
     shipping_cost_per_m3_jump: 0,
     source_regions: [
       "The Forge",
@@ -403,6 +404,8 @@ function App() {
 
   const abortRef = useRef<AbortController | null>(null);
   const desktopAlertCooldownRef = useRef<Map<string, number>>(new Map());
+  const regionAutoRefreshSignatureRef = useRef<string>("");
+  const regionAutoRefreshLastRunRef = useRef<number>(0);
   const { addToast } = useGlobalToast();
 
   const [contractScanCompleted, setContractScanCompleted] = useState(false);
@@ -618,6 +621,8 @@ function App() {
           max_dos: cfg.max_dos ?? prev.max_dos,
           min_demand_per_day:
             cfg.min_demand_per_day ?? prev.min_demand_per_day,
+          purchase_demand_days:
+            cfg.purchase_demand_days ?? prev.purchase_demand_days,
           shipping_cost_per_m3_jump:
             cfg.shipping_cost_per_m3_jump ?? prev.shipping_cost_per_m3_jump,
           source_regions: cfg.source_regions ?? prev.source_regions,
@@ -897,13 +902,26 @@ function App() {
   useEffect(() => {
     if (!autoRefreshRegion || tab !== "region") return;
     const CHECK_INTERVAL = 15_000; // check every 15s
+    const COOLDOWN_MS = 90_000; // avoid loops on stale metadata snapshots
     const timer = window.setInterval(() => {
       if (scanning) return;
       if (!regionCacheMeta?.next_expiry_at) return;
       const expiresAt = Date.parse(regionCacheMeta.next_expiry_at);
-      if (Number.isFinite(expiresAt) && Date.now() >= expiresAt) {
-        void handleScan();
+      if (!Number.isFinite(expiresAt) || Date.now() < expiresAt) return;
+
+      const signature = `${regionCacheMeta.current_revision ?? 0}:${regionCacheMeta.next_expiry_at}`;
+      const now = Date.now();
+      const sameSnapshot = regionAutoRefreshSignatureRef.current === signature;
+      if (
+        sameSnapshot &&
+        now - regionAutoRefreshLastRunRef.current < COOLDOWN_MS
+      ) {
+        return;
       }
+
+      regionAutoRefreshSignatureRef.current = signature;
+      regionAutoRefreshLastRunRef.current = now;
+      void handleScan();
     }, CHECK_INTERVAL);
     return () => window.clearInterval(timer);
   }, [autoRefreshRegion, tab, scanning, regionCacheMeta, handleScan]);
@@ -917,6 +935,7 @@ function App() {
       if ((next.min_period_roi ?? 0) <= 0) next.min_period_roi = 3;
       if ((next.min_demand_per_day ?? 0) <= 0) next.min_demand_per_day = 1;
       if ((next.max_dos ?? 0) <= 0) next.max_dos = 180;
+      if ((next.purchase_demand_days ?? 0) <= 0) next.purchase_demand_days = 0.5;
       return next;
     });
     regionDefaultsAppliedRef.current = true;
@@ -1649,6 +1668,7 @@ function App() {
                 "min_period_roi",
                 "max_dos",
                 "min_demand_per_day",
+                "purchase_demand_days",
                 "min_s2b_per_day",
                 "min_bfs_per_day",
                 "min_s2b_bfs_ratio",
